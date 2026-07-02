@@ -1,0 +1,15 @@
+__pycache__/
+quant_outlier_*
+plot/
+result_logs/
+test/
+model/
+logs/
+intermediate_result/
+
+run.*.sh
+*.out
+# run.sh
+*.json
+*.csv
+models
