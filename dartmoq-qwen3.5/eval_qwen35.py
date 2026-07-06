@@ -30,6 +30,7 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
     testenc = testloader.input_ids
     nsamples = testenc.shape[1] // model.seqlen
     print(f'ppl evaluation samples (sequential mode): {nsamples}')
+    print(f'Testenc shape: {testenc.shape}')
 
     # Save original device for each layer
     layers = model.model.layers
@@ -45,12 +46,21 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
     for layer in layers:
         layer.to('cpu')
 
-    # Keep embed_tokens, norm, lm_head on GPU permanently
+    # Keep embed_tokens, norm, lm_head, and rotary_emb on GPU permanently
+    print(f"Moving embed_tokens/norm/lm_head/rotary_emb to {DEV}...")
     model.model.embed_tokens = model.model.embed_tokens.to(DEV)
     if hasattr(model.model, 'norm'):
         model.model.norm = model.model.norm.to(DEV)
     if hasattr(model, 'lm_head'):
         model.lm_head = model.lm_head.to(DEV)
+    if hasattr(model.model, 'rotary_emb'):
+        model.model.rotary_emb = model.model.rotary_emb.to(DEV)
+
+    # Verify devices
+    print(f"embed_tokens device: {next(model.model.embed_tokens.parameters()).device}")
+    if torch.cuda.is_available():
+        for i in range(torch.cuda.device_count()):
+            print(f"CUDA {i} memory after moving: {torch.cuda.memory_allocated(i) / 1024**3:.2f} GB")
 
     # Force cleanup
     gc.collect()
@@ -59,9 +69,13 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
         for i in range(torch.cuda.device_count()):
             print(f"CUDA {i}: {torch.cuda.memory_allocated(i) / 1024**3:.2f} GB")
 
-    # First, capture correct attention_mask, position_ids using Catcher
-    # Temporarily move layer 0 to DEV for capturing
+    # First, capture correct attention_mask, position_ids, position_embeddings using Catcher
+    # Temporarily move necessary components to DEV for capturing
+    print("Moving temporary components to GPU for kwargs capture...")
     layers[0] = layers[0].to(DEV)
+    # Also move rotary embeddings if they exist
+    if hasattr(model.model, 'rotary_emb'):
+        model.model.rotary_emb = model.model.rotary_emb.to(DEV)
 
     class Catcher(nn.Module):
         def __init__(self, module):
@@ -89,10 +103,21 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
     captured_kwargs = layers[0].captured_kwargs
     attention_mask = captured_kwargs.get('attention_mask')
     position_ids = captured_kwargs.get('position_ids')
+    position_embeddings = captured_kwargs.get('position_embeddings')
 
-    # Restore layer 0
+    print(f"Captured kwargs: {list(captured_kwargs.keys())}")
+    if attention_mask is not None:
+        print(f"  attention_mask shape: {attention_mask.shape}")
+    if position_ids is not None:
+        print(f"  position_ids shape: {position_ids.shape}")
+    if position_embeddings is not None:
+        print(f"  position_embeddings type: {type(position_embeddings)}")
+
+    # Restore layer 0 and rotary emb
     layers[0] = layers[0].module
     layers[0] = layers[0].to('cpu')
+    if hasattr(model.model, 'rotary_emb'):
+        model.model.rotary_emb = model.model.rotary_emb.to('cpu')
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -153,6 +178,16 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
             if 'position_ids' in forward_signature.parameters and position_ids is not None:
                 # Create position_ids for this specific batch size
                 layer_kwargs['position_ids'] = position_ids.repeat(actual_batch_size, 1)
+
+            if 'position_embeddings' in forward_signature.parameters and position_embeddings is not None:
+                # Create position_embeddings for this specific batch size
+                if isinstance(position_embeddings, tuple):
+                    layer_kwargs['position_embeddings'] = tuple(
+                        pe.repeat(actual_batch_size, 1, 1) if pe is not None else None
+                        for pe in position_embeddings
+                    )
+                else:
+                    layer_kwargs['position_embeddings'] = position_embeddings.repeat(actual_batch_size, 1, 1)
 
             # Forward pass
             with torch.no_grad():
@@ -325,11 +360,16 @@ def main():
         print(f"Evaluating on {dataset}")
         print(f"{'=' * 80}")
 
+        print(f"Loading {dataset} dataset... (this may take a while)")
+        tick_data = time.time()
         dataloader, testloader = get_loaders(
             dataset, nsamples=args.val_samples, seed=args.seed,
             tokenizer=tokenizer, seqlen=model.seqlen
         )
+        print(f"Dataset loaded in {time.time() - tick_data:.2f}s")
+        print(f"Test data shape: {testloader.input_ids.shape}")
 
+        print("Starting PPL evaluation...")
         ppl = qwen35_ppl_eval(model, testloader, dataset, args)
         ppl_results[dataset] = ppl
 
