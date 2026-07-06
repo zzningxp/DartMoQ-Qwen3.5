@@ -39,48 +39,75 @@ class Qwen35SingleExpert(nn.Module):
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
-class Qwen35ExpertsProxy(nn.Module):
+class Qwen35MLPProxy(nn.Module):
     """
-    Qwen3.5 Experts 的代理，支持下标访问
-    看起来像传统的 ModuleList，但不修改原始结构
+    Qwen3.5 MLP (Grouped_GEMM_MoE mode) 的完整代理
+    既支持下标访问 experts，又支持正常的 forward 调用
     """
-    def __init__(self, original_experts):
+    def __init__(self, original_mlp):
         super().__init__()
-        self.original_experts = original_experts
+        self.original_mlp = original_mlp
+
+        # 复制所有属性
+        for attr_name in dir(original_mlp):
+            if not attr_name.startswith('_') and not callable(getattr(original_mlp, attr_name)):
+                try:
+                    setattr(self, attr_name, getattr(original_mlp, attr_name))
+                except:
+                    pass
+
+        # 处理 gate
+        self.gate = original_mlp.gate
+
+        # 处理 shared_expert
+        if hasattr(original_mlp, 'shared_expert'):
+            self.shared_expert = original_mlp.shared_expert
+        if hasattr(original_mlp, 'shared_expert_gate'):
+            self.shared_expert_gate = original_mlp.shared_expert_gate
 
         # 缓存形状信息
-        self.gate_up_proj = original_experts.gate_up_proj  # (num_experts, 2*intermediate_size, hidden_size)
-        self.down_proj = original_experts.down_proj        # (num_experts, hidden_size, intermediate_size)
+        self._gate_up_proj = original_mlp.experts.gate_up_proj
+        self._down_proj = original_mlp.experts.down_proj
 
-        self.num_experts = self.gate_up_proj.shape[0]
-        self.hidden_size = self.gate_up_proj.shape[2]
-        self.intermediate_size = self.gate_up_proj.shape[1] // 2
+        self.num_experts = self._gate_up_proj.shape[0]
+        self.hidden_size = self._gate_up_proj.shape[2]
+        self.intermediate_size = self._gate_up_proj.shape[1] // 2
 
         # 缓存单个专家对象（延迟创建）
         self._expert_cache = {}
 
-    def __len__(self):
-        return self.num_experts
+        # 创建一个可下标访问的 experts 代理
+        self._experts_list = None
 
-    def __getitem__(self, idx):
-        if idx not in self._expert_cache:
-            # 动态创建单个专家代理
-            self._expert_cache[idx] = Qwen35SingleExpert(
-                self.gate_up_proj[idx],
-                self.down_proj[idx],
-                self.hidden_size,
-                self.intermediate_size
-            )
-        return self._expert_cache[idx]
+    @property
+    def experts(self):
+        # 第一次访问时创建
+        if self._experts_list is None:
+            self._experts_list = []
+            for i in range(self.num_experts):
+                self._experts_list.append(
+                    Qwen35SingleExpert(
+                        self._gate_up_proj[i],
+                        self._down_proj[i],
+                        self.hidden_size,
+                        self.intermediate_size
+                    )
+                )
+        return self._experts_list
 
-    def __iter__(self):
-        for i in range(self.num_experts):
-            yield self[i]
+    @experts.setter
+    def experts(self, value):
+        # 允许被替换（比如量化过程中会替换）
+        self._experts_list = value
+
+    def forward(self, x, *args, **kwargs):
+        # 转发给原始 MLP
+        return self.original_mlp(x, *args, **kwargs)
 
 
-def wrap_qwen35_layer_for_quant(layer):
+def wrap_grouped_gemm_moe_for_quant(layer):
     """
-    临时包装 Qwen3.5 层，让它看起来像传统 MoE 层
+    临时包装 Grouped_GEMM_MoE 层，让它看起来像传统 MoE 层
     """
     if not hasattr(layer.mlp, 'experts'):
         return layer, None
@@ -88,17 +115,17 @@ def wrap_qwen35_layer_for_quant(layer):
     if not hasattr(layer.mlp.experts, 'gate_up_proj'):
         return layer, None
 
-    # 创建代理
-    original_experts = layer.mlp.experts
-    layer.mlp.experts = Qwen35ExpertsProxy(original_experts)
+    # 创建完整的 MLP 代理
+    original_mlp = layer.mlp
+    layer.mlp = Qwen35MLPProxy(original_mlp)
 
-    return layer, original_experts
+    return layer, original_mlp
 
 
-def unwrap_qwen35_layer(layer, original_experts):
-    """恢复原始层结构"""
-    if original_experts is not None:
-        layer.mlp.experts = original_experts
+def unwrap_grouped_gemm_moe_layer(layer, original_mlp):
+    """恢复 Grouped_GEMM_MoE 原始层结构"""
+    if original_mlp is not None:
+        layer.mlp = original_mlp
 
 
 def get_qwen35_model(model_path, device_map="auto"):
@@ -133,7 +160,8 @@ def load_model(model_path, standby_cpu=False):
     return model, tokenizer
 
 
-def is_qwen35_merged_weights(model):
+def is_grouped_gemm_moe(model):
+    """检测是否是 Grouped_GEMM_MoE mode (Qwen3.5 风格)"""
     if not hasattr(model.model, 'layers'):
         return False
     layer = model.model.layers[0]
@@ -146,7 +174,8 @@ def is_qwen35_merged_weights(model):
     return False
 
 
-def inspect_qwen35_layer(layer, verbose=False):
+def inspect_grouped_gemm_moe_layer(layer, verbose=False):
+    """检查 Grouped_GEMM_MoE 层结构"""
     info = {}
     if hasattr(layer.mlp, 'experts'):
         experts = layer.mlp.experts
@@ -160,7 +189,7 @@ def inspect_qwen35_layer(layer, verbose=False):
             info['has_router'] = True
             info['router_type'] = type(layer.mlp.gate).__name__
     if verbose:
-        print("Qwen3.5 Layer Info:")
+        print("Grouped_GEMM_MoE Layer Info:")
         for k, v in info.items():
             print(f"  {k}: {v}")
     return info

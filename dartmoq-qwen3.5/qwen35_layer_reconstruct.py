@@ -26,6 +26,7 @@ from collections import Counter
 
 from dartmoq_hybridmoe import DartMoQHybridWrapper
 from dartmoq_hybridmoe import restructure_hybrid_qscheme
+from grouped_gemm_moe_adapter import SimpleMoEBlock
 
 
 INTERMEDIATE_RESULT_DIR = "intermediate_result"
@@ -62,25 +63,12 @@ def reconstruct_moe_from_existing(model, layer, layer_idx, inps,
     else:
         ori_expert_num = len(layer.mlp.experts)
 
-    if use_hybrid_moe:
-        new_expert_num = ori_expert_num
-    else:
-        new_expert_num = ori_expert_num * slice_expert_num
-        scaling_factor = slice_expert_num
-
+    # Hybrid mode only
+    new_expert_num = ori_expert_num
     ori_router_gate = layer.mlp.gate.weight
-
-    if use_hybrid_moe:
-        all_new_experts = []
-    else:
-        if type(layer.mlp.gate) == nn.Linear:
-            new_router = nn.Linear(model.config.hidden_size, new_expert_num, dtype=ori_router_gate.dtype, bias=False).to(device)
-        else:
-            new_router = layer.mlp.gate.__class__(model.config).to(device).to(layer.mlp.gate.weight.dtype)
-        all_new_experts = nn.ModuleList()
+    all_new_experts = []
 
     total_neurons_processed = 0
-    gate_start_idx = 0
 
     sub_expert_bit_configs = []
     expert_to_subexperts = []
@@ -106,10 +94,8 @@ def reconstruct_moe_from_existing(model, layer, layer_idx, inps,
         if 'target_bpw' not in qscheme:
             outlier_bits = {probe_bit}
         else:
-            if getattr(args, 'disable_0bit_prune', False):
-                outlier_bits = {1, 2, 3, 4}
-            else:
-                outlier_bits = {0, 1, 2, 3, 4}
+            # Always include 0bit
+            outlier_bits = {0, 1, 2, 3, 4}
         outlier_label = args.rank_mode if turboquant_outlier_mode else quantmode
         print(f"simulate {outlier_label} outlier_bits {outlier_bits}")
 
@@ -163,7 +149,7 @@ def reconstruct_moe_from_existing(model, layer, layer_idx, inps,
                     expert_activation_rates,
                     slice_expert_num,
                     target_bpw=qscheme['target_bpw'],
-                    enable_0bit_compensation=not getattr(args, 'disable_0bit_compensation', False)
+                    enable_0bit_compensation=True
                 )
                 dp_tick1 = time.time()
                 print(f"enum_optimal_m_scheme_global_fast time {dp_tick1 - dp_tick0}", flush=True)
@@ -197,17 +183,15 @@ def reconstruct_moe_from_existing(model, layer, layer_idx, inps,
             energy = analyze_expert_energy(expert, inps)
             expert_energy_list.append(energy.detach().cpu().float().numpy())
 
-        if getattr(args, 'disable_0bit_prune', False):
-            energy_bits = [1, 2, 3, 4]
-        else:
-            energy_bits = [0, 1, 2, 3, 4]
+        # Always include 0bit
+        energy_bits = [0, 1, 2, 3, 4]
         dpscheme_list, all_rates_arr = enum_optimal_m_scheme_energy_global_fast(
             expert_energy_list,
             expert_activation_rates,
             slice_expert_num,
             target_bpw=qscheme['target_bpw'],
             bits=energy_bits,
-            enable_0bit_compensation=not getattr(args, 'disable_0bit_compensation', False)
+            enable_0bit_compensation=True
         )
 
         print(f"built dpscheme_list for energy mode target_bpw {qscheme['target_bpw']} for {ori_expert_num} experts")
@@ -269,9 +253,9 @@ def reconstruct_moe_from_existing(model, layer, layer_idx, inps,
     counter = Counter(tuple(s) for s in qscheme['expert'])
     print(f"layer {layer_idx} scheme type count: {counter}")
 
-    if use_hybrid_moe:
-        qscheme['slice_expert'] = qscheme['expert']
-        qscheme['expert'] = restructure_hybrid_qscheme(qscheme['slice_expert'], slice_expert_num)
+    # Hybrid mode only
+    qscheme['slice_expert'] = qscheme['expert']
+    qscheme['expert'] = restructure_hybrid_qscheme(qscheme['slice_expert'], slice_expert_num)
 
     for expert_idx, expert in enumerate(layer.mlp.experts):
         ori_gate_proj_weights = expert.gate_proj.weight
@@ -280,66 +264,44 @@ def reconstruct_moe_from_existing(model, layer, layer_idx, inps,
 
         expert_groups = all_expert_groups[expert_idx]
 
-        if use_hybrid_moe:
-            expert_sub_experts = []
-            expert_sub_sizes = []
+        expert_sub_experts = []
+        expert_sub_sizes = []
 
-            orig_bit_config = qscheme['slice_expert'][expert_idx]
-            restructured_config = qscheme['expert'][expert_idx]
+        orig_bit_config = qscheme['slice_expert'][expert_idx]
+        restructured_config = qscheme['expert'][expert_idx]
 
-            bit_to_indices = {}
-            for bit, group_indices in zip(orig_bit_config, expert_groups):
-                if bit not in bit_to_indices:
-                    bit_to_indices[bit] = []
-                bit_to_indices[bit].extend(group_indices)
+        bit_to_indices = {}
+        for bit, group_indices in zip(orig_bit_config, expert_groups):
+            if bit not in bit_to_indices:
+                bit_to_indices[bit] = []
+            bit_to_indices[bit].extend(group_indices)
 
-            for bit in restructured_config:
-                if bit == 0:
-                    continue
+        for bit in restructured_config:
+            if bit == 0:
+                continue
 
-                indices = bit_to_indices[bit]
-                n_neurons = len(indices)
+            indices = bit_to_indices[bit]
+            n_neurons = len(indices)
 
-                new_config = model.config
-                new_config.intermediate_size = n_neurons
-                expert_mlp = expert.__class__(new_config).to(device)
+            new_config = model.config
+            new_config.intermediate_size = n_neurons
+            expert_mlp = expert.__class__(new_config).to(device)
 
-                with torch.no_grad():
-                    indices_tensor = torch.tensor(indices, dtype=torch.long, device=ori_gate_proj_weights.device)
-                    expert_mlp.gate_proj.weight.data = ori_gate_proj_weights[indices_tensor, :].detach().clone()
-                    expert_mlp.up_proj.weight.data = ori_up_proj_weights[indices_tensor, :].detach().clone()
-                    expert_mlp.down_proj.weight.data = ori_down_proj_weights[:, indices_tensor].detach().clone()
+            with torch.no_grad():
+                indices_tensor = torch.tensor(indices, dtype=torch.long, device=ori_gate_proj_weights.device)
+                expert_mlp.gate_proj.weight.data = ori_gate_proj_weights[indices_tensor, :].detach().clone()
+                expert_mlp.up_proj.weight.data = ori_up_proj_weights[indices_tensor, :].detach().clone()
+                expert_mlp.down_proj.weight.data = ori_down_proj_weights[:, indices_tensor].detach().clone()
 
-                expert_mlp._quant_bit = bit
+            expert_mlp._quant_bit = bit
 
-                expert_sub_experts.append(expert_mlp)
-                expert_sub_sizes.append(n_neurons)
-                total_neurons_processed += n_neurons
+            expert_sub_experts.append(expert_mlp)
+            expert_sub_sizes.append(n_neurons)
+            total_neurons_processed += n_neurons
 
-            all_new_experts.append(expert_sub_experts)
-            sub_expert_bit_configs.append(tuple([bit for bit in restructured_config if bit != 0]))
-            expert_to_subexperts.append(list(range(len(expert_sub_experts))))
-        else:
-            for ii, group_indices in enumerate(expert_groups):
-                n_neurons = len(group_indices)
-
-                new_config = model.config
-                new_config.intermediate_size = n_neurons
-                expert_mlp = expert.__class__(new_config).to(device)
-
-                with torch.no_grad():
-                    group_indices_tensor = torch.tensor(group_indices, dtype=torch.long, device=ori_gate_proj_weights.device)
-                    expert_mlp.gate_proj.weight.data = ori_gate_proj_weights[group_indices_tensor, :].detach().clone()
-                    expert_mlp.up_proj.weight.data = ori_up_proj_weights[group_indices_tensor, :].detach().clone()
-                    expert_mlp.down_proj.weight.data = ori_down_proj_weights[:, group_indices_tensor].detach().clone() * scaling_factor
-
-                all_new_experts.append(expert_mlp)
-                new_expert_intermediate_size = expert_mlp.up_proj.weight.shape[0]
-                total_neurons_processed += new_expert_intermediate_size
-
-            expanded_gate = ori_router_gate.data[expert_idx, :].unsqueeze(0).repeat(slice_expert_num, 1).to(device).detach().clone()
-            new_router.weight.data[gate_start_idx: gate_start_idx + slice_expert_num, :] = expanded_gate
-            gate_start_idx += slice_expert_num
+        all_new_experts.append(expert_sub_experts)
+        sub_expert_bit_configs.append(tuple([bit for bit in restructured_config if bit != 0]))
+        expert_to_subexperts.append(list(range(len(expert_sub_experts))))
 
         del ori_gate_proj_weights, ori_up_proj_weights, ori_down_proj_weights
         gc.collect()
@@ -349,28 +311,19 @@ def reconstruct_moe_from_existing(model, layer, layer_idx, inps,
     print(f"Layer {layer_idx}, {args.rank_mode} expert re- sort time: {tick1 - tick0}", flush=True)
     print("all_new_expert_rates:", len(all_new_expert_rates))
 
-    if use_hybrid_moe:
-        moe = layer.mlp.__class__(model.config).to(device)
-        moe.gate = layer.mlp.gate
-        moe.num_experts = len(all_new_experts)
-        moe.experts = nn.ModuleList([DartMoQHybridWrapper(sub_experts) for sub_experts in all_new_experts])
-        counter = Counter(sub_expert_bit_configs)
-        print("reconstruct moe with sub_expert_bit_configs: ", counter)
-        if hasattr(layer.mlp, 'shared_expert'):
-            moe.shared_expert = layer.mlp.shared_expert
-        if hasattr(layer.mlp, 'shared_expert_gate'):
-            moe.shared_expert_gate = layer.mlp.shared_expert_gate
-        moe.training = False
-    else:
-        moe = layer.mlp.__class__(model.config).to(device)
-        moe.num_experts = len(all_new_experts)
-        moe.top_k = n_activated
-        moe.gate = new_router
-        moe.experts = all_new_experts
-        if hasattr(layer.mlp, 'shared_expert'):
-            moe.shared_expert = layer.mlp.shared_expert
-        if hasattr(layer.mlp, 'shared_expert_gate'):
-            moe.shared_expert_gate = layer.mlp.shared_expert_gate
+    # Hybrid mode only
+    # 用简单的 MoE 块，不依赖原始类
+    moe = SimpleMoEBlock(model.config).to(device)
+    moe.gate = layer.mlp.gate
+    moe.num_experts = len(all_new_experts)
+    moe.experts = nn.ModuleList([DartMoQHybridWrapper(sub_experts) for sub_experts in all_new_experts])
+    counter = Counter(sub_expert_bit_configs)
+    print("reconstruct moe with sub_expert_bit_configs: ", counter)
+    if hasattr(layer.mlp, 'shared_expert'):
+        moe.shared_expert = layer.mlp.shared_expert
+    if hasattr(layer.mlp, 'shared_expert_gate'):
+        moe.shared_expert_gate = layer.mlp.shared_expert_gate
+    moe.training = False
 
     gc.collect()
     torch.cuda.empty_cache()

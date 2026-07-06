@@ -12,7 +12,7 @@ sys.path.insert(0, '..')
 
 from data_utils import get_loaders
 from qwen35_utils import load_model
-from qwen35_simple_wrapper import qwen35_dartmoq_sequential_simple as qwen35_dartmoq_sequential
+from qwen35_simple_wrapper import dartmoq_quant_grouped_gemm_moe
 
 
 def main():
@@ -24,23 +24,19 @@ def main():
     parser.add_argument("--slices", type=int, default=4, help="Number of sub experts to slice")
     parser.add_argument("--quant-scheme", type=str, default="a8s4m2233", help="Quantization scheme")
     parser.add_argument("--rank-mode", type=str, default="turboquant_innerproduct", help="Rank mode for neuron ordering")
-    parser.add_argument("--disable-0bit-compensation", action="store_true", default=False, help="Disable 0bit compensation")
-    parser.add_argument("--disable-0bit-prune", action="store_true", default=False, help="Disable 0bit in DP search")
     parser.add_argument("--standby-layer-cpu", action="store_true", default=False, help="Use CPU standby for layers")
     parser.add_argument("--sequential-eval", action="store_true", default=False, help="Use sequential PPL evaluation")
-    parser.add_argument("--no-use-hybrid-moe", dest="use_hybrid_moe", action="store_false", default=True, help="Disable Hybrid MoE structure")
     parser.add_argument("--quantmode", type=str, default="turboquant", choices=["gptq", "turboquant"], help="Quantization mode")
-    parser.add_argument("--save-model", action="store_true", default=False, help="Save quantized model")
 
     args = parser.parse_args()
 
-    print("DartMoQ for Qwen3.5 MoE")
+    print("DartMoQ for Qwen3.5 MoE (Hybrid Mode Only)")
     print(f"Model: {args.model}")
     print(f"Calibration dataset: {args.dataset}")
     print(f"Quant scheme: {args.quant_scheme}")
     print(f"Rank mode: {args.rank_mode}")
     print(f"Slices per expert: {args.slices}")
-    print(f"Hybrid MoE: {'Yes' if args.use_hybrid_moe else 'No'}")
+    print(f"Hybrid MoE: Yes (always enabled)")
     print(f"Quant mode: {args.quantmode}")
     print(f"CPU standby: {'Yes' if args.standby_layer_cpu else 'No'}")
 
@@ -61,7 +57,7 @@ def main():
 
     print("\nStarting quantization...")
     with torch.no_grad():
-        quant_model = qwen35_dartmoq_sequential(
+        quant_model = dartmoq_quant_grouped_gemm_moe(
             model, tokenizer, dataloader, args, test_ppl=True
         )
 
