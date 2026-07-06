@@ -16,9 +16,7 @@ from qwen35_utils import load_model, DEV
 @torch.no_grad()
 def simple_test(model, tokenizer, args):
     """Simple test with generated dummy data."""
-    print(f"\n{'=' * 80}")
-    print(f"Simple Test (no external dataset)")
-    print(f"{'=' * 80}")
+    print(f"\nSimple Test (no external dataset)")
 
     # Generate dummy input data
     print("Generating dummy input...")
@@ -99,9 +97,7 @@ def main():
 
     args = parser.parse_args()
 
-    print("=" * 80)
     print("Qwen3.5 MoE Simple Test (Phase 1)")
-    print("=" * 80)
     print(f"Model: {args.model}")
     print(f"Device: {args.device}")
     print(f"Samples: {args.val_samples}")

@@ -147,7 +147,7 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
 
     import inspect
     for layer_idx, layer in enumerate(layers):
-        if layer_idx % 5 == 0:
+        if layer_idx % 10 == 0:
             print(f"Processing layer {layer_idx}/{len(layers)}...", flush=True)
 
         # Move layer to GPU
@@ -219,9 +219,9 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-            if layer_idx % 5 == 0:
-                for i in range(torch.cuda.device_count()):
-                    print(f"  Layer {layer_idx}, CUDA {i}: {torch.cuda.memory_allocated(i) / 1024**3:.2f} GB")
+            # if layer_idx % 5 == 0:
+            #     for i in range(torch.cuda.device_count()):
+            #         print(f"  Layer {layer_idx}, CUDA {i}: {torch.cuda.memory_allocated(i) / 1024**3:.2f} GB")
 
     # Final norm and lm_head - process in batches of 4
     print("Processing final norm and lm_head...")
@@ -334,9 +334,7 @@ def main():
 
     args = parser.parse_args()
 
-    print("=" * 80)
     print("Qwen3.5 MoE Evaluation (Phase 1: FP16 Baseline)")
-    print("=" * 80)
     print(f"Model: {args.model}")
     print(f"Datasets: {args.datasets}")
     print(f"Sequential eval: {args.sequential_eval}")
@@ -356,9 +354,7 @@ def main():
     # Run evaluation on each dataset
     ppl_results = {}
     for dataset in args.datasets:
-        print(f"\n{'=' * 80}")
-        print(f"Evaluating on {dataset}")
-        print(f"{'=' * 80}")
+        print(f"\nEvaluating on {dataset}")
 
         print(f"Loading {dataset} dataset... (this may take a while)")
         tick_data = time.time()
@@ -374,9 +370,7 @@ def main():
         ppl_results[dataset] = ppl
 
     # Print summary
-    print(f"\n{'=' * 80}")
-    print("Evaluation Summary")
-    print(f"{'=' * 80}")
+    print(f"\nEvaluation Summary")
     for dataset, ppl in ppl_results.items():
         print(f"{dataset}: {ppl:.4f}")
 
