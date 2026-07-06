@@ -83,17 +83,16 @@ if __name__ == '__main__':
         help='Disable 0bit in DP search: only use 1-4 bits for bit allocation'
     )
     parser.add_argument(        '--standby-layer-cpu', action='store_true', default=False,
-        help='Whether to move quant layers to CPU before and after quantization.' 
+        help='Whether to move quant layers to CPU before and after quantization.'
+    )
+    parser.add_argument(        '--sequential-eval', action='store_true', default=False,
+        help='Use sequential PPL evaluation (keeps layers on CPU, moves one by one).'
     )
     parser.add_argument(        '--no-use-hybrid-moe', dest='use_hybrid_moe', action='store_false', default=True,
         help='Disable hybrid MoE structure and use original experts instead.'
     )
     parser.add_argument(        '--quantmode', type=str, default='turboquant', choices=['gptq', 'turboquant'],
         help='Quantization mode: gptq (default) or turboquant.'
-    )
-    parser.add_argument(        '--eval-method',
-        type=str, default='hf', choices=['hf', 'custom'],
-        help='Evaluation method: hf (HuggingFace), custom (custom in-memory wrapper),.'
     )
     parser.add_argument(        '--save-model', action='store_true', default=False,
         help='Whether to save the model to disk.'
@@ -103,10 +102,11 @@ if __name__ == '__main__':
     
     print("-" * 50)
     print(f"Current start time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}")
+
     print("Loading model: (ppl)", args.model)
-    print("slices/quant-scheme/rank-mode/moe-struct/quantmode/disable-0bit-prune: (ppl)",
-          args.slices, args.quant_scheme, args.rank_mode, "use_hybrid_moe" if args.use_hybrid_moe else " use_origin_moe", args.quantmode, args.disable_0bit_prune)
-    model, tokenizer = load_model(args.model)
+    print("slices/quant-scheme/rank-mode/moe-struct/quantmode/disable-0bit-prune/standby-layer-cpu: (ppl)",
+          args.slices, args.quant_scheme, args.rank_mode, "use_hybrid_moe" if args.use_hybrid_moe else " use_origin_moe", args.quantmode, args.disable_0bit_prune, args.standby_layer_cpu)
+    model, tokenizer = load_model(args.model, standby_cpu=args.standby_layer_cpu)
 
     dataloader, _ = get_loaders(
         args.dataset, 
@@ -131,15 +131,17 @@ if __name__ == '__main__':
         save_dartmoq_model(dartmoq_model, tokenizer, save_dir, args)
 
     time_zero_eval = 0.0
-    if args.eval_zero:
+    if args.eval_zero and not args.standby_layer_cpu:
         tick_zero_start = time.time()
         task_list = ["arc_challenge", "arc_easy", "piqa", "boolq", "winogrande", "mnli", "hellaswag", "mmlu"]
         # task_list = ["mnli", "hellaswag", "mmlu", "sciq"]
         # task_list = ["gsm8k", "triviaqa"]
-        eval_zero_shot(dartmoq_model, task_list, eval_method=args.eval_method, tokenizer=tokenizer)
+        eval_zero_shot(dartmoq_model, task_list, tokenizer=tokenizer)
         tick_zero_done = time.time()
         time_zero_eval = tick_zero_done - tick_zero_start
         print(f"Runtime of zero-shot evaluation: {time_zero_eval:.2f}")
+    elif args.eval_zero and args.standby_layer_cpu:
+        print("Skipping zero-shot evaluation because standby_layer_cpu is enabled (standby mode takes precedence)")
 
     # print(model)
 

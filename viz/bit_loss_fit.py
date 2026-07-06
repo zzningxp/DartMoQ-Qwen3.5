@@ -13,7 +13,7 @@ from typing import Dict, List, Set, Tuple
 
 # Add parent directory to path to import dp_utils
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from dp_utils import extrapolate_0bit_loss_fix, extrapolate_0bit_loss
+from dp_utils import extrapolate_0bit_loss_fix, extrapolate_0bit_loss, compute_r_squared_for_rates
 
 INTERMEDIATE_RESULT_DIR = "intermediate_result"
 
@@ -506,7 +506,7 @@ def test_read_rates_from_file():
 
 def get_model_layer_stats(
     model_id: str,
-    expert_idx: int = 0,
+    expert_idx: int = None,
     outlier_bits: Set[int] = None,
     debug_layers: List[int] = None,
 ) -> Dict[str, Dict[int, Dict[str, float]]]:
@@ -547,7 +547,8 @@ def get_model_layer_stats(
             print(f"[ERROR] No layers found for model {model_id} in cache directories!")
         return {'turboquant': {}, 'gptq': {}}
 
-    print(f"Processing model {model_id}, layers: {layer_indices}")
+    mode_str = f"ALL EXPERTS" if expert_idx is None else f"EXPERT {expert_idx}"
+    print(f"Processing model {model_id} ({mode_str}), layers: {layer_indices}")
 
     result = {'turboquant': {}, 'gptq': {}}
 
@@ -566,8 +567,13 @@ def get_model_layer_stats(
                     try:
                         import torch
                         cached_data = torch.load(cache_path, map_location='cpu')
-                        expert_data = cached_data[expert_idx].detach().cpu().float().numpy()
-                        rates[x] = expert_data
+                        if expert_idx is None:
+                            # Load ALL experts (default mode A)
+                            rates[x] = cached_data
+                        else:
+                            # Load single expert only
+                            expert_data = cached_data[expert_idx].detach().cpu().float().numpy()
+                            rates[x] = expert_data
                     except Exception as e:
                         print(f"[WARNING] Failed to load {cache_path}: {e}")
                         missing_bits.append(x)
@@ -579,110 +585,39 @@ def get_model_layer_stats(
                 continue
 
             bits_sorted = sorted(rates.keys())
-            n_neurons = len(rates[bits_sorted[0]])
-            b_array = np.array(bits_sorted, dtype=float)
 
-            r2_values = []
-            n_all_zero = 0
-            n_constant = 0
-            n_normal_fit = 0
+            # ========== NEW WAY (from dp_utils.py) ==========
+            if expert_idx is None:
+                # Default mode A: already all experts in rates[x], pass directly
+                rates_for_dp_utils = rates
+            else:
+                # Single expert mode: wrap in list
+                rates_for_dp_utils = {}
+                for b in bits_sorted:
+                    rates_for_dp_utils[b] = [rates[b]]
 
-            for i in range(n_neurons):
-                loss_array = np.array([rates[b][i] for b in bits_sorted])
-                positive_mask = loss_array > 0
+            new_stats = compute_r_squared_for_rates(rates_for_dp_utils)
+            new_mean = new_stats['mean']
+            new_median = new_stats['median']
 
-                # 检查是否是绝对拟合情况：全 0 或所有 loss 都是同一个正数
-                if positive_mask.sum() == 0:
-                    r2_values.append(1.0)
-                    n_all_zero += 1
-                elif positive_mask.sum() >= 2 and (loss_array[positive_mask] == loss_array[positive_mask][0]).all():
-                    r2_values.append(1.0)
-                    n_constant += 1
-                elif positive_mask.sum() >= 3:
-                    try:
-                        fit_bits = b_array[positive_mask]
-                        fit_loss = loss_array[positive_mask]
-                        log_loss = np.log(fit_loss)
-
-                        p, q, r = np.polyfit(fit_bits, log_loss, deg=2)
-                        r2 = compute_r_squared(fit_bits, log_loss, p, q, r)
-
-                        if not np.isnan(r2):
-                            r2_values.append(r2)
-                            n_normal_fit += 1
-                    except Exception:
-                        pass
-
-            if r2_values:
-                r2_arr = np.array(r2_values)
+            if not np.isnan(new_mean):
                 result[quant_type][lidx] = {
-                    'mean': np.mean(r2_arr),
-                    'median': np.median(r2_arr)
+                    'mean': new_mean,
+                    'median': new_median
                 }
-                perf_fit_str = f" (perfect: {n_all_zero} all-zero + {n_constant} constant)" if n_all_zero + n_constant > 0 else ""
-                print(f"  {quant_type} layer {lidx}: mean R² = {result[quant_type][lidx]['mean']:.4f}, median = {result[quant_type][lidx]['median']:.4f}{perf_fit_str}")
+                print(f"  {quant_type} layer {lidx}: mean R² = {new_mean:.4f}, median = {new_median:.4f}")
+            else:
+                print(f"  {quant_type} layer {lidx}: no valid data")
 
-                # Debug mode: print detailed info for specific layers
-                if debug_layers and lidx in debug_layers:
-                    print(f"\n  === DEBUG {quant_type} layer {lidx} ===")
-                    # Collect R² distribution
-                    r2_arr = np.array(r2_values)
-                    print(f"  R² stats: min={r2_arr.min():.4f}, max={r2_arr.max():.4f}, median={np.median(r2_arr):.4f}, std={r2_arr.std():.4f}")
-                    print(f"  R² < 0.9: {np.sum(r2_arr < 0.9)}, R² < 0.95: {np.sum(r2_arr < 0.95)}")
-
-                    # Re-calculate to find all neurons' R²
-                    neuron_r2 = []
-                    for i in range(n_neurons):
-                        loss_array = np.array([rates[b][i] for b in bits_sorted])
-                        positive_mask = loss_array > 0
-                        if positive_mask.sum() == 0:
-                            neuron_r2.append((i, 1.0, loss_array))
-                        elif positive_mask.sum() >= 2 and (loss_array[positive_mask] == loss_array[positive_mask][0]).all():
-                            neuron_r2.append((i, 1.0, loss_array))
-                        elif positive_mask.sum() >= 3:
-                            try:
-                                fit_bits = b_array[positive_mask]
-                                fit_loss = loss_array[positive_mask]
-                                log_loss = np.log(fit_loss)
-                                p, q, r = np.polyfit(fit_bits, log_loss, deg=2)
-                                r2_val = compute_r_squared(fit_bits, log_loss, p, q, r)
-                                if not np.isnan(r2_val):
-                                    neuron_r2.append((i, r2_val, loss_array))
-                            except Exception:
-                                pass
-
-                    # Sort and print lowest 5
-                    neuron_r2.sort(key=lambda x: x[1])
-                    print(f"\n  Lowest 5 R² neurons:")
-                    for i, (neuron_idx, r2_val, loss_arr) in enumerate(neuron_r2[:5]):
-                        loss_str = '  '.join([f"{b}:{v:.6g}" for b, v in zip(bits_sorted, loss_arr)])
-                        print(f"    neuron {neuron_idx:4d}: R²={r2_val:.4f} | {loss_str}")
-
-                    # Print highest 5
-                    print(f"\n  Highest 5 R² neurons:")
-                    for i, (neuron_idx, r2_val, loss_arr) in enumerate(neuron_r2[-5:]):
-                        loss_str = '  '.join([f"{b}:{v:.6g}" for b, v in zip(bits_sorted, loss_arr)])
-                        print(f"    neuron {neuron_idx:4d}: R²={r2_val:.4f} | {loss_str}")
-                    print()
-
-                    # Plot this layer for visualization - special debug plot for lowest 5 R² neurons
-                    print(f"  Plotting debug fit comparison for layer {lidx} (lowest 5 R² neurons)...")
-                    plot_lowest_r2_neurons(
-                        model_id=model_id,
-                        layer_idx=lidx,
-                        expert_idx=expert_idx,
-                        quant_type=quant_type,
-                        neuron_r2=neuron_r2[:5],  # lowest 5
-                        outlier_bits=outlier_bits,
-                        save_dir=None,
-                        use_pdf=False,
-                    )
+                # Debug mode temporarily disabled (old code removed)
+                # if debug_layers and lidx in debug_layers:
+                #     pass
     return result
 
 
 def analyze_multi_model_r2(
     model_ids: List[str] = None,
-    expert_idx: int = 0,
+    expert_idx: int = None,
     outlier_bits: Set[int] = None,
     save_dir: str = None,
     use_pdf: bool = False,
@@ -776,8 +711,14 @@ def analyze_multi_model_r2(
                             color='black', linewidth=1.5, solid_capstyle='butt')
 
         # Add reference lines
-        ax.axhline(0.95, color='#27ae60', linestyle='--', alpha=0.7, linewidth=1.5, label='R²=0.95' if ax_idx == 0 else "")
-        ax.axhline(0.99, color='#c0392b', linestyle=':', alpha=0.7, linewidth=1.5, label='R²=0.99' if ax_idx == 0 else "")
+        if expert_idx is None:
+            # All experts mode: 0.98 and 0.99
+            ax.axhline(0.98, color='#27ae60', linestyle='--', alpha=0.7, linewidth=1.5, label='R²=0.98' if ax_idx == 0 else "")
+            ax.axhline(0.99, color='#c0392b', linestyle=':', alpha=0.7, linewidth=1.5, label='R²=0.99' if ax_idx == 0 else "")
+        else:
+            # Single expert mode: 0.95 and 0.99 (keep original)
+            ax.axhline(0.95, color='#27ae60', linestyle='--', alpha=0.7, linewidth=1.5, label='R²=0.95' if ax_idx == 0 else "")
+            ax.axhline(0.99, color='#c0392b', linestyle=':', alpha=0.7, linewidth=1.5, label='R²=0.99' if ax_idx == 0 else "")
 
         # Add dummy lines for legend to explain mean marker
         if ax_idx == 0:
@@ -793,8 +734,8 @@ def analyze_multi_model_r2(
                     all_r2.append(val['median'])
 
         # Dynamic y-axis limits
-        if all_r2:
-            y_min = 0.8
+        if expert_idx is None:
+            y_min = 0.9
         else:
             y_min = 0.8
 
@@ -811,8 +752,11 @@ def analyze_multi_model_r2(
         else:
             ax.set_xticklabels([str(l) for l in layer_indices], rotation=45, ha='right', fontsize=8)
         ax.set_ylim(y_min, 1.005)
-        # Set y-axis ticks to be sparser
-        ax.set_yticks(np.arange(0.85, 1.01, 0.05))
+        # Set y-axis ticks
+        if expert_idx is None:
+            ax.set_yticks(np.arange(0.9, 1.0, 0.02))
+        else:
+            ax.set_yticks(np.arange(0.85, 1.01, 0.05))
         ax.grid(True, alpha=0.3, axis='y')
 
         # Only show legend on first plot
@@ -825,17 +769,23 @@ def analyze_multi_model_r2(
     if save_dir is None:
         save_dir = 'plot/neuron_rates_fit'
     os.makedirs(save_dir, exist_ok=True)
-    ext = 'pdf' if use_pdf else 'png'
     if use_all_models:
         model_str = 'all_models'
     else:
         model_str = '_'.join([m.replace('-', '_') for m in model_ids])
-    save_path = os.path.join(save_dir, f'r2_comparison_{model_str}.{ext}')
-    if use_pdf:
-        plt.savefig(save_path, bbox_inches='tight')
+    # Add expert identifier to filename if specified
+    if expert_idx is None:
+        expert_str = '_all_experts'
     else:
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    print(f"\nMulti-model R² plot saved to {save_path}")
+        expert_str = f'_expert{expert_idx}'
+    # Save both PNG and PDF by default
+    save_path_png = os.path.join(save_dir, f'r2_comparison_{model_str}{expert_str}.png')
+    save_path_pdf = os.path.join(save_dir, f'r2_comparison_{model_str}{expert_str}.pdf')
+    plt.savefig(save_path_png, dpi=150, bbox_inches='tight')
+    plt.savefig(save_path_pdf, bbox_inches='tight')
+    print(f"\nMulti-model R² plots saved to:")
+    print(f"  PNG: {save_path_png}")
+    print(f"  PDF: {save_path_pdf}")
     plt.close()
 
 
@@ -852,8 +802,8 @@ def main():
                       help="Single model identifier (for neuron rate plotting)")
     parser.add_argument("--layer", type=int, default=1,
                       help="Layer index (for neuron rate plotting)")
-    parser.add_argument("--expert", type=int, default=0,
-                      help="Expert index")
+    parser.add_argument("--expert", type=int, default=-1,
+                      help="Expert index (default: None = all experts)")
     parser.add_argument("--p", type=int, default=20,
                       help="Number of neurons to plot (unused now, kept for compatibility)")
     parser.add_argument("--n-show-neurons", type=int, default=20,
@@ -878,9 +828,11 @@ def main():
         target_model_ids = args.models
         if not target_model_ids and args.model:
             target_model_ids = [args.model]
+        # Convert -1 to None (use all experts)
+        expert_param = args.expert if args.expert != -1 else None
         analyze_multi_model_r2(
             model_ids=target_model_ids,  # None = auto-discover
-            expert_idx=args.expert,
+            expert_idx=expert_param,
             outlier_bits=set(args.bits),
             save_dir=args.save_dir,
             use_pdf=args.pdf,
@@ -889,10 +841,12 @@ def main():
     else:
         # Default to the new fit comparison plot
         model_to_plot = args.model or "deepseek-v1-moe-16b"
+        # plot_neuron_rates_with_fit still expects a single expert index, keep default 0
+        expert_param = args.expert if args.expert != -1 else 0
         plot_neuron_rates_with_fit(
             model_id=model_to_plot,
             layer_idx=args.layer,
-            expert_idx=args.expert,
+            expert_idx=expert_param,
             p=args.p,
             n_show_neurons=args.n_show_neurons,
             outlier_bits=set(args.bits),

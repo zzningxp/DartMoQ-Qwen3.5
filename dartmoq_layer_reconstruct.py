@@ -1,4 +1,4 @@
-import time 
+import time
 import torch
 import torch.nn as nn
 import os
@@ -44,9 +44,14 @@ def reconstruct_moe_from_existing(model, layer, layer_idx, inps,
             expert_activation_rates = analyze_experts_activation(layer, layer_idx, inps, ori_activated, model.config.model_type)
             torch.save(expert_activation_rates.detach().cpu(), cache_path)
             print(f"Saved expert activation rates to {cache_path}")
-
-    ori_expert_num = len(layer.mlp.experts)
     
+    if hasattr(model.config, 'num_experts'):
+        ori_expert_num = model.config.num_experts
+    elif hasattr(model.config, 'n_routed_experts'):
+        ori_expert_num = model.config.n_routed_experts
+    else:
+        ori_expert_num = len(layer.mlp.experts)
+
     if use_hybrid_moe:
         # Hybrid MoE: keep original expert count at first level
         new_expert_num = ori_expert_num
@@ -106,7 +111,7 @@ def reconstruct_moe_from_existing(model, layer, layer_idx, inps,
         # print(f"cache_dir: {cache_dir}")
         os.makedirs(cache_dir, exist_ok=True)
 
-        for x in sorted(outlier_bits, reverse=True):  ## 0 bit should be extrapolated from other bit data, so we compute it at last
+        for x in sorted(outlier_bits, reverse=True):
             cache_path = os.path.join(cache_dir, f"{model.model_id}_L{layer_idx}_b{x}.pt")
             if os.path.exists(cache_path):
                 try:
@@ -136,13 +141,13 @@ def reconstruct_moe_from_existing(model, layer, layer_idx, inps,
                     )
                 else:
                     q_rates[x] = analyze_gptq_quant_outlier(
-                        layer, layer_idx, inps, ori_expert_num, wbits=x, 
+                        layer, layer_idx, inps, ori_expert_num, wbits=x,
                         quantmode=quantmode, save_path=None, seed=args.seed)
             torch.save(q_rates[x], cache_path)
             print(f"Saved {outlier_label} outlier data to {cache_path}")
             # print(f"sleep 20s")
             # time.sleep(20)
-            
+
         if 'target_bpw' not in qscheme:
             all_rates = q_rates[probe_bit]
         else:
