@@ -4,6 +4,14 @@ Bit loss extrapolation and visualization utilities.
 This module contains functions for:
 - Extrapolating 0bit loss using log-quadratic fit
 - Visualizing neuron rates across bit widths with fit curves
+
+Supported models:
+- olmoe-7b-1b: OLMoE-1B-7B
+- deepseek-v1-moe-16b: DeepSeekMoE-V1-16B
+- deepseek-v2-lite: DeepSeek-V2-Lite
+- moonlight: Moonlight-16B-A3B
+- qwen3-30b-a3b: Qwen3-30B-A3B
+- qwen3.5-35b-a3b: Qwen3.5-35B-A3B (NEW)
 """
 import os
 import sys
@@ -16,6 +24,17 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from dp_utils import extrapolate_0bit_loss_fix, extrapolate_0bit_loss, compute_r_squared_for_rates
 
 INTERMEDIATE_RESULT_DIR = "intermediate_result"
+
+# Canonical ID mapping (same as in _cache_io.py)
+_CANONICAL_ID = {
+    "deepseek-v1-moe-16b": "deepseek-v1-moe-16b",
+    "deepseek-v2-lite":    "deepseek-v2-lite",
+    "moonlight":           "moonlight",
+    "olmoe-7b-1b":         "olmoe-7b-1b",
+    "qwen3-30b-a3b":       "qwen3-30b-a3b",
+    "qwen3.5-35b-a3b":     "Qwen3.5-35B-A3B",
+    "Qwen3.5-35B-A3B":     "Qwen3.5-35B-A3B",
+}
 
 
 def plot_lowest_r2_neurons(
@@ -45,13 +64,14 @@ def plot_lowest_r2_neurons(
     b_array = np.array(bits_sorted, dtype=float)
 
     # Load full data to get all bits for these neurons
+    canonical_id = _CANONICAL_ID.get(model_id, model_id)
     rank_mode = 'turboquant_innerproduct' if quant_type == 'turboquant' else 'gptq_quant_outlier'
-    cache_dir = os.path.join(INTERMEDIATE_RESULT_DIR, f"quant_outlier_{quant_type}", rank_mode, model_id)
+    cache_dir = os.path.join(INTERMEDIATE_RESULT_DIR, f"quant_outlier_{quant_type}", rank_mode, canonical_id)
 
     # Load all bit data for these neurons
     full_rates = {}
     for x in bits_sorted:
-        cache_path = os.path.join(cache_dir, f"{model_id}_L{layer_idx}_b{x}.pt")
+        cache_path = os.path.join(cache_dir, f"{canonical_id}_L{layer_idx}_b{x}.pt")
         if os.path.exists(cache_path):
             try:
                 import torch
@@ -209,6 +229,9 @@ def plot_neuron_rates_with_fit(
 
     print(f"Plotting neuron rates with fit: model={model_id}, layer={layer_idx}, expert={expert_idx}, p={p}")
 
+    # Get canonical model ID for cache paths
+    canonical_id = _CANONICAL_ID.get(model_id, model_id)
+
     # Load data for both quant types
     quants = [
         ('turboquant', 'turboquant_innerproduct'),
@@ -217,12 +240,12 @@ def plot_neuron_rates_with_fit(
 
     all_data = {}
     for quant_type, rank_mode in quants:
-        cache_dir = os.path.join(INTERMEDIATE_RESULT_DIR, f"quant_outlier_{quant_type}", rank_mode, model_id)
+        cache_dir = os.path.join(INTERMEDIATE_RESULT_DIR, f"quant_outlier_{quant_type}", rank_mode, canonical_id)
         rates = {}
 
         # Load data for each bit
         for x in outlier_bits:
-            cache_path = os.path.join(cache_dir, f"{model_id}_L{layer_idx}_b{x}.pt")
+            cache_path = os.path.join(cache_dir, f"{canonical_id}_L{layer_idx}_b{x}.pt")
             if os.path.exists(cache_path):
                 try:
                     import torch
@@ -474,16 +497,17 @@ def test_read_rates_from_file():
     outlier_bits = {1, 2, 3, 4}
     print(f"simulate quant outlier_bits {outlier_bits}")
 
-    model_id = "deepseek-v1-moe-16b"
+    model_id = "qwen3.5-35b-a3b"  # can also use "deepseek-v1-moe-16b"
+    canonical_id = _CANONICAL_ID.get(model_id, model_id)
     layer_idx = 1
     quant_type = "turboquant"
-    cache_dir = os.path.join(INTERMEDIATE_RESULT_DIR, f"quant_outlier_{quant_type}", "turboquant_innerproduct", model_id)
+    cache_dir = os.path.join(INTERMEDIATE_RESULT_DIR, f"quant_outlier_{quant_type}", "turboquant_innerproduct", canonical_id)
 
     p = 20
     expert_idx = 0
     rates = {}
     for x in outlier_bits:
-        cache_path = os.path.join(cache_dir, f"{model_id}_L{layer_idx}_b{x}.pt")
+        cache_path = os.path.join(cache_dir, f"{canonical_id}_L{layer_idx}_b{x}.pt")
         if os.path.exists(cache_path):
             try:
                 import torch
@@ -514,6 +538,9 @@ def get_model_layer_stats(
     if outlier_bits is None:
         outlier_bits = {1, 2, 3, 4}
 
+    # Get canonical model ID for cache paths
+    canonical_id = _CANONICAL_ID.get(model_id, model_id)
+
     # Discover all available layers
     all_layers = set()
     # prefix = '_nopr8fix'
@@ -524,11 +551,11 @@ def get_model_layer_stats(
     ]
     found_any_cache = False
     for quant_type, rank_mode in quants_for_discovery:
-        cache_dir = os.path.join(INTERMEDIATE_RESULT_DIR, f"quant_outlier_{quant_type}", rank_mode, model_id)
+        cache_dir = os.path.join(INTERMEDIATE_RESULT_DIR, f"quant_outlier_{quant_type}", rank_mode, canonical_id)
         if os.path.exists(cache_dir):
             found_any_cache = True
             for filename in os.listdir(cache_dir):
-                if filename.endswith('_b1.pt') and model_id in filename:
+                if filename.endswith('_b1.pt') and canonical_id in filename:
                     parts = filename.split('_L')
                     if len(parts) > 1:
                         layer_part = parts[1].split('_b')[0]
@@ -553,7 +580,7 @@ def get_model_layer_stats(
     result = {'turboquant': {}, 'gptq': {}}
 
     for quant_type, rank_mode in quants_for_discovery:
-        cache_dir = os.path.join(INTERMEDIATE_RESULT_DIR, f"quant_outlier_{quant_type}", rank_mode, model_id)
+        cache_dir = os.path.join(INTERMEDIATE_RESULT_DIR, f"quant_outlier_{quant_type}", rank_mode, canonical_id)
         if not os.path.exists(cache_dir):
             print(f"[WARNING] {quant_type} cache directory not found: {cache_dir}")
             continue
@@ -562,7 +589,7 @@ def get_model_layer_stats(
             rates = {}
             missing_bits = []
             for x in outlier_bits:
-                cache_path = os.path.join(cache_dir, f"{model_id}_L{lidx}_b{x}.pt")
+                cache_path = os.path.join(cache_dir, f"{canonical_id}_L{lidx}_b{x}.pt")
                 if os.path.exists(cache_path):
                     try:
                         import torch
@@ -840,7 +867,7 @@ def main():
         )
     else:
         # Default to the new fit comparison plot
-        model_to_plot = args.model or "deepseek-v1-moe-16b"
+        model_to_plot = args.model or "qwen3.5-35b-a3b"
         # plot_neuron_rates_with_fit still expects a single expert index, keep default 0
         expert_param = args.expert if args.expert != -1 else 0
         plot_neuron_rates_with_fit(

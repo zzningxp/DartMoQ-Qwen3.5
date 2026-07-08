@@ -16,8 +16,8 @@ viz/
 Each viz module exposes a `main()` callable as `python -m viz.<module>`.
 
 `--model` accepts either a **short cache id** (`olmoe-7b-1b`,
-`deepseek-v1-moe-16b`, `deepseek-v2-lite`, `moonlight`, `qwen3-30b-a3b`) **or
-the full model path** you would pass to `run_dartmoq.py`
+`deepseek-v1-moe-16b`, `deepseek-v2-lite`, `moonlight`, `qwen3-30b-a3b`,
+`qwen3.5-35b-a3b`) **or the full model path** you would pass to `run_dartmoq.py`
 (e.g. `--model /home/.../OLMoE-1B-7B-0924/`). The path → id mapping lives in
 `viz/_cache_io.py::resolve_model_id` and mirrors `eval_dartmoq.load_model`.
 
@@ -146,11 +146,27 @@ and Exp.5 plots the same assigned losses along the global DP ordering.
 | 4 | `python -m viz.dp_score_tests.exp_4.plot_exp4_assigned_loss_vs_uniform` | `sum(q_rates[assigned_bit]) * activation` | expert | Plot final assigned loss by expert; with `--include-uniform-baseline`, also outputs the no-sort, no-DP, fixed-bit boxplot at the same integer bpw. |
 | 5 | `python -m viz.dp_score_tests.exp_5.plot_exp5_assigned_loss_by_order` | `sum(q_rates[assigned_bit]) * activation` | DP sorted sub-expert index | Check whether final assigned losses look reasonable along the DP sorted queue. |
 
-Typical Qwen3 TurboQuant command for Exp.4:
+Typical Qwen3/Qwen3.5 TurboQuant command for Exp.4:
 
 ```bash
+# Qwen3-30B-A3B
 python -m viz.dp_score_tests.exp_4.plot_exp4_assigned_loss_vs_uniform \
   --model qwen3-30b-a3b \
+  --quantmode turboquant \
+  --rank-mode turboquant_innerproduct \
+  --layers 7 \
+  --include-random-layer \
+  --random-seed 123 \
+  --bits 0 1 2 3 4 \
+  --slices-per-expert 8 \
+  --target-bpw 2.0 \
+  --disable-0bit-compensation \
+  --include-uniform-baseline \
+  --comparison-out-dir figs/assigned_loss_bpw2_boxplot_compare
+
+# Qwen3.5-35B-A3B
+python -m viz.dp_score_tests.exp_4.plot_exp4_assigned_loss_vs_uniform \
+  --model qwen3.5-35b-a3b \
   --quantmode turboquant \
   --rank-mode turboquant_innerproduct \
   --layers 7 \

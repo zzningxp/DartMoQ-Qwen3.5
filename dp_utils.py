@@ -244,7 +244,7 @@ def enum_optimal_m_scheme_global_fast_with_0bit_compensation(
     print(f"Multi Bits Global DP mode with 0bit compensation: {Counter(global_scheme_sorted)}")
     print(f"  Raw average bpw: {avg_raw_bpw:.3f}, Effective average bpw: {avg_effective_bpw:.3f}",
           f"  Target bpw: {target_bpw:.3f} + {quant_overhead:.3f}, {zero_count}/{total_subexperts} sub-experts are 0bit")
-    print(f"  Best loss: {best_loss:.4f}")
+    print(f"  Best loss: {best_loss:.6f}")
     
     # Step 5: Map back to per-expert scheme
     per_expert_scheme = [[0] * slice_expert_num for _ in range(n_experts)]
@@ -711,7 +711,7 @@ def enum_optimal_m_scheme_separate_fast(rates, s, target_bpw, epsilon=0):
             best_loss = total_loss
             best_scheme = scheme
     
-    print(f"{len(valid_schemes)} valid schemes... Optimal Scheme: {best_scheme}, Minimum Loss: {best_loss:.4f}")
+    print(f"{len(valid_schemes)} valid schemes... Optimal Scheme: {best_scheme}, Minimum Loss: {best_loss:.6f}")
 
     m = n_neurons // s
     neuron_bits = np.zeros(n_neurons, dtype=int)
@@ -1021,7 +1021,7 @@ def enum_optimal_m_scheme_global_fast(
     print(f"Multi Bits Global DP mode {Counter(global_scheme_sorted)}")
     print(f"  Raw average bpw: {avg_raw_bpw:.3f}, Effective average bpw: {avg_effective_bpw:.3f}",
           f"  Target bpw: {target_bpw:.3f} + {quant_overhead:.3f}, {zero_count}/{total_subexperts} sub-experts are 0bit")
-    print(f"  best loss = {best_loss:.4f}")
+    print(f"  best loss = {best_loss:.6f}")
 
     # Step 5: Map back to per-expert scheme
     per_expert_scheme = [[0] * slice_expert_num for _ in range(n_experts)]
@@ -1249,7 +1249,7 @@ def enum_optimal_m_scheme_energy_global_fast(
     print(f"Energy Global DP mode {Counter(global_scheme_sorted)}")
     print(f"  Raw average bpw: {avg_raw_bpw:.3f}, Effective average bpw: {avg_effective_bpw:.3f}",
           f"  Target bpw: {target_bpw:.3f} + {quant_overhead:.3f}, {zero_count}/{total_subexperts} sub-experts are 0bit")
-    print(f"  best loss = {best_loss:.4f}")
+    print(f"  best loss = {best_loss:.6f}")
 
     # Step 5: Map back to per-expert scheme
     per_expert_scheme = [[0] * slice_expert_num for _ in range(n_experts)]

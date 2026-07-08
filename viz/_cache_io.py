@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
-import torch
+# torch is imported inside functions where needed
 
 
 INTERMEDIATE_RESULT_DIR = "intermediate_result"
@@ -44,6 +44,19 @@ KNOWN_MODELS = {
     "moonlight":           "Moonlight-16B-A3B",
     "olmoe-7b-1b":         "OLMoE-1B-7B",
     "qwen3-30b-a3b":       "Qwen3-30B-A3B",
+    "qwen3.5-35b-a3b":     "Qwen3.5-35B-A3B",
+    "Qwen3.5-35B-A3B":     "Qwen3.5-35B-A3B",  # 缓存目录使用的实际名称
+}
+
+# Maps the short id to the canonical cache directory name.
+_CANONICAL_ID = {
+    "deepseek-v1-moe-16b": "deepseek-v1-moe-16b",
+    "deepseek-v2-lite":    "deepseek-v2-lite",
+    "moonlight":           "moonlight",
+    "olmoe-7b-1b":         "olmoe-7b-1b",
+    "qwen3-30b-a3b":       "qwen3-30b-a3b",
+    "qwen3.5-35b-a3b":     "Qwen3.5-35B-A3B",  # 指向实际缓存目录
+    "Qwen3.5-35B-A3B":     "Qwen3.5-35B-A3B",
 }
 
 # (substring-in-path, short_id). Kept in sync with `eval_dartmoq.load_model`.
@@ -55,6 +68,8 @@ _PATH_TO_ID = [
     ("deepseek-moe-16b", "deepseek-v1-moe-16b"),
     ("deepseek-v2-lite", "deepseek-v2-lite"),
     ("moonlight",        "moonlight"),
+    ("Qwen3.5-35B-A3B", "Qwen3.5-35B-A3B"),
+    ("qwen3.5-35b-a3b", "Qwen3.5-35B-A3B"),  # 小写也可以
     ("qwen3-30b-a3b",    "qwen3-30b-a3b"),
 ]
 
@@ -99,6 +114,8 @@ _ID_TO_PATH = {
     "moonlight":           "Moonlight-16B-A3B",
     "olmoe-7b-1b":         "OLMoE-1B-7B-0924-Instruct",
     "qwen3-30b-a3b":       "Qwen3-30B-A3B",
+    "qwen3.5-35b-a3b":     "Qwen3.5-35B-A3B",
+    "Qwen3.5-35B-A3B":     "Qwen3.5-35B-A3B",
 }
 
 
@@ -155,8 +172,9 @@ class LayerSensitivity:
 
 
 def cache_dir(quantmode: str, rank_mode: str, model_id: str) -> str:
+    canonical_id = _CANONICAL_ID.get(model_id, model_id)
     return CACHE_ROOT_PATTERN.format(
-        quantmode=quantmode, rank_mode=rank_mode, model_id=model_id
+        quantmode=quantmode, rank_mode=rank_mode, model_id=canonical_id
     )
 
 
@@ -170,6 +188,8 @@ def load_layer(
     device: str = "cpu",
 ) -> Optional[LayerSensitivity]:
     """Load all cached `.pt` files for one (model, quantmode, rank_mode, layer)."""
+    import torch
+    canonical_id = _CANONICAL_ID.get(model_id, model_id)
     base = cache_dir(quantmode, rank_mode, model_id) + dir_suffix
     if not os.path.isdir(base):
         return None
@@ -179,7 +199,7 @@ def load_layer(
         rank_mode=rank_mode, layer_idx=layer_idx,
     )
     for b in bits:
-        path = os.path.join(base, f"{model_id}_L{layer_idx}_b{b}.pt")
+        path = os.path.join(base, f"{canonical_id}_L{layer_idx}_b{b}.pt")
         if not os.path.exists(path):
             continue
         raw = torch.load(path, map_location=device)
@@ -193,10 +213,11 @@ def load_layer(
 def discover_layers(quantmode: str, rank_mode: str, model_id: str,
                     dir_suffix: str = "") -> List[int]:
     """Return the sorted list of layer indices that have at least one cached bit."""
+    canonical_id = _CANONICAL_ID.get(model_id, model_id)
     base = cache_dir(quantmode, rank_mode, model_id) + dir_suffix
     if not os.path.isdir(base):
         return []
-    pat = re.compile(rf"{re.escape(model_id)}_L(\d+)_b\d+\.pt$")
+    pat = re.compile(rf"{re.escape(canonical_id)}_L(\d+)_b\d+\.pt$")
     seen = set()
     for fn in os.listdir(base):
         m = pat.match(fn)
@@ -295,8 +316,9 @@ def expert_cosine_cache_path(
     preserve_fracs: Optional[Sequence[float]] = None,
 ) -> str:
     """Get cache path for expert_cosine summary."""
+    canonical_id = _CANONICAL_ID.get(model_id, model_id)
     sanitized_task = _slug(task_name)
-    parts = [model_id, quantmode, rank_mode, f"b{bit}"]
+    parts = [canonical_id, quantmode, rank_mode, f"b{bit}"]
     if layers:
         layer_str = "_".join(str(l) for l in sorted(layers))
         parts.append(f"L{layer_str}")
