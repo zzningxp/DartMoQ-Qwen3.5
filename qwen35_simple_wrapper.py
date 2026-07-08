@@ -159,7 +159,12 @@ def construct_moe(model, moe_model_flag, layer, layer_idx, inp,
     with torch.no_grad():
         moe_out = moe_out + residual
 
+    # Clean up all intermediate tensors aggressively
     del hidden_states, hidden_states_inorm, residual, attn_out
+    if 'attn_kwargs' in locals():
+        del attn_kwargs
+    if 'forward_signature' in locals():
+        del forward_signature
 
     gc.collect()
     torch.cuda.empty_cache()
@@ -339,6 +344,11 @@ def dartmoq_quant_grouped_gemm_moe(model, tokenizer, dataloader, args, test_ppl=
             args = args
         )
 
+        # Free memory from old inps before assigning new one
+        del inps
+        gc.collect()
+        torch.cuda.empty_cache()
+
         inps = moe_out
 
         if args.standby_layer_cpu:
@@ -351,6 +361,10 @@ def dartmoq_quant_grouped_gemm_moe(model, tokenizer, dataloader, args, test_ppl=
         tick1 = time.time()
         print(f"Layer {layer_idx} total reconstruct and quantization time: {tick1 - tick0:.2f} s", flush=True)
         print("." * 100, flush=True)
+
+        # Aggressive memory cleanup after each layer
+        gc.collect()
+        torch.cuda.empty_cache()
 
     print("MoE reconstruction and quantization done.")
     tick_quant_end = time.time()

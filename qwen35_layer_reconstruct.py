@@ -143,6 +143,12 @@ def reconstruct_moe_from_existing(model, layer, layer_idx, inps,
                         rates_x[x] = q_rates[x][expert_idx].detach().cpu().float().numpy()
                     expert_rates_list.append(rates_x)
 
+                # Free q_rates early since we don't need it after this point
+                for x in outlier_bits:
+                    del q_rates[x]
+                del q_rates
+                gc.collect()
+
                 dp_tick0 = time.time()
                 dpscheme_list, all_rates_arr = enum_optimal_m_scheme_global_fast(
                     expert_rates_list,
@@ -154,10 +160,18 @@ def reconstruct_moe_from_existing(model, layer, layer_idx, inps,
                 dp_tick1 = time.time()
                 print(f"enum_optimal_m_scheme_global_fast time {dp_tick1 - dp_tick0}", flush=True)
 
+                # Free expert_rates_list after use
+                del expert_rates_list
+                gc.collect()
+
                 all_rates = []
                 for expert_idx in range(ori_expert_num):
                     rates_arr = all_rates_arr[expert_idx]
                     all_rates.append(torch.from_numpy(rates_arr).to(device))
+
+                # Free all_rates_arr after use
+                del all_rates_arr
+                gc.collect()
 
                 print(f"built dpscheme_list target_bpw {qscheme['target_bpw']} for {ori_expert_num} experts")
             else:
@@ -311,12 +325,23 @@ def reconstruct_moe_from_existing(model, layer, layer_idx, inps,
     print(f"Layer {layer_idx}, {args.rank_mode} expert re- sort time: {tick1 - tick0}", flush=True)
     print("all_new_expert_rates:", len(all_new_expert_rates))
 
+    # Clean up intermediate data structures
+    del all_expert_groups, all_new_expert_rates
+    if 'all_rates' in locals():
+        del all_rates
+    gc.collect()
+
     # Hybrid mode only
     # 用简单的 MoE 块，不依赖原始类
     moe = SimpleMoEBlock(model.config).to(device)
     moe.gate = layer.mlp.gate
     moe.num_experts = len(all_new_experts)
     moe.experts = nn.ModuleList([DartMoQHybridWrapper(sub_experts) for sub_experts in all_new_experts])
+
+    # Clean up all_new_experts since we've transferred ownership to the ModuleList
+    del all_new_experts
+    gc.collect()
+
     counter = Counter(sub_expert_bit_configs)
     print("reconstruct moe with sub_expert_bit_configs: ", counter)
     if hasattr(layer.mlp, 'shared_expert'):
@@ -324,6 +349,11 @@ def reconstruct_moe_from_existing(model, layer, layer_idx, inps,
     if hasattr(layer.mlp, 'shared_expert_gate'):
         moe.shared_expert_gate = layer.mlp.shared_expert_gate
     moe.training = False
+
+    # Clean up sub_expert_bit_configs
+    del sub_expert_bit_configs, expert_to_subexperts
+    if 'dpscheme_list' in locals():
+        del dpscheme_list
 
     gc.collect()
     torch.cuda.empty_cache()

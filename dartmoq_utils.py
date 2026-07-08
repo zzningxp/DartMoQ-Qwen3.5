@@ -469,13 +469,20 @@ def analyze_turboquant_outlier_activation_aware(
             activation_sample_counts=expert_inputs[expert_idx]["sample_counts"] if expert_inputs is not None else None,
         )
 
+        # Make sure rates is on CPU to save GPU memory
+        rates = rates.detach().cpu()
         all_rates.append(rates)
+
         tick1 = time.time()
         print(
             f"TurboQuant {mode} outlier, layer {layer_idx} expert {expert_idx} "
             f"bits: {wbits} time: {tick1 - tick0:.4f}",
             flush=True,
         )
+
+        # Clean up after each expert
+        del rates
+        gc.collect()
 
     if save_path:
         rates = all_rates[0]
@@ -520,8 +527,6 @@ def quant_layer_mix_precision(layer, layer_idx, quant_attn, n_experts, slice_exp
     for ff in filters:
         qmodule_all = find_layers(layer, filters=[ff])
         qbatch = QBATCH
-        gptq = {}
-        loss = {}
         bit_set = []
 
         for qmi in range(0, len(qmodule_all.keys()), qbatch):
@@ -530,6 +535,11 @@ def quant_layer_mix_precision(layer, layer_idx, quant_attn, n_experts, slice_exp
             qmodule = {k: qmodule_all[k] for k in list(qmodule_all.keys())[qmi: qmi + qbatch]}
             if len(qmodule.keys()) == 0:
                 continue
+
+            # Initialize for this batch
+            gptq = {}
+            loss = {}
+
             for name in qmodule.keys():
                 split_name = name.split('.')[-1]
                 gptq[name] = GPTQ(qmodule[name])
@@ -733,9 +743,16 @@ def quant_layer_mix_precision(layer, layer_idx, quant_attn, n_experts, slice_exp
             print(f"Quantize layer {layer_idx} {ff} {qmi}:{qmi + min(qbatch, len(qmodule.keys()))} {quantmode} time: {tick1 - tick0:.4f} + {tick2 - tick1:.4f}", end=" ")
             print(f"bit_set: {Counter(bit_set)} loss: {sum_loss:.6f}", flush=True)
             del qmodule
+            # Clean up after each batch
+            gc.collect()
+            torch.cuda.empty_cache()
 
         del qmodule_all
-        del loss, gptq
+
+        # Clean up bit_set to save memory
+        del bit_set
+        gc.collect()
+        torch.cuda.empty_cache()
 
     torch.cuda.synchronize()
 
