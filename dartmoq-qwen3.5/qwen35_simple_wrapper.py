@@ -30,6 +30,7 @@ def construct_moe(model, moe_model_flag, layer, layer_idx, inp,
                     attention_mask, position_ids, position_embeddings,
                     n_experts, n_activated, slice_expert_num, ori_activated,
                     qscheme, args):
+    import inspect
 
     modeltype = model.config.model_type
     batchsize = inp.shape[0]
@@ -54,29 +55,63 @@ def construct_moe(model, moe_model_flag, layer, layer_idx, inp,
         if modeltype == 'olmoe' or modeltype == 'llama' or modeltype == 'qwen3' or modeltype == 'qwen3_moe' or modeltype == 'qwen3_5' or modeltype == 'deepseek_v3':
             with torch.no_grad():
                 if hasattr(layer, 'self_attn'):
-                    attn_out[b_i:b_i+1] = layer.self_attn(
-                        hidden_states=hidden_states_inorm[b_i:b_i+1],
-                        attention_mask=attention_mask,
-                        position_ids=position_ids,
-                        position_embeddings=position_embeddings)[0]
+                    # Use inspect to check what arguments the attention layer accepts
+                    attn_forward = layer.self_attn.forward
+                    forward_signature = inspect.signature(attn_forward)
+                    attn_kwargs = {
+                        'hidden_states': hidden_states_inorm[b_i:b_i+1]
+                    }
+                    if 'attention_mask' in forward_signature.parameters:
+                        attn_kwargs['attention_mask'] = attention_mask
+                    if 'position_ids' in forward_signature.parameters:
+                        attn_kwargs['position_ids'] = position_ids
+                    if 'position_embeddings' in forward_signature.parameters:
+                        attn_kwargs['position_embeddings'] = position_embeddings
+                    attn_out[b_i:b_i+1] = layer.self_attn(**attn_kwargs)[0]
                 elif hasattr(layer, 'linear_attn'):
-                    attn_out[b_i:b_i+1] = layer.linear_attn(
-                        hidden_states=hidden_states_inorm[b_i:b_i+1],
-                        attention_mask=attention_mask,
-                        position_ids=position_ids,
-                        position_embeddings=position_embeddings)[0]
+                    # Use inspect to check what arguments the attention layer accepts
+                    attn_forward = layer.linear_attn.forward
+                    forward_signature = inspect.signature(attn_forward)
+                    attn_kwargs = {
+                        'hidden_states': hidden_states_inorm[b_i:b_i+1]
+                    }
+                    if 'attention_mask' in forward_signature.parameters:
+                        attn_kwargs['attention_mask'] = attention_mask
+                    if 'position_ids' in forward_signature.parameters:
+                        attn_kwargs['position_ids'] = position_ids
+                    if 'position_embeddings' in forward_signature.parameters:
+                        attn_kwargs['position_embeddings'] = position_embeddings
+                    attn_out[b_i:b_i+1] = layer.linear_attn(**attn_kwargs)[0]
         else:
             with torch.no_grad():
                 if hasattr(layer, 'self_attn'):
-                    attn_out[b_i:b_i+1] = layer.self_attn(
-                        hidden_states=hidden_states_inorm[b_i:b_i+1],
-                        attention_mask=attention_mask,
-                        position_ids=position_ids)[0]
+                    # Use inspect to check what arguments the attention layer accepts
+                    attn_forward = layer.self_attn.forward
+                    forward_signature = inspect.signature(attn_forward)
+                    attn_kwargs = {
+                        'hidden_states': hidden_states_inorm[b_i:b_i+1]
+                    }
+                    if 'attention_mask' in forward_signature.parameters:
+                        attn_kwargs['attention_mask'] = attention_mask
+                    if 'position_ids' in forward_signature.parameters:
+                        attn_kwargs['position_ids'] = position_ids
+                    if 'position_embeddings' in forward_signature.parameters:
+                        attn_kwargs['position_embeddings'] = position_embeddings
+                    attn_out[b_i:b_i+1] = layer.self_attn(**attn_kwargs)[0]
                 elif hasattr(layer, 'linear_attn'):
-                    attn_out[b_i:b_i+1] = layer.linear_attn(
-                        hidden_states=hidden_states_inorm[b_i:b_i+1],
-                        attention_mask=attention_mask,
-                        position_ids=position_ids)[0]
+                    # Use inspect to check what arguments the attention layer accepts
+                    attn_forward = layer.linear_attn.forward
+                    forward_signature = inspect.signature(attn_forward)
+                    attn_kwargs = {
+                        'hidden_states': hidden_states_inorm[b_i:b_i+1]
+                    }
+                    if 'attention_mask' in forward_signature.parameters:
+                        attn_kwargs['attention_mask'] = attention_mask
+                    if 'position_ids' in forward_signature.parameters:
+                        attn_kwargs['position_ids'] = position_ids
+                    if 'position_embeddings' in forward_signature.parameters:
+                        attn_kwargs['position_embeddings'] = position_embeddings
+                    attn_out[b_i:b_i+1] = layer.linear_attn(**attn_kwargs)[0]
 
     hidden_states = residual + attn_out
     residual = hidden_states

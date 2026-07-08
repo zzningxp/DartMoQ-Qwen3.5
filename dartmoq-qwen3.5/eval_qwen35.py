@@ -4,6 +4,7 @@ Qwen3.5 MoE Evaluation Script.
 Phase 1: Original FP16 perplexity evaluation with CPU standby mode support.
 """
 
+import gc
 import time
 import torch
 import torch.nn as nn

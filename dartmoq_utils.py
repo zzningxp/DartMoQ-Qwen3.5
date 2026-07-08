@@ -31,40 +31,48 @@ def analyze_experts_activation(layer, layer_idx, inps, K, modeltype, save_path=N
     batch_size, seq_len, emb_size = inps.shape
     total_samples = batch_size * seq_len
 
-    activation_markers = torch.zeros(layer.mlp.gate.weight.shape[0]).to(inps.device)
-    if modeltype == 'olmoe' or modeltype == 'qwen3_moe' or modeltype == 'qwen3':
+    num_experts = layer.mlp.gate.weight.shape[0]
+    activation_markers = torch.zeros(num_experts, dtype=torch.float32, device='cpu')
+
+    if modeltype == 'olmoe' or modeltype == 'qwen3_moe' or modeltype == 'qwen3' or modeltype == 'qwen3_5':
         with torch.no_grad():
             hidden_states = inps.view(-1, emb_size)
             router_logits = layer.mlp.gate(hidden_states)
             router_logits = F.softmax(router_logits, dim=-1)
             _, top_indices = torch.topk(router_logits, K, dim=-1)
-            # print(top_indices.shape)
+            # Move to CPU for processing
+            top_indices = top_indices.detach().to('cpu')
             del router_logits, hidden_states
     else:
         if modeltype == 'deepseek_v3':
             with torch.no_grad():
                 top_indices, top_values = layer.mlp.gate(inps)
+                top_indices = top_indices.detach().to('cpu')
         else:
             with torch.no_grad():
                 top_indices, top_values, _ = layer.mlp.gate(inps)
-                # print(top_indices.shape)
+                top_indices = top_indices.detach().to('cpu')
 
-    for i in range(total_samples):
-        activation_markers[top_indices[i]] += 1.0
-    
+    # Convert to long first, then flatten and convert to numpy for safe processing
+    flat_top_indices = top_indices.to(torch.long).view(-1).numpy()
+
+    # Use numpy for safe accumulation
+    for idx in flat_top_indices:
+        if 0 <= idx < num_experts:
+            activation_markers[idx] += 1.0
+
     activation_rates = activation_markers / total_samples
-    activation_rates = activation_rates.detach().cpu()
 
     if save_path:
         plt.figure(figsize=(10, 10))
-        
+
         plt.subplot(1, 1, 1)
         plt.plot(range(activation_rates.shape[0]), np.sort(activation_rates.numpy()),  'b-', alpha=0.6)
         plt.title(f'Activation Rates for Layer {layer_idx}')
         plt.xlabel('Neuron Index')
         plt.ylabel('Activation Rate')
         plt.grid(True, alpha=0.3)
-        
+
         # Add statistics for rates
         mean_rate = activation_rates.mean()
         std_rate = activation_rates.std()
@@ -72,7 +80,7 @@ def analyze_experts_activation(layer, layer_idx, inps, K, modeltype, save_path=N
                      f'Std rate: {std_rate:.3f}\n'
                      f'Max rate: {activation_rates.max():.3f}\n'
                      f'Min rate: {activation_rates.min():.3f}')
-        
+
         plt.text(0.95, 0.95, stats_text,
                 transform=plt.gca().transAxes,
                 verticalalignment='top',
@@ -80,9 +88,9 @@ def analyze_experts_activation(layer, layer_idx, inps, K, modeltype, save_path=N
                 bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
 
         plt.grid(True, alpha=0.3)
-        
+
         plt.tight_layout()
-        
+
         plt.savefig(save_path)
         plt.close()
 
@@ -595,19 +603,78 @@ def quant_layer_mix_precision(layer, layer_idx, quant_attn, n_experts, slice_exp
             for isample in range(nsample):
                 if split_name in attn_filters:
                     attn_sample = attn_hidden_states[isample].unsqueeze(0)
-                    try:
-                        with torch.no_grad():
-                            layer.self_attn(
-                                hidden_states=attn_sample, 
-                                attention_mask=attention_mask, 
-                                position_ids=position_ids,
-                                position_embeddings=position_embeddings)
-                    except:
-                        with torch.no_grad():
-                            layer.self_attn(
-                                hidden_states=attn_sample, 
-                                attention_mask=attention_mask, 
-                                position_ids=position_ids)
+                    with torch.no_grad():
+                        # Use inspect to determine which parameters the attention layer expects
+                        import inspect
+                        # Check if we have self_attn or linear_attn
+                        if hasattr(layer, 'self_attn'):
+                            attn_layer = layer.self_attn
+                        elif hasattr(layer, 'linear_attn'):
+                            attn_layer = layer.linear_attn
+                        else:
+                            raise ValueError("Layer has neither self_attn nor linear_attn")
+
+                        forward_signature = inspect.signature(attn_layer.forward)
+
+                        # # Debug: print the signature
+                        # if isample == 0:
+                        #     print(f"DEBUG: Attention layer forward signature: {forward_signature}")
+                        #     print(f"DEBUG: All parameters: {list(forward_signature.parameters.keys())}")
+                        #     print(f"DEBUG: attention_mask available: {attention_mask is not None}")
+                        #     if attention_mask is not None:
+                        #         print(f"DEBUG: attention_mask shape: {attention_mask.shape}")
+                        #     print(f"DEBUG: position_ids available: {position_ids is not None}")
+                        #     if position_ids is not None:
+                        #         print(f"DEBUG: position_ids shape: {position_ids.shape}")
+                        #     print(f"DEBUG: position_embeddings available: {position_embeddings is not None}")
+
+                        attn_kwargs = {'hidden_states': attn_sample}
+
+                        # Add all required parameters that we have
+                        param_names = list(forward_signature.parameters.keys())
+                        for param_name in param_names:
+                            if param_name == 'hidden_states':
+                                continue  # already added
+                            if param_name == 'attention_mask':
+                                # Always pass attention_mask even if it's None - it's required by the signature
+                                if attention_mask is not None:
+                                    # Slice attention_mask for the current sample if it's batched
+                                    if attention_mask.dim() > 1 and attention_mask.shape[0] > 1:
+                                        attn_kwargs['attention_mask'] = attention_mask[isample:isample+1]
+                                    else:
+                                        attn_kwargs['attention_mask'] = attention_mask
+                                else:
+                                    # Create a dummy attention_mask if None is passed but required
+                                    # Use bool type for SDPA compatibility
+                                    seq_length = attn_sample.shape[1]
+                                    attn_kwargs['attention_mask'] = torch.ones((1, seq_length), dtype=torch.bool, device=attn_sample.device)
+                            elif param_name == 'position_ids' and position_ids is not None:
+                                # Slice position_ids for the current sample if it's batched
+                                if position_ids.dim() > 1 and position_ids.shape[0] > 1:
+                                    attn_kwargs['position_ids'] = position_ids[isample:isample+1]
+                                else:
+                                    attn_kwargs['position_ids'] = position_ids
+                            elif param_name == 'position_embeddings' and position_embeddings is not None:
+                                # Handle position_embeddings - could be a tuple or tensor
+                                if isinstance(position_embeddings, (list, tuple)):
+                                    if len(position_embeddings) == 2:
+                                        # (cos, sin) format
+                                        cos, sin = position_embeddings
+                                        if cos.dim() > 1 and cos.shape[0] > 1:
+                                            attn_kwargs['position_embeddings'] = (cos[isample:isample+1], sin[isample:isample+1])
+                                        else:
+                                            attn_kwargs['position_embeddings'] = position_embeddings
+                                    else:
+                                        attn_kwargs['position_embeddings'] = position_embeddings
+                                else:
+                                    # Tensor format
+                                    if position_embeddings.dim() > 1 and position_embeddings.shape[0] > 1:
+                                        attn_kwargs['position_embeddings'] = position_embeddings[isample:isample+1]
+                                    else:
+                                        attn_kwargs['position_embeddings'] = position_embeddings
+
+                        # Call attention layer with the appropriate kwargs
+                        attn_layer(**attn_kwargs)
                 elif split_name in ffn_filters:
                     ffn_sample = ffn_hidden_states[isample].unsqueeze(0)
                     with torch.no_grad():
