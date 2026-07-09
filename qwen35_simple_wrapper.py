@@ -69,39 +69,19 @@ def should_quantize_layer(layer_idx, quant_layers_set):
 def construct_moe(model, moe_model_flag, layer, layer_idx, inp,
                     attention_mask, position_ids, position_embeddings,
                     n_experts, n_activated, slice_expert_num, ori_activated,
-                    qscheme, args, should_quantize=True):
+                    qscheme, args):
     import inspect
+    from grouped_gemm_moe_adapter import convert_single_layer, is_grouped_gemm_moe_layer
 
-    # Fast path: if not quantizing, just do a simple forward pass
-    if not should_quantize:
-        print(f"Skipping quantization for layer {layer_idx} - using fast path", flush=True)
-        tick0 = time.time()
+    # Convert this single layer first if needed
+    if is_grouped_gemm_moe_layer(layer):
+        print(f"  Converting layer {layer_idx} to traditional format...")
+        tick_convert = time.time()
+        layer, _ = convert_single_layer(layer)
+        tick_convert_end = time.time()
+        print(f"  Layer {layer_idx} converted in {tick_convert_end - tick_convert:.3f}s")
 
-        device = next(layer.parameters()).device
-        inp = inp.to(device)
-
-        # Directly call the layer's forward method - simplest and fastest
-        import inspect
-        layer_forward = layer.forward
-        forward_signature = inspect.signature(layer_forward)
-
-        layer_kwargs = {
-            'hidden_states': inp
-        }
-        if 'attention_mask' in forward_signature.parameters and attention_mask is not None:
-            layer_kwargs['attention_mask'] = attention_mask.to(device)
-        if 'position_ids' in forward_signature.parameters and position_ids is not None:
-            layer_kwargs['position_ids'] = position_ids.to(device)
-        if 'position_embeddings' in forward_signature.parameters and position_embeddings is not None:
-            layer_kwargs['position_embeddings'] = position_embeddings
-
-        out = layer(**layer_kwargs)[0]
-
-        tick1 = time.time()
-        print(f"Fast path layer {layer_idx} time: {tick1 - tick0:.2f} s", flush=True)
-        return out
-
-    # Normal quantization path
+    # Normal quantization path - always quantize when this function is called
     modeltype = model.config.model_type
     batchsize = inp.shape[0]
 
@@ -197,8 +177,10 @@ def construct_moe(model, moe_model_flag, layer, layer_idx, inp,
 
     if moe_model_flag:
         if is_moe_layer:
-            moe = reconstruct_moe_from_existing(model, layer, layer_idx, hidden_states,
-                                                n_experts, n_activated, slice_expert_num, ori_activated, device,
+            moe, layer_metadata = reconstruct_moe_from_existing(model, layer, layer_idx,
+                                                hidden_states,
+                                                n_experts, n_activated, slice_expert_num, 
+                                                ori_activated, device,
                                                 qscheme, use_hybrid_moe, global_mode, quantmode, args)
             layer.mlp = moe
     else:
@@ -210,13 +192,23 @@ def construct_moe(model, moe_model_flag, layer, layer_idx, inp,
 
     tick0 = time.time()
     if_quant_attn = True
-    quant_layer_mix_precision(layer, layer_idx, if_quant_attn, n_experts, slice_expert_num,
-                hidden_states_inorm, hidden_states, attention_mask, position_ids, position_embeddings,
-                qscheme, use_hybrid_moe, quantmode, seed=args.seed)
+    quant_layer_mix_precision(layer, layer_idx, if_quant_attn, 
+                              n_experts, slice_expert_num,
+                              hidden_states_inorm, hidden_states, 
+                              attention_mask, position_ids, position_embeddings,
+                              qscheme, use_hybrid_moe, quantmode, seed=args.seed)
     gc.collect()
     torch.cuda.empty_cache()
     tick1 = time.time()
     print(f"quant_layer_mix_precision layer {layer_idx} time: {tick1 - tick0:.4f}", flush=True)
+
+    if moe_model_flag and is_moe_layer:
+        print(f"Restructuring to grouped_gemm format (layer {layer_idx})...")
+        tick_restructure = time.time()
+        from qwen35_hybrid_moe import restructure_to_grouped_gemm
+        layer.mlp = restructure_to_grouped_gemm(layer.mlp, layer_metadata, device)
+        tick_restructure_end = time.time()
+        print(f"Restructured layer {layer_idx} in {tick_restructure_end - tick_restructure:.2f}s")
 
     moe_out = torch.zeros_like(hidden_states)
     for b_i in range(0, batchsize):
@@ -246,10 +238,6 @@ def construct_moe(model, moe_model_flag, layer, layer_idx, inp,
 def dartmoq_quant_grouped_gemm_moe(model, tokenizer, dataloader, args, test_ppl=True):
     print('Starting Grouped_GEMM_MoE quantization...')
     tick_quant_start = time.time()
-
-    # ============ 改动2：先把 Grouped_GEMM_MoE 层转换成传统格式 ============
-    print("Converting Grouped_GEMM_MoE layers to traditional format...")
-    model = convert_grouped_gemm_to_traditional(model, use_gpu_acceleration=True)
 
     use_cache = model.config.use_cache
     model.config.use_cache = False
@@ -326,21 +314,38 @@ def dartmoq_quant_grouped_gemm_moe(model, tokenizer, dataloader, args, test_ppl=
     if moe_model_flag:
         slice_expert_num = args.slices
 
+        # 从第一层获取必要的 config 信息（不需要 convert，直接读）
+        first_mlp = model.model.layers[0].mlp
         if hasattr(model.config, 'num_experts'):
             ori_num_experts = model.config.num_experts
         elif hasattr(model.config, 'n_routed_experts'):
             ori_num_experts = model.config.n_routed_experts
-        elif hasattr(model.model.layers[0].mlp, 'experts'):
-            # 兜底方案：从第一层推断
-            ori_num_experts = len(model.model.layers[0].mlp.experts)
+        elif hasattr(first_mlp, 'experts'):
+            if hasattr(first_mlp.experts, 'gate_up_proj'):
+                ori_num_experts = first_mlp.experts.gate_up_proj.shape[0]
+            else:
+                ori_num_experts = len(first_mlp.experts)
 
         # 获取 top_k/num_experts_per_tok
         if hasattr(model.config, 'num_experts_per_tok'):
             ori_num_experts_per_tok = model.config.num_experts_per_tok
-        elif hasattr(model.model.layers[0].mlp, 'top_k'):
-            ori_num_experts_per_tok = model.model.layers[0].mlp.top_k
+        elif hasattr(first_mlp, 'top_k'):
+            ori_num_experts_per_tok = first_mlp.top_k
         else:
             ori_num_experts_per_tok = 6
+
+        # 确保 config 有必要的属性
+        if not hasattr(model.config, 'num_experts') and not hasattr(model.config, 'n_routed_experts'):
+            model.config.num_experts = ori_num_experts
+        if not hasattr(model.config, 'moe_intermediate_size'):
+            if hasattr(model.config, 'intermediate_size'):
+                model.config.moe_intermediate_size = model.config.intermediate_size
+            elif hasattr(first_mlp.experts, 'gate_up_proj'):
+                model.config.moe_intermediate_size = first_mlp.experts.gate_up_proj.shape[1] // 2
+        if not hasattr(model.config, 'intermediate_size'):
+            model.config.intermediate_size = model.config.moe_intermediate_size
+        if not hasattr(model.config, 'num_experts_per_tok'):
+            model.config.num_experts_per_tok = ori_num_experts_per_tok
 
         # Hybrid mode: keep original config
         new_num_expert = ori_num_experts
@@ -392,6 +397,11 @@ def dartmoq_quant_grouped_gemm_moe(model, tokenizer, dataloader, args, test_ppl=
     quant_layers_set = parse_quant_layers(getattr(args, 'quant_layers', None))
     if quant_layers_set is not None:
         print(f"Quantizing layers: {sorted(quant_layers_set)}")
+        # Ensure quant layers are continuous starting from 0
+        sorted_layers = sorted(quant_layers_set)
+        assert sorted_layers[0] == 0, f"Quant layers must start from 0, got {sorted_layers[0]}"
+        for i in range(1, len(sorted_layers)):
+            assert sorted_layers[i] == sorted_layers[i-1] + 1, f"Quant layers must be continuous, got gap between {sorted_layers[i-1]} and {sorted_layers[i]}"
     else:
         print("Quantizing all layers")
 
@@ -406,6 +416,13 @@ def dartmoq_quant_grouped_gemm_moe(model, tokenizer, dataloader, args, test_ppl=
         print(f"Set model.model_id to: {model.model_id}")
 
     for layer_idx, layer in enumerate(layers):
+        # Determine if this layer should be quantized, skip layer for fast algorithm tests
+        quantize_this_layer = should_quantize_layer(layer_idx, quant_layers_set)
+
+        if not quantize_this_layer:
+            print(f"Skipping layer {layer_idx} and all remaining layers...", flush=True)
+            break
+
         tick0 = time.time()
         print(f"\nProcessing layer {layer_idx}/{len(layers)}")
 
@@ -415,9 +432,7 @@ def dartmoq_quant_grouped_gemm_moe(model, tokenizer, dataloader, args, test_ppl=
             if hasattr(model.model, 'rotary_emb'):
                 model.model.rotary_emb = model.model.rotary_emb.to(DEV)
 
-        # Determine if this layer should be quantized
-        quantize_this_layer = should_quantize_layer(layer_idx, quant_layers_set)
-
+        # Quantize this layer - use construct_moe
         moe_out = construct_moe(model,
             moe_model_flag,
             layer,
@@ -431,8 +446,7 @@ def dartmoq_quant_grouped_gemm_moe(model, tokenizer, dataloader, args, test_ppl=
             slice_expert_num = slice_expert_num,
             ori_activated = ori_num_experts_per_tok,
             qscheme = qscheme,
-            args = args,
-            should_quantize = quantize_this_layer
+            args = args
         )
 
         # Free memory from old inps before assigning new one

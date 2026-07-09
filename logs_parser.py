@@ -19,33 +19,10 @@ from dataclasses import asdict, dataclass, field
 from typing import Iterable
 
 
-TASK_ALIASES = {
-    "arc_challenge": "arc_c",
-    "arc_easy": "arc_e",
-    "piqa": "piqa",
-    "boolq": "boolq",
-    "winogrande": "wino",
-    "mnli": "mnli",
-    "hellaswag": "hella",
-    "mmlu": "mmlu",
-}
-
-TASK_FIELDS = [
-    "arc_c_acc", "arc_c_acc_norm",
-    "arc_e_acc", "arc_e_acc_norm",
-    "piqa_acc", "piqa_acc_norm",
-    "boolq_acc",
-    "wino_acc",
-    "mnli_acc",
-    "hella_acc", "hella_acc_norm",
-    "mmlu_acc",
-]
-
 FIELDNAMES = [
     "model_name", "slices", "quant_scheme", "rank_mode",
-    "moe_struct", "quantmode", "disable_0bit_prune", "standby_layer_cpu", "quant_layers", "true_quant", "bpw", "ppl_wikitext2", "ppl_c4",
-    *TASK_FIELDS,
-    "status", "runtime_ppl", "runtime_quant", "runtime_ppl_eval", "runtime_zero_eval",
+    "moe_struct", "quantmode", "disable_0bit_prune", "standby_layer_cpu", "quant_layers", "bpw", "ppl_wikitext2", "ppl_c4",
+    "status", "runtime_ppl", "runtime_quant", "runtime_ppl_eval",
 ]
 
 # New log format patterns
@@ -58,7 +35,6 @@ NEW_SLICES_RE = re.compile(r"^Slices per expert:\s+(?P<slices>\S+)")
 NEW_QUANTMODE_RE = re.compile(r"^Quant mode:\s+(?P<quantmode>\S+)")
 NEW_STANDBY_CPU_RE = re.compile(r"^CPU standby:\s+(?P<standby_layer_cpu>\S+)")
 NEW_QUANT_LAYERS_RE = re.compile(r"^Quantizing layers:\s+(?P<quant_layers>.+)")
-NEW_TRUE_QUANT_RE = re.compile(r"^True quantization:\s+(?P<true_quant>\S+)")
 NEW_START_TIME_RE = re.compile(r"^Current time:\s*(?P<value>.+)")
 NEW_FINISH_TIME_RE = re.compile(r"^Finish time:\s*(?P<value>.+)")
 NEW_PPL_RE = re.compile(r"ppl on (?P<dataset>wikitext2|c4)(?:\s+\([^)]+\))?:\s*(?P<value>[-+0-9.eE]+)(?:\s+time:\s*(?P<time_value>[-+0-9.eE]+))?")
@@ -77,12 +53,9 @@ QUANTMODE_RE = re.compile(
 )
 BPW_RE = re.compile(r"\bwith bpw\s+(?P<bpw>[-+0-9.eE]+)")
 PPL_RE = re.compile(r"ppl on (?P<dataset>wikitext2|c4)(?:\s+\([^)]+\))?:\s*(?P<value>[-+0-9.eE]+)")
-TASK_RE = re.compile(r"^(?P<task>[A-Za-z0-9_]+)\s+\{(?P<body>.*)\}\s+time:")
-METRIC_RE_TEMPLATE = r"['\"]{name}['\"]:\s*(?:np\.float64\()?([-+0-9.eE]+)"
 RUNTIME_RE = re.compile(r"Runtime of training-free construction \(ppl\):\s*(?P<value>[-+0-9.eE]+)")
 RUNTIME_QUANT_RE = re.compile(r"Runtime of quantization only:\s*(?P<value>[-+0-9.eE]+)")
 RUNTIME_PPL_EVAL_RE = re.compile(r"Runtime of wiki/c4 validation:\s*(?P<value>[-+0-9.eE]+)")
-RUNTIME_ZERO_EVAL_RE = re.compile(r"Runtime of zero-shot evaluation:\s*(?P<value>[-+0-9.eE]+)")
 START_TIME_RE = re.compile(r"Current start time:\s*(?P<value>.+)")
 FATAL_RE = re.compile(r"Segmentation fault|Traceback|RuntimeError|CUDA out of memory|Killed", re.IGNORECASE)
 MODEL_NAME_RE = re.compile(r"^model:\s+(?P<path>\S+)\s+(?P<name>\S+)")
@@ -90,7 +63,9 @@ NUMERIC_RE = re.compile(r"^[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?$")
 
 # For backward compatibility with old logs
 PPL_INDIVIDUAL_TIME_RE = re.compile(r"ppl on (?P<dataset>wikitext2|c4)(?:\s+\([^)]+\))?:\s*[-+0-9.eE]+\s*time:\s*(?P<value>[-+0-9.eE]+)")
-ZERO_EVAL_OLD_RE = re.compile(r"Zero-shot evaluation time:\s*(?P<value>[-+0-9.eE]+)")
+
+# Pattern to parse bpw from quant_scheme (format like "w8a8" or "w4a4" etc.)
+QUANT_SCHEME_BPW_RE = re.compile(r"w(?P<weight_bits>\d+)(?:a(?P<act_bits>\d+))?")
 
 
 @dataclass
@@ -111,26 +86,12 @@ class RunRecord:
     disable_0bit_prune: str = ""
     standby_layer_cpu: str = ""
     quant_layers: str = ""
-    true_quant: str = ""
     bpw: str = ""
     ppl_wikitext2: str = ""
     ppl_c4: str = ""
-    arc_c_acc: str = ""
-    arc_c_acc_norm: str = ""
-    arc_e_acc: str = ""
-    arc_e_acc_norm: str = ""
-    piqa_acc: str = ""
-    piqa_acc_norm: str = ""
-    boolq_acc: str = ""
-    wino_acc: str = ""
-    mnli_acc: str = ""
-    hella_acc: str = ""
-    hella_acc_norm: str = ""
-    mmlu_acc: str = ""
     runtime_ppl: str = ""
     runtime_quant: str = ""
     runtime_ppl_eval: str = ""
-    runtime_zero_eval: str = ""
     error: str = ""
     _fatal: bool = field(default=False, repr=False)
     # Temporary fields for accumulating time from old logs
@@ -148,25 +109,58 @@ class RunRecord:
         if not self.runtime_ppl_eval and self._ppl_eval_times:
             total = sum(self._ppl_eval_times)
             self.runtime_ppl_eval = f"{total:.2f}"
+        # Calculate bpw from quant_scheme if not already set
+        if not self.bpw and self.quant_scheme:
+            bpw = self._calculate_bpw_from_scheme(self.quant_scheme)
+            if bpw is not None:
+                self.bpw = f"{bpw:.2f}"
+        # Calculate total time: time = t_q + t_ppl
+        if not self.runtime_ppl:
+            t_quant = 0.0
+            t_ppl = 0.0
+            try:
+                if self.runtime_quant:
+                    t_quant = float(self.runtime_quant)
+            except ValueError:
+                pass
+            try:
+                if self.runtime_ppl_eval:
+                    t_ppl = float(self.runtime_ppl_eval)
+            except ValueError:
+                pass
+            if t_quant > 0 or t_ppl > 0:
+                self.runtime_ppl = f"{t_quant + t_ppl:.2f}"
         if self._fatal:
             self.status = "failed"
         elif self.ppl_wikitext2 and self.ppl_c4:
             # Have both ppl results
-            missing = [name for name in TASK_FIELDS if not getattr(self, name)]
-            if missing:
-                self.status = "partial"
-            else:
-                self.status = "ok"
-        elif self.runtime_ppl or self.mmlu_acc:
+            self.status = "ok"
+        elif self.runtime_ppl:
             # Have other results but not both ppl
-            missing = [name for name in TASK_FIELDS if not getattr(self, name)]
-            if missing:
-                self.status = "partial"
-            else:
-                self.status = "ok"
+            self.status = "partial"
         else:
             # Have only one ppl or nothing at all
             self.status = "incomplete"
+
+    @staticmethod
+    def _calculate_bpw_from_scheme(quant_scheme: str) -> float | None:
+        """Calculate bpw from quant_scheme string.
+
+        Format examples: "w8a8", "w4a4", "w4", "w8a16", etc.
+        Returns None if parsing fails.
+        """
+        match = QUANT_SCHEME_BPW_RE.search(quant_scheme)
+        if match:
+            weight_bits = int(match.group("weight_bits"))
+            act_bits = match.group("act_bits")
+            if act_bits:
+                # Simple estimation: average of weight and activation bits
+                # This can be adjusted based on actual calculation logic
+                act_bits_val = int(act_bits)
+                return (weight_bits + act_bits_val) / 2.0
+            else:
+                return float(weight_bits)
+        return None
 
     def public_dict(self) -> dict[str, str | int]:
         row = asdict(self)
@@ -180,11 +174,6 @@ def _clean_line(line: str) -> str:
 
 def _last_path_component(path: str) -> str:
     return os.path.basename(path.rstrip("/"))
-
-
-def _metric(body: str, name: str) -> str:
-    match = re.search(METRIC_RE_TEMPLATE.format(name=re.escape(name)), body)
-    return match.group(1) if match else ""
 
 
 def _append_error(record: RunRecord, line: str) -> None:
@@ -356,11 +345,6 @@ def parse_log(path: str) -> list[RunRecord]:
                     current.quant_layers = quant_layers_match.group("quant_layers")
                     continue
 
-                true_quant_match = NEW_TRUE_QUANT_RE.search(line)
-                if true_quant_match:
-                    current.true_quant = true_quant_match.group("true_quant")
-                    continue
-
                 start_time_match = NEW_START_TIME_RE.search(line)
                 if start_time_match:
                     current.start_time = start_time_match.group("value").strip()
@@ -421,20 +405,6 @@ def parse_log(path: str) -> list[RunRecord]:
                 setattr(current, f"ppl_{dataset}", ppl_match.group("value"))
                 continue
 
-            task_match = TASK_RE.search(line)
-            if task_match:
-                task = task_match.group("task")
-                prefix = TASK_ALIASES.get(task)
-                if prefix:
-                    body = task_match.group("body")
-                    acc = _metric(body, "acc,none")
-                    acc_norm = _metric(body, "acc_norm,none")
-                    if acc:
-                        setattr(current, f"{prefix}_acc", acc)
-                    if acc_norm and f"{prefix}_acc_norm" in TASK_FIELDS:
-                        setattr(current, f"{prefix}_acc_norm", acc_norm)
-                continue
-
             runtime_match = RUNTIME_RE.search(line)
             if runtime_match:
                 current.runtime_ppl = runtime_match.group("value")
@@ -448,17 +418,6 @@ def parse_log(path: str) -> list[RunRecord]:
             runtime_ppl_eval_match = RUNTIME_PPL_EVAL_RE.search(line)
             if runtime_ppl_eval_match:
                 current.runtime_ppl_eval = runtime_ppl_eval_match.group("value")
-                continue
-
-            runtime_zero_eval_match = RUNTIME_ZERO_EVAL_RE.search(line)
-            if runtime_zero_eval_match:
-                current.runtime_zero_eval = runtime_zero_eval_match.group("value")
-                continue
-
-            # Backward compatibility: parse old zero-eval time format
-            zero_eval_old_match = ZERO_EVAL_OLD_RE.search(line)
-            if zero_eval_old_match and not current.runtime_zero_eval:
-                current.runtime_zero_eval = zero_eval_old_match.group("value")
                 continue
 
             if FATAL_RE.search(line):
@@ -504,12 +463,10 @@ def write_csv(records: list[RunRecord], out) -> None:
 
 
 DISPLAY_FIELDS = [
-    "model_name", "slices", "quant_scheme", "rank_mode", "quantmode", "quant_layers", "true_quant", "bpw",
+    "model_name", "slices", "quant_scheme", "rank_mode", "quantmode", "quant_layers", "bpw",
     "ppl_wikitext2", "ppl_c4",
-    "arc_c_acc", "arc_c_acc_norm", "arc_e_acc", "arc_e_acc_norm",
-    "piqa_acc", "piqa_acc_norm", "boolq_acc", "wino_acc", "mnli_acc",
-    "hella_acc", "hella_acc_norm", "mmlu_acc", "status",
-    "runtime_ppl", "runtime_quant", "runtime_ppl_eval", "runtime_zero_eval", "error",
+    "status",
+    "runtime_ppl", "runtime_quant", "runtime_ppl_eval", "error",
 ]
 
 PLAIN_HEADERS = {
@@ -522,27 +479,13 @@ PLAIN_HEADERS = {
     "disable_0bit_prune": "no0prune",
     "standby_layer_cpu": "stdbycpu",
     "quant_layers": "qlayers",
-    "true_quant": "tquant",
     "bpw": "bpw",
     "ppl_wikitext2": "wiki",
     "ppl_c4": "c4",
-    "arc_c_acc": "arc_c",
-    "arc_c_acc_norm": "arc_c_n",
-    "arc_e_acc": "arc_e",
-    "arc_e_acc_norm": "arc_e_n",
-    "piqa_acc": "piqa",
-    "piqa_acc_norm": "piqa_n",
-    "boolq_acc": "boolq",
-    "wino_acc": "wino",
-    "mnli_acc": "mnli",
-    "hella_acc": "hella",
-    "hella_acc_norm": "hella_n",
-    "mmlu_acc": "mmlu",
     "status": "status",
     "runtime_ppl": "time",
     "runtime_quant": "t_quant",
     "runtime_ppl_eval": "t_ppl",
-    "runtime_zero_eval": "t_zero",
     "error": "err",
 }
 
@@ -556,27 +499,13 @@ EXPORT_HEADERS = {
     "disable_0bit_prune": "disable_0bit_prune",
     "standby_layer_cpu": "standby_layer_cpu",
     "quant_layers": "quant_layers",
-    "true_quant": "true_quant",
     "bpw": "bpw",
     "ppl_wikitext2": "ppl_wikitext2",
     "ppl_c4": "ppl_c4",
-    "arc_c_acc": "arc_c_acc",
-    "arc_c_acc_norm": "arc_c_acc_norm",
-    "arc_e_acc": "arc_e_acc",
-    "arc_e_acc_norm": "arc_e_acc_norm",
-    "piqa_acc": "piqa_acc",
-    "piqa_acc_norm": "piqa_acc_norm",
-    "boolq_acc": "boolq_acc",
-    "wino_acc": "wino_acc",
-    "mnli_acc": "mnli_acc",
-    "hella_acc": "hella_acc",
-    "hella_acc_norm": "hella_acc_norm",
-    "mmlu_acc": "mmlu_acc",
     "status": "status",
     "runtime_ppl": "total_time",
     "runtime_quant": "quant_time",
     "runtime_ppl_eval": "ppl_eval_time",
-    "runtime_zero_eval": "zero_eval_time",
 }
 
 

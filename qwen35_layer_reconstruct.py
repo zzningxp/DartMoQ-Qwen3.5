@@ -217,6 +217,9 @@ def reconstruct_moe_from_existing(model, layer, layer_idx, inps,
     all_new_expert_rates = []
     all_expert_groups = []
 
+    # 保存元数据：每个专家的 bit_to_indices
+    layer_expert_bit_indices = []
+
     for expert_idx, expert in enumerate(layer.mlp.experts):
         if args.rank_mode == "expert_activation":
             ori_gate_proj_weights = expert.gate_proj.weight
@@ -271,6 +274,9 @@ def reconstruct_moe_from_existing(model, layer, layer_idx, inps,
     qscheme['slice_expert'] = qscheme['expert']
     qscheme['expert'] = restructure_hybrid_qscheme(qscheme['slice_expert'], slice_expert_num)
 
+    # 保存原始的 bit config
+    layer_orig_bit_config = qscheme['slice_expert']
+
     for expert_idx, expert in enumerate(layer.mlp.experts):
         ori_gate_proj_weights = expert.gate_proj.weight
         ori_up_proj_weights = expert.up_proj.weight
@@ -289,6 +295,9 @@ def reconstruct_moe_from_existing(model, layer, layer_idx, inps,
             if bit not in bit_to_indices:
                 bit_to_indices[bit] = []
             bit_to_indices[bit].extend(group_indices)
+
+        # 保存这个专家的 bit_to_indices
+        layer_expert_bit_indices.append(bit_to_indices)
 
         for bit in restructured_config:
             if bit == 0:
@@ -325,8 +334,33 @@ def reconstruct_moe_from_existing(model, layer, layer_idx, inps,
     print(f"Layer {layer_idx}, {args.rank_mode} expert re- sort time: {tick1 - tick0}", flush=True)
     print("all_new_expert_rates:", len(all_new_expert_rates))
 
+    # 收集所有使用的 bit
+    all_bits = set()
+    for expert_bit_idx in layer_expert_bit_indices:
+        all_bits.update(expert_bit_idx.keys())
+    bit_list = sorted(list(all_bits))
+
+    # 获取维度信息
+    hidden_size = model.config.hidden_size
+    if hasattr(model.config, 'intermediate_size'):
+        intermediate_size = model.config.intermediate_size
+    else:
+        intermediate_size = layer.mlp.experts[0].gate_proj.weight.shape[0]
+
+    # 构建 layer_metadata
+    layer_metadata = {
+        'layer_idx': layer_idx,
+        'expert_bit_indices': layer_expert_bit_indices,
+        'expert_groups': all_expert_groups,
+        'orig_bit_config': layer_orig_bit_config,
+        'num_experts': ori_expert_num,
+        'hidden_size': hidden_size,
+        'intermediate_size': intermediate_size,
+        'bit_list': bit_list
+    }
+
     # Clean up intermediate data structures
-    del all_expert_groups, all_new_expert_rates
+    del all_new_expert_rates
     if 'all_rates' in locals():
         del all_rates
     gc.collect()
@@ -336,7 +370,10 @@ def reconstruct_moe_from_existing(model, layer, layer_idx, inps,
     moe = SimpleMoEBlock(model.config).to(device)
     moe.gate = layer.mlp.gate
     moe.num_experts = len(all_new_experts)
-    moe.experts = nn.ModuleList([DartMoQHybridWrapper(sub_experts) for sub_experts in all_new_experts])
+    moe.experts = nn.ModuleList([
+        DartMoQHybridWrapper(sub_experts, bit_to_indices=layer_expert_bit_indices[expert_idx])
+        for expert_idx, sub_experts in enumerate(all_new_experts)
+    ])
 
     # Clean up all_new_experts since we've transferred ownership to the ModuleList
     del all_new_experts
@@ -357,5 +394,5 @@ def reconstruct_moe_from_existing(model, layer, layer_idx, inps,
 
     gc.collect()
     torch.cuda.empty_cache()
-    return moe
+    return moe, layer_metadata
 

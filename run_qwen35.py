@@ -28,7 +28,6 @@ def main():
     parser.add_argument("--sequential-eval", action="store_true", default=False, help="Use sequential PPL evaluation")
     parser.add_argument("--quantmode", type=str, default="turboquant", choices=["gptq", "turboquant"], help="Quantization mode")
     parser.add_argument("--quant-layers", type=str, default=None, help="Only quantize specific layers (e.g., '0-5,8,10' for layers 0-5, 8, and 10; default: all layers)")
-    parser.add_argument("--true-quant", action="store_true", default=True, help="Use true quantization (int4/int3/int2/int1) instead of dequantizing back to fp16")
 
     args = parser.parse_args()
 
@@ -45,7 +44,6 @@ def main():
         print(f"Quantize layers: {args.quant_layers}")
     else:
         print(f"Quantize layers: All")
-    print(f"True quantization: {'Yes' if args.true_quant else 'No (fake quant, dequant to fp16)'}")
 
     print(f"\nCurrent time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}")
 
