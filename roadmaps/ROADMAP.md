@@ -180,6 +180,21 @@ down_proj: (num_experts, hidden_size, inter_size)
 
 **默认启用：** `args.true_quant` 默认为 True，直接使用第三阶段的 grouped_gemm 格式
 
+### 调试优化 (最近更新)
+
+**问题：** 一开始就全 convert 所有层，调试时浪费时间。
+
+**解决方案：**
+- [x] **按需单层 convert**：只在要量化某一层时才 convert 那一层，而不是一开始全 convert
+- [x] **部分层量化调试模式**：使用 `--quant_layers 0-5` 只量化前几层，后面直接 break，节省时间
+- [x] **断言保护**：确保量化层是从 0 开始连续的（例如 `0-5` 可以，`1-5` 或 `0,2,4` 不行）
+
+**使用示例：**
+```bash
+# 只量化前 6 层调试
+python run_qwen35.py --quant_layers 0-5
+```
+
 ### ⚠️ 关键问题分析：传统格式量化后能否重组回 grouped_gemm？
 
 **问题：** 当前量化流程存在信息丢失！
