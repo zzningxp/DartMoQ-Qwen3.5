@@ -5,6 +5,8 @@
 本项目将 DartMoQ 混合精度量化框架适配到 Qwen3.5 MoE 架构上。
 Qwen3.5 MoE 有一个完全不同的权重存储设计，可以实现高效的分组矩阵乘法。
 
+---
+
 ## 架构背景
 
 ### 传统 MoE vs Qwen3.5 MoE
@@ -26,6 +28,99 @@ Qwen3.5 MoE 有一个完全不同的权重存储设计，可以实现高效的�
 这可以实现高效的分组矩阵乘法！
 ```
 
+### Qwen3.5 的 grouped_gemm 格式详解
+
+**grouped_gemm 的本质：只是 gate 和 up 合并，专家还是独立的**
+
+```
+假设：
+  num_experts = 4
+  hidden_size = 10
+  intermediate_size = 3
+
+Qwen3.5 的权重格式：
+  gate_up_proj: (4, 2*3, 10)  ← (num_experts, 2*inter_size, hidden_size)
+  down_proj: (4, 10, 3)       ← (num_experts, hidden_size, inter_size)
+
+让我们看看 gate_up_proj 的实际内容：
+
+gate_up_proj[0]:  ← 专家 0
+  [:, :10] = gate_proj of expert 0  ← 前一半是 gate
+  [:, 10:] = up_proj of expert 0    ← 后一半是 up
+
+gate_up_proj[1]:  ← 专家 1
+  [:, :10] = gate_proj of expert 1
+  [:, 10:] = up_proj of expert 1
+```
+
+**图解：Qwen3.5 的 grouped_gemm 格式**
+
+```
+gate_up_proj: (num_experts, 2*inter_size, hidden_size)
+
+  ┌─────────────────────────────────────────────────────────────┐
+  │  专家 0                      专家 1                          │
+  │ ┌─────────────┬─────────────┐ ┌─────────────┬─────────────┐ │
+  │ │   gate[0]   │    up[0]    │ │   gate[1]   │    up[1]    │ │
+  │ ├─────────────┼─────────────┤ ├─────────────┼─────────────┤ │
+  │ │ (3, 10)     │  (3, 10)    │ │  (3, 10)    │  (3, 10)    │ │
+  │ └─────────────┴─────────────┘ └─────────────┴─────────────┘ │
+  │ ┌─────────────┬─────────────┐ ┌─────────────┬─────────────┐ │
+  │ │   gate[2]   │    up[2]    │ │   gate[3]   │    up[3]    │ │
+  │ ├─────────────┼─────────────┤ ├─────────────┼─────────────┤ │
+  │ │ (3, 10)     │  (3, 10)    │ │  (3, 10)    │  (3, 10)    │ │
+  │ └─────────────┴─────────────┘ └─────────────┴─────────────┘ │
+  │  专家 2                      专家 3                          │
+  └─────────────────────────────────────────────────────────────┘
+         ↑                              ↑
+    gate 和 up 合并             但专家之间还是独立的！
+
+
+down_proj: (num_experts, hidden_size, inter_size)
+
+  ┌─────────────────────────────────────────────────────────────┐
+  │  专家 0         专家 1         专家 2         专家 3        │
+  │ ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐ │
+  │ │ down[0]  │   │ down[1]  │   │ down[2]  │   │ down[3]  │ │
+  │ ├──────────┤   ├──────────┤   ├──────────┤   ├──────────┤ │
+  │ │(10, 3)  │   │ (10, 3)  │   │ (10, 3)  │   │ (10, 3)  │ │
+  │ └──────────┘   └──────────┘   └──────────┘   └──────────┘ │
+  └─────────────────────────────────────────────────────────────┘
+         ↑
+    每个专家的 down_proj 也是独立的！
+```
+
+---
+
+## Qwen3.5 MoE 适配差异总结
+
+### 1. 模型加载架构差异
+
+- **原有模型**: 纯语言模型，直接加载 `AutoModelForCausalLM`
+- **Qwen3.5 MoE**: 外层是多模态模型 `Qwen3_5MoeForConditionalGeneration`，需要提取 `model.language_model` 获取纯文本部分
+
+### 2. 专家存储结构差异
+
+- **原有模型**: 每个专家是独立的 Module
+- **Qwen3.5 MoE**: 所有专家权重合并存储在大张量中
+
+### 3. 注意力机制差异
+
+- **原有模型**: 每层都使用相同的自注意力机制
+- **Qwen3.5 MoE**: 交替使用两种注意力：`linear_attn` 和 `self_attn`
+
+### 4. MoE 层结构差异
+
+- **原有模型**: 通常只有路由专家
+- **Qwen3.5 MoE**: 同时包含 `shared_expert` 和路由专家
+
+### 5. 门控输出格式差异
+
+- **原有模型**: 通常只返回 logits，需要手动计算 topk
+- **Qwen3.5 MoE**: 返回三值 tuple `(logits, topk_weights, topk_indices)`
+
+---
+
 ## 第一阶段: FP16 基线评估
 
 **目标:** 运行 Qwen3.5 MoE 原始的 FP16 困惑度评估，支持 CPU 待机模式。
@@ -46,26 +141,21 @@ Qwen3.5 MoE 有一个完全不同的权重存储设计，可以实现高效的�
 - `eval_qwen35.py` - 评估脚本
 - `explore_qwen35.py` - 架构探索脚本
 
+---
 
-## 第二阶段: DartMoQ 混合 MoE + FP16 反量化
+## 第二阶段: DartMoQ 混合 MoE + FP16 反量化 (已完成)
 
 **目标:** 将 DartMoQ 的混合精度量化方法应用到 Qwen3.5 MoE，仍然在 FP16 中评估（通过反量化）。
 
-### 设计原则
-- ✅ 不训练，保持路由一致性，数学推导的等价结构
-- ✅ 每一步验证正确性，用 git 节点保证可追溯
-- ⏳ 第三阶段先不急
-
-### 当前状态 (已完成 - 选项 B)
+### 当前状态 (已完成)
 - [x] 为 Qwen3.5 的合并权重格式适配专家敏感度分析
 - [x] 在 Qwen3.5 结构中实现神经元排序和分组（通过转换为传统格式）
 - [x] 创建适配 Qwen3.5 架构的混合 MoE 包装器
 - [x] 适配动态规划位宽分配
-- [ ] 通过 FP16 反量化评估验证数值正确性 (**下一步 3.1**)
 
-选项 A 是不转成传统格式，直接用 Qwen3.5 格式本身。但是之前尝试时，跑不通，错误信息没有保存。
+---
 
-### 第三阶段 (待实现 - 回归 grouped_gemm 格式)
+## 第三阶段 (实现中 - 回归 grouped_gemm 格式，当前目标)
 
 **目标架构:**
 ```
@@ -87,6 +177,8 @@ Qwen3.5 MoE 有一个完全不同的权重存储设计，可以实现高效的�
                     │         ...                             │
                     └─────────────────────────────────────────┘
 ```
+
+**默认启用：** `args.true_quant` 默认为 True，直接使用第三阶段的 grouped_gemm 格式
 
 ### ⚠️ 关键问题分析：传统格式量化后能否重组回 grouped_gemm？
 
@@ -123,120 +215,84 @@ for bit, group_indices in zip(orig_bit_config, expert_groups):
 **量化后保留的信息：**
 - ✅ 子专家的权重值
 - ✅ 子专家的 bit 宽度（`_quant_bit` 属性）
-- ❌ **丢失了**：这些权重对应原始神经元的哪些索引位置
-
-**为什么这很关键？**
-如果要重组回 grouped_gemm 格式，我们需要知道：
-- 对于专家 e，bit 2 的神经元在原始 `intermediate_size` 中是哪些位置？
-- 没有位置信息，就无法正确拼接到 `(E, 2*I, H)` 的张量中
+- ❌ **丢失了：** 这些权重对应原始神经元的哪些索引位置
 
 **解决方案：** 在量化过程中保存元数据
 
 **方案 A（推荐）：在 `DartMoQHybridWrapper` 中保存元数据**
 ```python
 class DartMoQHybridWrapper(nn.Module):
-    def __init__(self, sub_experts, bit_to_indices=None):
+    def __init__(self, sub_experts, bit_to_indices=None, expert_bit_indices=None):
         super().__init__()
         self.sub_experts = nn.ModuleList(sub_experts)
-        self.bit_to_indices = bit_to_indices  # 保存原始索引映射
+        self.bit_to_indices = bit_to_indices  # 保存原始索引映射（按 bit）
+        self.expert_bit_indices = expert_bit_indices  # 保存每个子专家对应的神经元索引
 ```
 
-**方案 B：创建独立的元数据结构**
-```python
-class QuantizationMetadata:
-    def __init__(self):
-        self.layer_metadata = []  # 每层的元数据
-    
-    def add_layer(self, layer_idx, expert_bit_indices):
-        # expert_bit_indices[e][b] = 专家 e 中 bit b 的神经元索引列表
-        self.layer_metadata.append(expert_bit_indices)
-```
+### 详细设计文档
+
+详见 `PHASE3_DESIGN.md` 获取完整的第三阶段设计。
 
 ---
 
-**任务分解:**
-- [ ] **3.1 验证当前量化正确性** (先做)
-  - 通过 FP16 反量化评估
-  - 记录 PPL 基线
+## 第四阶段 (以后考虑 - 真实量化推理)
 
-- [ ] **3.1.5 修改代码保存元数据**
-  - 在 `DartMoQHybridWrapper` 中保存 `bit_to_indices`
-  - 或创建独立的 `QuantizationMetadata` 结构
-  - 确保可以追踪每个神经元的原始位置
-  - 提交 git 节点
+**目标：** 在 RTX 5090 上使用 Qwen3.5 的分组格式实现真实量化推理（int4/int3/int2/int1）。当前暂不实现。
 
-- [ ] **3.2 设计权重重组函数**
-  - 输入: 量化后的传统格式 MoE (SimpleMoEBlock + DartMoQHybridWrapper)
-  - 输出: 按精度分组的 grouped_gemm 格式
-  - 关键逻辑: 收集每个精度的所有神经元，重新组织权重
-  - 验证数值等价性
+### 核心架构：DartMoQ-Accel
 
-- [ ] **3.3 实现 Qwen35HybridMoE 类**
-  - 完善 `qwen35_hybrid_moe.py` 中的 `Qwen35HybridExperts`
-  - 实现按精度分组的前向传播
-  - 复用原始 gate (不重新训练)
-  - 验证数值等价性
+Qwen3.5 MoE 的权重存储设计与混合精度量化完美契合：
+- **传统**: 每个专家是独立的 Module
+- **Qwen3.5**: 所有专家合并为两个大张量
 
-- [ ] **3.4 端到端验证**
-  - 完整流程验证 PPL
-  - 与基线对比
+这使得高效的**分组矩阵乘法**成为可能，对混合精度是巨大优势！
 
-### 关键设计决策
+### 架构概览
 
-#### 选项 A (长期目标): 保持 Qwen3.5 的分组格式，但按位宽拆分为不同组
 ```
-mlp.experts_bit2.gate_up_proj: (num_experts, 2*inter_size_bit2, H)
-mlp.experts_bit3.gate_up_proj: (num_experts, 2*inter_size_bit3, H)
-...
+┌─────────────────────────────────────────────────────────────────┐
+│                        DartMoQ-Accel Layer                      │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐          │
+│  │   Router     │  │ Shared Expert│  │Bit Groups    │          │
+│  └──────┬───────┘  └──────────────┘  └──────┬───────┘          │
+│         │                                    │                  │
+│         ▼                                    ▼                  │
+│  ┌─────────────────────────────────────────────────────┐       │
+│  │              Bit-Grouped Expert Storage             │       │
+│  ├─────────────────────────────────────────────────────┤       │
+│  │  ┌─────────────────────────────────────────────┐  │       │
+│  │  │ Bit2 Group (merged weights)                 │  │       │
+│  │  │  - gate_up_proj: (E2, 2*I2, H)              │  │       │
+│  │  │  - down_proj: (E2, H, I2)                   │  │       │
+│  │  │  - scales/zeros: quantization params        │  │       │
+│  │  └─────────────────────────────────────────────┘  │       │
+│  │  ┌─────────────────────────────────────────────┐  │       │
+│  │  │ Bit3 Group (merged weights)                 │  │       │
+│  │  │  - gate_up_proj: (E3, 2*I3, H)              │  │       │
+│  │  │  - down_proj: (E3, H, I3)                   │  │       │
+│  │  │  - scales/zeros: quantization params        │  │       │
+│  │  └─────────────────────────────────────────────┘  │       │
+│  │  ┌─────────────────────────────────────────────┐  │       │
+│  │  │ Bit4 Group (merged weights)                 │  │       │
+│  │  │  - gate_up_proj: (E4, 2*I4, H)              │  │       │
+│  │  │  - down_proj: (E4, H, I4)                   │  │       │
+│  │  │  - scales/zeros: quantization params        │  │       │
+│  │  └─────────────────────────────────────────────┘  │       │
+│  └─────────────────────────────────────────────────────┘       │
+│                           │                                     │
+│                           ▼                                     │
+│  ┌─────────────────────────────────────────────────────────┐  │
+│  │               Group GEMM Execution Engine                │  │
+│  ├─────────────────────────────────────────────────────────┤  │
+│  │  Bit2 Group GEMM  ────┐                                 │  │
+│  │  Bit3 Group GEMM  ────┼─── Parallel Execution            │  │
+│  │  Bit4 Group GEMM  ────┘                                 │  │
+│  └─────────────────────────────────────────────────────────┘  │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
 ```
-
-#### 选项 B (已完成): 转换为传统格式进行量化，然后再转换回来
-(第二阶段更简单，但效率较低)
-
-### 关键文件
-- `qwen35_layer_reconstruct.py` - Qwen3.5 层重构
-- `qwen35_hybrid_moe.py` - Qwen3.5 混合 MoE 包装器
-- `run_qwen35.py` - 主量化脚本
-- `grouped_gemm_moe_adapter.py` - 格式转换适配层
-
-### 数学等价性保证 (Router Gate 设计)
-
-**设计思路:**
-原始路由:
-```
-gate_logits = gate(x)  # (batch, num_experts)
-topk_weights, topk_indices = topk(gate_logits)
-```
-
-目标: 复用原始 gate (不重新训练)，保证路由一致性
-
-**等价变换:**
-对于每个 bit b:
-1. 收集所有专家中，属于 bit b 的神经元索引
-2. 对于 gate 来说，路由决策只关心 "选哪些专家"，不关心 "专家内部怎么分组"
-3. 因此，可以完全复用原始 gate，只是在前向时对每个 bit 分别做 grouped_gemm
-
-**前向传播等价性:**
-```
-原始:
-  out = sum_{e in topk} weight_e * expert_e(x)
-
-等价分解:
-  out = sum_{e in topk} weight_e * [ sum_b expert_e^b(x) ]
-      = sum_b [ sum_{e in topk} weight_e * expert_e^b(x) ]
-
-其中 expert_e^b(x) 是 expert_e 中 bit b 的神经元贡献
-```
-
-因此，我们可以:
-- 保持原始 gate 不变 (保证路由一致性)
-- 按 bit 分组专家的神经元
-- 前向时，先用原始 gate 路由，再分别对每个 bit 做 grouped_gemm
-
-
-## 第四阶段: 真实量化推理 (RTL 内核)
-
-**目标:** 在 RTX 5090 上使用 Qwen3.5 的分组格式实现真实量化推理。
 
 ### 任务:
 - [ ] 研究 PyTorch 对分组矩阵乘法的支持
@@ -251,27 +307,56 @@ topk_weights, topk_indices = topk(gate_logits)
 - 我们能否为 Qwen3.5 的格式适配现有的 MoE 量化内核？
 - 相比反量化 FP16，潜在加速比是多少？
 
-### 关键文件:
-- `qwen35_quant_kernels.py` - 量化内核包装器
-- `qwen35_inference.py` - 量化推理引擎
+---
 
+## 关键设计决策
+
+### 选项 A (长期目标): 保持 Qwen3.5 的分组格式，但按位宽拆分为不同组
+```
+mlp.experts_bit2.gate_up_proj: (num_experts, 2*inter_size_bit2, hidden_size)
+mlp.experts_bit3.gate_up_proj: (num_experts, 2*inter_size_bit3, hidden_size)
+...
+```
+
+### 选项 B (已完成): 转换为传统格式进行量化，然后再转换回来
+(第二阶段更简单，但效率较低)
+
+---
+
+## 关键文件
+
+- `qwen35_layer_reconstruct.py` - Qwen3.5 层重构（已扩展支持元数据）
+- `qwen35_hybrid_moe.py` - 第三阶段按 bit 分组的 grouped_gemm 实现
+- `dartmoq_hybridmoe.py` - 第二阶段传统格式的混合 MoE 包装器（已扩展）
+- `run_qwen35.py` - 主量化脚本（支持 --true_quant）
+- `grouped_gemm_moe_adapter.py` - 格式转换适配层
+- `qwen35_utils.py` - Qwen3.5 专用工具
+
+### 第四阶段文件（待实现）
+- `qwen35_quant_kernels.py` - 量化内核
+- `qwen35_inference.py` - 量化推理
+
+---
 
 ## 文件夹结构
 
 ```
 dartmoq-qwen3.5/
 ├── README.md
-├── ROADMAP.md (本文件)
+├── roadmaps/
+│   ├── ROADMAP.md (本文件)
+│   ├── PHASE3_DESIGN.md (第三阶段详细设计)
+│   ├── ROADMAP_ALTERNATIVE_QWENMULTILINEAR.md (备选方案参考)
+│   └── GROUPED_GEMM_VS_BLOCKSPARSE.md (格式对比参考)
 ├── explore_qwen35.py          # 第一阶段: 架构探索
 ├── eval_qwen35.py             # 第一阶段: FP16 评估
 ├── qwen35_utils.py            # 第一阶段+: Qwen3.5 工具
 │
-├── qwen35_layer_reconstruct.py  # 第二阶段: 层重构
-├── qwen35_hybrid_moe.py         # 第二阶段: 混合 MoE 包装器
-├── run_qwen35.py                # 第二阶段: 主量化脚本
-│
-├── qwen35_quant_kernels.py    # 第三阶段: 量化内核
-├── qwen35_inference.py        # 第三阶段: 量化推理
+├── qwen35_layer_reconstruct.py  # 第二阶段/第三阶段: 层重构
+├── qwen35_hybrid_moe.py         # 第三阶段: 按 bit 分组的 grouped_gemm 实现
+├── dartmoq_hybridmoe.py         # 第二阶段: 传统格式的混合 MoE 包装器
+├── run_qwen35.py                # 第二阶段/第三阶段: 主量化脚本
+├── grouped_gemm_moe_adapter.py  # 格式转换适配层
 │
 └── test/                      # 测试脚本
     ├── test_phase1.py
@@ -279,6 +364,7 @@ dartmoq-qwen3.5/
     └── test_phase3.py
 ```
 
+---
 
 ## 关键挑战
 
@@ -294,11 +380,48 @@ dartmoq-qwen3.5/
 - Qwen3.5 的权重布局可能针对特定硬件优化
 - 需要理解如何最好地适配我们的量化方法
 
+---
+
+## 数学等价性保证 (Router Gate 设计)
+
+**设计思路：**
+原始路由：
+```
+gate_logits = gate(x)  # (batch, num_experts)
+topk_weights, topk_indices = topk(gate_logits)
+```
+
+目标：复用原始 gate（不重新训练），保证路由一致性
+
+**等价变换：**
+对于每个 bit b：
+1. 收集所有专家中，属于 bit b 的神经元索引
+2. 对于 gate 来说，路由决策只关心 "选哪些专家"，不关心 "专家内部怎么分组"
+3. 因此，可以完全复用原始 gate，只是在前向时对每个 bit 分别做 grouped_gemm
+
+**前向传播等价性：**
+```
+原始：
+  out = sum_{e in topk} weight_e * expert_e(x)
+
+等价分解：
+  out = sum_{e in topk} weight_e * [ sum_b expert_e^b(x) ]
+      = sum_b [ sum_{e in topk} weight_e * expert_e^b(x) ]
+
+其中 expert_e^b(x) 是 expert_e 中 bit b 的神经元贡献
+```
+
+因此，我们可以：
+- 保持原始 gate 不变（保证路由一致性）
+- 按 bit 分组专家的神经元
+- 前向时，先用原始 gate 路由，再分别对每个 bit 做 grouped_gemm
+
+---
 
 ## 依赖
 
-与主 DartMoQ 项目相同:
+与主 DartMoQ 项目相同：
 - PyTorch
 - Transformers
-- (可选) 用于第三阶段自定义内核的 CUDA Toolkit
+- (可选) 用于第四阶段自定义内核的 CUDA Toolkit
 - (可选) 用于零样本评估的 lm_eval
