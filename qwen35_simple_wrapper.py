@@ -208,12 +208,9 @@ def construct_moe(model, moe_model_flag, layer, layer_idx, inp,
     print(f"quant_layer_mix_precision layer {layer_idx} time: {tick1 - tick0:.4f}", flush=True)
 
     if moe_model_flag and is_moe_layer:
-	        print(f"Restructuring to grouped_gemm format (layer {layer_idx})...")
-	        tick_restructure = time.time()
-	        from qwen35_hybrid_moe import restructure_to_grouped_gemm
-	        layer.mlp = restructure_to_grouped_gemm(layer.mlp, layer_metadata, device)
-	        tick_restructure_end = time.time()
-	        print(f"Restructured layer {layer_idx} in {tick_restructure_end - tick_restructure:.2f}s")
+        # 跳过重组为 grouped_gemm 格式，直接使用 SimpleMoEBlock 验证
+        print(f"Skip restructuring - using SimpleMoEBlock directly (layer {layer_idx})...")
+        pass
 
     moe_out = torch.zeros_like(hidden_states)
     for b_i in range(0, batchsize):
