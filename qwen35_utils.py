@@ -147,13 +147,14 @@ def load_model(model_path, standby_cpu=False):
     model, tokenizer = get_qwen35_model(model_path, device_map=device_map)
     model.eval()
 
-    model_id = str(model_path).split('/')[-1]
+    import os
+    model_id = os.path.basename(model_path.rstrip('/'))
     model.model_id = model_id
     if not model.model_id:
-        model.model_id = getattr(model.config, '_name_or_path', None) or model_path
-        model.model_id = str(model.model_id).split('/')[-1]
+        fallback = getattr(model.config, '_name_or_path', None) or model_path
+        model.model_id = os.path.basename(str(fallback).rstrip('/'))
 
-    print(f"model_id: {model.model_id}, model_type: {model.config.model_type}")
+    print(f"{model_path}, model_id: {model.model_id}, model_type: {model.config.model_type}", flush=True)
     model._standby_cpu = standby_cpu
     model._model_path = model_path
 

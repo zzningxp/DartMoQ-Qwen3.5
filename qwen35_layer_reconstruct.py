@@ -45,9 +45,9 @@ def reconstruct_moe_from_existing(model, layer, layer_idx, inps,
             try:
                 expert_activation_rates = torch.load(cache_path, map_location="cpu")
                 expert_activation_rates = torch.as_tensor(expert_activation_rates).detach().cpu()
-                print(f"Loading cached expert activation rates for layer {layer_idx}", flush=True)
+                print(f"Loading cached expert activation rates for layer {layer_idx} from {cache_path}", flush=True)
             except Exception as e:
-                print(f"Failed to load cached expert activation rates {e}")
+                print(f"Failed to load cached expert activation rates {e} from {cache_path}", flush=True)
                 expert_activation_rates = analyze_experts_activation(layer, layer_idx, inps, ori_activated, model.config.model_type)
                 torch.save(expert_activation_rates.detach().cpu(), cache_path)
                 print(f"Saved expert activation rates to {cache_path}")

@@ -43,7 +43,7 @@ TASK_FIELDS = [
 
 FIELDNAMES = [
     "model_name", "slices", "quant_scheme", "rank_mode",
-    "moe_struct", "quantmode", "disable_0bit_prune", "standby_layer_cpu", "bpw", "ppl_wikitext2", "ppl_c4",
+    "moe_struct", "quantmode", "disable_0bit_prune", "standby_layer_cpu", "quant_layers", "true_quant", "bpw", "ppl_wikitext2", "ppl_c4",
     *TASK_FIELDS,
     "status", "runtime_ppl", "runtime_quant", "runtime_ppl_eval", "runtime_zero_eval",
 ]
@@ -57,6 +57,8 @@ NEW_RANK_MODE_RE = re.compile(r"^Rank mode:\s+(?P<rank_mode>\S+)")
 NEW_SLICES_RE = re.compile(r"^Slices per expert:\s+(?P<slices>\S+)")
 NEW_QUANTMODE_RE = re.compile(r"^Quant mode:\s+(?P<quantmode>\S+)")
 NEW_STANDBY_CPU_RE = re.compile(r"^CPU standby:\s+(?P<standby_layer_cpu>\S+)")
+NEW_QUANT_LAYERS_RE = re.compile(r"^Quantizing layers:\s+(?P<quant_layers>.+)")
+NEW_TRUE_QUANT_RE = re.compile(r"^True quantization:\s+(?P<true_quant>\S+)")
 NEW_START_TIME_RE = re.compile(r"^Current time:\s*(?P<value>.+)")
 NEW_FINISH_TIME_RE = re.compile(r"^Finish time:\s*(?P<value>.+)")
 NEW_PPL_RE = re.compile(r"ppl on (?P<dataset>wikitext2|c4)(?:\s+\([^)]+\))?:\s*(?P<value>[-+0-9.eE]+)(?:\s+time:\s*(?P<time_value>[-+0-9.eE]+))?")
@@ -108,6 +110,8 @@ class RunRecord:
     quantmode: str = ""
     disable_0bit_prune: str = ""
     standby_layer_cpu: str = ""
+    quant_layers: str = ""
+    true_quant: str = ""
     bpw: str = ""
     ppl_wikitext2: str = ""
     ppl_c4: str = ""
@@ -347,6 +351,16 @@ def parse_log(path: str) -> list[RunRecord]:
                     current.standby_layer_cpu = standby_cpu_match.group("standby_layer_cpu")
                     continue
 
+                quant_layers_match = NEW_QUANT_LAYERS_RE.search(line)
+                if quant_layers_match:
+                    current.quant_layers = quant_layers_match.group("quant_layers")
+                    continue
+
+                true_quant_match = NEW_TRUE_QUANT_RE.search(line)
+                if true_quant_match:
+                    current.true_quant = true_quant_match.group("true_quant")
+                    continue
+
                 start_time_match = NEW_START_TIME_RE.search(line)
                 if start_time_match:
                     current.start_time = start_time_match.group("value").strip()
@@ -490,7 +504,7 @@ def write_csv(records: list[RunRecord], out) -> None:
 
 
 DISPLAY_FIELDS = [
-    "model_name", "slices", "quant_scheme", "rank_mode", "quantmode", "bpw",
+    "model_name", "slices", "quant_scheme", "rank_mode", "quantmode", "quant_layers", "true_quant", "bpw",
     "ppl_wikitext2", "ppl_c4",
     "arc_c_acc", "arc_c_acc_norm", "arc_e_acc", "arc_e_acc_norm",
     "piqa_acc", "piqa_acc_norm", "boolq_acc", "wino_acc", "mnli_acc",
@@ -507,6 +521,8 @@ PLAIN_HEADERS = {
     "quantmode": "qmode",
     "disable_0bit_prune": "no0prune",
     "standby_layer_cpu": "stdbycpu",
+    "quant_layers": "qlayers",
+    "true_quant": "tquant",
     "bpw": "bpw",
     "ppl_wikitext2": "wiki",
     "ppl_c4": "c4",
@@ -539,6 +555,8 @@ EXPORT_HEADERS = {
     "quantmode": "quantmode",
     "disable_0bit_prune": "disable_0bit_prune",
     "standby_layer_cpu": "standby_layer_cpu",
+    "quant_layers": "quant_layers",
+    "true_quant": "true_quant",
     "bpw": "bpw",
     "ppl_wikitext2": "ppl_wikitext2",
     "ppl_c4": "ppl_c4",
