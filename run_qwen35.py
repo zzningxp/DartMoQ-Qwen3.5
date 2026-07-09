@@ -63,11 +63,11 @@ def main():
 
     print(f"\nFinish time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}")
 
-    if args.save_model:
-        save_dir = f"models/dartmoq_qwen35_{args.rank_mode}_{args.quant_scheme}"
-        print(f"\nSaving quantized model to: {save_dir}")
-        os.makedirs(save_dir, exist_ok=True)
-        print("(Model saving not fully implemented yet - needs custom handling)")
+    # if args.save_model:
+    #     save_dir = f"models/dartmoq_qwen35_{args.rank_mode}_{args.quant_scheme}"
+    #     print(f"\nSaving quantized model to: {save_dir}")
+    #     os.makedirs(save_dir, exist_ok=True)
+    #     print("(Model saving not fully implemented yet - needs custom handling)")
 
     return 0
 

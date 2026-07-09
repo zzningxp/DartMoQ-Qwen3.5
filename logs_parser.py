@@ -48,6 +48,25 @@ FIELDNAMES = [
     "status", "runtime_ppl", "runtime_quant", "runtime_ppl_eval", "runtime_zero_eval",
 ]
 
+# New log format patterns
+START_RUN_RE = re.compile(r"DartMoQ for Qwen3.5 MoE")
+EVAL_START_RUN_RE = re.compile(r"Qwen3.5 MoE Evaluation")
+NEW_MODEL_RE = re.compile(r"^Model:\s+(?P<path>\S+)")
+NEW_QUANT_SCHEME_RE = re.compile(r"^Quant scheme:\s+(?P<quant_scheme>\S+)")
+NEW_RANK_MODE_RE = re.compile(r"^Rank mode:\s+(?P<rank_mode>\S+)")
+NEW_SLICES_RE = re.compile(r"^Slices per expert:\s+(?P<slices>\S+)")
+NEW_QUANTMODE_RE = re.compile(r"^Quant mode:\s+(?P<quantmode>\S+)")
+NEW_STANDBY_CPU_RE = re.compile(r"^CPU standby:\s+(?P<standby_layer_cpu>\S+)")
+NEW_START_TIME_RE = re.compile(r"^Current time:\s*(?P<value>.+)")
+NEW_FINISH_TIME_RE = re.compile(r"^Finish time:\s*(?P<value>.+)")
+NEW_PPL_RE = re.compile(r"ppl on (?P<dataset>wikitext2|c4)(?:\s+\([^)]+\))?:\s*(?P<value>[-+0-9.eE]+)(?:\s+time:\s*(?P<time_value>[-+0-9.eE]+))?")
+LAYER_TIME_RE = re.compile(r"Layer (?P<layer>\d+) total reconstruct and quantization time:\s*(?P<value>[-+0-9.eE]+) s")
+# Eval-specific patterns
+EVAL_DATASETS_RE = re.compile(r"^Datasets:\s+(?P<datasets>.+)")
+EVAL_SEQUENTIAL_RE = re.compile(r"^Sequential eval:\s+(?P<sequential>\S+)")
+EVAL_STANDBY_CPU_RE = re.compile(r"^Standby CPU:\s+(?P<standby_cpu>\S+)")
+
+# Old log format patterns (for backward compatibility)
 LOADING_RE = re.compile(r"Loading model:\s*\(ppl\)\s*(?P<path>\S+)")
 QUANTMODE_RE = re.compile(
     r"slices/quant-scheme/rank-mode/moe-struct/quantmode(?:/disable-0bit-prune)?(?:/standby-layer-cpu)?:\s*\(ppl\)\s+"
@@ -68,7 +87,6 @@ MODEL_NAME_RE = re.compile(r"^model:\s+(?P<path>\S+)\s+(?P<name>\S+)")
 NUMERIC_RE = re.compile(r"^[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?$")
 
 # For backward compatibility with old logs
-LAYER_TIME_RE = re.compile(r"Layer (?P<layer>\d+) total reconstruct and quantization time:\s*(?P<value>[-+0-9.eE]+) s")
 PPL_INDIVIDUAL_TIME_RE = re.compile(r"ppl on (?P<dataset>wikitext2|c4)(?:\s+\([^)]+\))?:\s*[-+0-9.eE]+\s*time:\s*(?P<value>[-+0-9.eE]+)")
 ZERO_EVAL_OLD_RE = re.compile(r"Zero-shot evaluation time:\s*(?P<value>[-+0-9.eE]+)")
 
@@ -181,6 +199,9 @@ def parse_log(path: str) -> list[RunRecord]:
     pending_start_time = ""
     source = os.path.basename(path)
     last_line_no = 0
+    # Track which format we're using
+    using_new_format = False
+    using_eval_format = False
 
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         for line_no, raw_line in enumerate(f, 1):
@@ -189,12 +210,9 @@ def parse_log(path: str) -> list[RunRecord]:
             if not line:
                 continue
 
-            start_match = START_TIME_RE.search(line)
-            if start_match:
-                pending_start_time = start_match.group("value").strip()
-
-            loading_match = LOADING_RE.search(line)
-            if loading_match:
+            # Check for eval format start
+            eval_start_match = EVAL_START_RUN_RE.search(line)
+            if eval_start_match:
                 if current is not None:
                     current.finalize(line_no - 1)
                     records.append(current)
@@ -202,15 +220,160 @@ def parse_log(path: str) -> list[RunRecord]:
                     source=source,
                     run_idx=len(records) + 1,
                     start_line=line_no,
-                    start_time=pending_start_time,
-                    model_path=loading_match.group("path"),
+                    start_time="",
+                    model_path="",
                 )
-                current.model_name = _last_path_component(current.model_path)
+                current.quantmode = "fp16"
+                using_eval_format = True
+                using_new_format = False
                 continue
+
+            # Check for new format start
+            start_run_match = START_RUN_RE.search(line)
+            if start_run_match:
+                if current is not None:
+                    current.finalize(line_no - 1)
+                    records.append(current)
+                current = RunRecord(
+                    source=source,
+                    run_idx=len(records) + 1,
+                    start_line=line_no,
+                    start_time="",
+                    model_path="",
+                )
+                using_new_format = True
+                using_eval_format = False
+                continue
+
+            # If not using new format yet, check for old format patterns
+            if not using_new_format and not using_eval_format:
+                start_match = START_TIME_RE.search(line)
+                if start_match:
+                    pending_start_time = start_match.group("value").strip()
+
+                loading_match = LOADING_RE.search(line)
+                if loading_match:
+                    if current is not None:
+                        current.finalize(line_no - 1)
+                        records.append(current)
+                    current = RunRecord(
+                        source=source,
+                        run_idx=len(records) + 1,
+                        start_line=line_no,
+                        start_time=pending_start_time,
+                        model_path=loading_match.group("path"),
+                    )
+                    current.model_name = _last_path_component(current.model_path)
+                    using_new_format = False
+                    using_eval_format = False
+                    continue
 
             if current is None:
                 continue
 
+            # Parse layer times - do this first for all formats!
+            layer_time_match = LAYER_TIME_RE.search(line)
+            if layer_time_match:
+                try:
+                    t = float(layer_time_match.group("value"))
+                    current._layer_times.append(t)
+                except ValueError:
+                    pass
+                # Don't continue, fall through to other matches
+
+            # Both new formats use model line
+            model_match = NEW_MODEL_RE.search(line)
+            if model_match:
+                current.model_path = model_match.group("path")
+                current.model_name = _last_path_component(current.model_path)
+                continue
+
+            # Eval format parsing
+            if using_eval_format:
+                # Eval-specific fields
+                eval_datasets_match = EVAL_DATASETS_RE.search(line)
+                if eval_datasets_match:
+                    # Just note it, not a critical field
+                    pass
+
+                eval_sequential_match = EVAL_SEQUENTIAL_RE.search(line)
+                if eval_sequential_match:
+                    # Could map to something, not critical
+                    pass
+
+                eval_standby_cpu_match = EVAL_STANDBY_CPU_RE.search(line)
+                if eval_standby_cpu_match:
+                    current.standby_layer_cpu = eval_standby_cpu_match.group("standby_cpu")
+                    continue
+
+                # Eval uses the same PPL format
+                new_ppl_match = NEW_PPL_RE.search(line)
+                if new_ppl_match:
+                    dataset = new_ppl_match.group("dataset")
+                    setattr(current, f"ppl_{dataset}", new_ppl_match.group("value"))
+                    time_value = new_ppl_match.groupdict().get("time_value")
+                    if time_value:
+                        try:
+                            t = float(time_value)
+                            current._ppl_eval_times.append(t)
+                        except ValueError:
+                            pass
+                    continue
+
+            # New format parsing
+            elif using_new_format:
+                quant_scheme_match = NEW_QUANT_SCHEME_RE.search(line)
+                if quant_scheme_match:
+                    current.quant_scheme = quant_scheme_match.group("quant_scheme")
+                    continue
+
+                rank_mode_match = NEW_RANK_MODE_RE.search(line)
+                if rank_mode_match:
+                    current.rank_mode = rank_mode_match.group("rank_mode")
+                    continue
+
+                slices_match = NEW_SLICES_RE.search(line)
+                if slices_match:
+                    current.slices = slices_match.group("slices")
+                    continue
+
+                quantmode_match = NEW_QUANTMODE_RE.search(line)
+                if quantmode_match:
+                    current.quantmode = quantmode_match.group("quantmode")
+                    continue
+
+                standby_cpu_match = NEW_STANDBY_CPU_RE.search(line)
+                if standby_cpu_match:
+                    current.standby_layer_cpu = standby_cpu_match.group("standby_layer_cpu")
+                    continue
+
+                start_time_match = NEW_START_TIME_RE.search(line)
+                if start_time_match:
+                    current.start_time = start_time_match.group("value").strip()
+                    continue
+
+                # New format PPL with time
+                new_ppl_match = NEW_PPL_RE.search(line)
+                if new_ppl_match:
+                    dataset = new_ppl_match.group("dataset")
+                    setattr(current, f"ppl_{dataset}", new_ppl_match.group("value"))
+                    time_value = new_ppl_match.groupdict().get("time_value")
+                    if time_value:
+                        try:
+                            t = float(time_value)
+                            current._ppl_eval_times.append(t)
+                        except ValueError:
+                            pass
+                    continue
+
+                # New format finish time - can calculate total runtime
+                finish_time_match = NEW_FINISH_TIME_RE.search(line)
+                if finish_time_match and current.start_time:
+                    # Try to calculate runtime from start and finish times if available
+                    pass
+                continue
+
+            # Old format parsing
             quantmode_match = QUANTMODE_RE.search(line)
             if quantmode_match:
                 for key, value in quantmode_match.groupdict().items():
@@ -276,16 +439,6 @@ def parse_log(path: str) -> list[RunRecord]:
             runtime_zero_eval_match = RUNTIME_ZERO_EVAL_RE.search(line)
             if runtime_zero_eval_match:
                 current.runtime_zero_eval = runtime_zero_eval_match.group("value")
-                continue
-
-            # Backward compatibility: parse layer times for old logs
-            layer_time_match = LAYER_TIME_RE.search(line)
-            if layer_time_match:
-                try:
-                    t = float(layer_time_match.group("value"))
-                    current._layer_times.append(t)
-                except ValueError:
-                    pass
                 continue
 
             # Backward compatibility: parse old zero-eval time format
