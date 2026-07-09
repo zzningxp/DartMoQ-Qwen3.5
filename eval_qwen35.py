@@ -147,9 +147,19 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
     all_hidden_states = [emb for emb in all_embeddings]  # Start with embeddings
 
     import inspect
+    # Debug: Print layer types at the beginning
+    print("\n=== Layer Type Debug Info ===")
+    for layer_idx, layer in enumerate(layers):
+        if layer_idx % 5 == 0:  # Print every 5th layer to avoid spam
+            mlp_type = type(layer.mlp).__name__ if hasattr(layer, 'mlp') else 'N/A'
+            print(f"  Layer {layer_idx}: mlp_type={mlp_type}, full_type={type(layer).__name__}")
+    print("============================\n")
+
     for layer_idx, layer in enumerate(layers):
         if layer_idx % 10 == 0:
             print(f"Processing layer {layer_idx}/{len(layers)}...", flush=True)
+
+        tick_layer = time.time()
 
         # Move layer to GPU
         layer = layer.to(DEV)
@@ -220,9 +230,12 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-            # if layer_idx % 5 == 0:
-            #     for i in range(torch.cuda.device_count()):
-            #         print(f"  Layer {layer_idx}, CUDA {i}: {torch.cuda.memory_allocated(i) / 1024**3:.2f} GB")
+
+        # Debug: Print layer timing every 10 layers or first 10 layers
+        if layer_idx < 10 or layer_idx % 10 == 0:
+            layer_time = time.time() - tick_layer
+            mlp_type = type(layer.mlp).__name__ if hasattr(layer, 'mlp') else 'N/A'
+            print(f"  [DEBUG] Layer {layer_idx} time: {layer_time:.2f}s, mlp_type={mlp_type}")
 
     # Final norm and lm_head - process in batches of 4
     print("Processing final norm and lm_head...")

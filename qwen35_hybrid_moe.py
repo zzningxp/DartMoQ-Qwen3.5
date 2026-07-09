@@ -45,33 +45,6 @@ class Qwen35HybridExperts(nn.Module):
             for bit_str, weight in down_proj_by_bit.items():
                 self.down_proj_by_bit[bit_str] = nn.Parameter(weight, requires_grad=False)
 
-    def get_gate(self, expert_idx: int, bit: int):
-        """获取某个专家某个 bit 宽度的 gate_proj 权重"""
-        bit_str = str(bit)
-        if bit_str not in self.gate_up_proj_by_bit:
-            return None
-        inter_size = self.inter_size_by_bit.get(bit, 0)
-        if inter_size == 0:
-            return None
-        return self.gate_up_proj_by_bit[bit_str][expert_idx, :inter_size, :]
-
-    def get_up(self, expert_idx: int, bit: int):
-        """获取某个专家某个 bit 宽度的 up_proj 权重"""
-        bit_str = str(bit)
-        if bit_str not in self.gate_up_proj_by_bit:
-            return None
-        inter_size = self.inter_size_by_bit.get(bit, 0)
-        if inter_size == 0:
-            return None
-        return self.gate_up_proj_by_bit[bit_str][expert_idx, inter_size:, :]
-
-    def get_down(self, expert_idx: int, bit: int):
-        """获取某个专家某个 bit 宽度的 down_proj 权重"""
-        bit_str = str(bit)
-        if bit_str not in self.down_proj_by_bit:
-            return None
-        return self.down_proj_by_bit[bit_str][expert_idx, :, :]
-
 
 class Qwen35HybridMLP(nn.Module):
     """
@@ -105,7 +78,7 @@ class Qwen35HybridMLP(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """
-        前向传播
+        前向传播 - 高效优化版
 
         数学等价性保证：
           out = sum_{e in topk} weight_e * expert_e(x)
@@ -121,7 +94,7 @@ class Qwen35HybridMLP(nn.Module):
         if self.shared_expert is not None and self.shared_expert_gate is not None:
             shared_out = self.shared_expert(x)
             shared_gate_val = torch.sigmoid(self.shared_expert_gate(x))
-            final_hidden_states = final_hidden_states + shared_out * shared_gate_val
+            final_hidden_states.add_(shared_out * shared_gate_val)
 
         # Router
         gate_output = self.gate(x)
@@ -135,56 +108,80 @@ class Qwen35HybridMLP(nn.Module):
 
         # 对每个 bit 分别计算
         for bit in self.bit_list:
-            bit_out = self._forward_bit(x, bit, topk_indices, topk_weights)
-            final_hidden_states = final_hidden_states + bit_out
+            bit_out = self._forward_bit_fast(x, bit, topk_indices, topk_weights)
+            final_hidden_states.add_(bit_out)
 
         return final_hidden_states.reshape(batch_size, seq_len, hidden_dim)
 
-    def _forward_bit(
+    def _forward_bit_fast(
         self,
         x: torch.Tensor,
         bit: int,
         topk_indices: torch.Tensor,
         topk_weights: torch.Tensor
     ) -> torch.Tensor:
-        """单个 bit 宽度的前向计算"""
+        """单个 bit 宽度的前向计算 - 高性能优化版"""
         bit_str = str(bit)
         if bit_str not in self.experts.gate_up_proj_by_bit:
             return torch.zeros_like(x)
 
-        batch_size = x.shape[0]
-        out = torch.zeros_like(x)
+        num_tokens = x.shape[0]
+        out = torch.zeros_like(x, device=x.device)
 
-        # 对每个 top-k 专家
-        for i in range(self.top_k):
-            expert_idx_flat = topk_indices[:, i]
-            weight_flat = topk_weights[:, i].unsqueeze(-1)
+        # 获取该 bit 的所有权重
+        gate_up_proj = self.experts.gate_up_proj_by_bit[bit_str]  # (num_experts, 2*inter_size, hidden_size)
+        down_proj = self.experts.down_proj_by_bit[bit_str]        # (num_experts, hidden_size, inter_size)
+        inter_size = self.experts.inter_size_by_bit[bit]
 
-            # 对每个 unique 的专家索引，批量计算
-            unique_experts, inverse_indices = expert_idx_flat.unique(return_inverse=True)
+        # 先对所有 top-k 位置做索引
+        # topk_indices: (num_tokens, top_k)
+        # topk_weights: (num_tokens, top_k)
 
-            for e_idx in unique_experts:
-                mask = expert_idx_flat == e_idx
-                if not mask.any():
-                    continue
+        # 一次性 gather 所有需要的专家权重
+        # 对于每个 token 和每个 top-k 专家，我们需要:
+        #   gate_up_w = gate_up_proj[expert_idx]
+        #   down_w = down_proj[expert_idx]
 
-                x_e = x[mask]
+        # 先展平
+        flat_indices = topk_indices.reshape(-1)  # (num_tokens * top_k)
+        flat_weights = topk_weights.reshape(-1, 1)  # (num_tokens * top_k, 1)
 
-                # 获取该专家该 bit 的权重
-                gate_w = self.experts.get_gate(e_idx, bit)
-                up_w = self.experts.get_up(e_idx, bit)
-                down_w = self.experts.get_down(e_idx, bit)
+        # 一次性 gather 所有需要的权重
+        # gate_up_weights: (num_tokens * top_k, 2*inter_size, hidden_size)
+        # down_weights: (num_tokens * top_k, hidden_size, inter_size)
+        gate_up_weights = gate_up_proj[flat_indices]  # (N*K, 2I, H)
+        down_weights = down_proj[flat_indices]        # (N*K, H, I)
 
-                if gate_w is None or up_w is None or down_w is None:
-                    continue
+        # 扩展 x 到每个 top-k 位置
+        x_expanded = x.repeat_interleave(self.top_k, dim=0)  # (N*K, H)
 
-                # 计算：silu(x @ gate_w.T) * (x @ up_w.T) @ down_w.T
-                gate_out = F.linear(x_e, gate_w)
-                up_out = F.linear(x_e, up_w)
-                act_out = F.silu(gate_out) * up_out
-                down_out = F.linear(act_out, down_w)
+        # 一次性计算所有 gate_up
+        # 使用 batch matrix multiply 或者 einsum
+        # x_expanded: (N*K, H)
+        # gate_up_weights: (N*K, 2I, H)
+        # result: (N*K, 2I)
+        gate_up_out = torch.bmm(x_expanded.unsqueeze(1), gate_up_weights.transpose(1, 2)).squeeze(1)
 
-                out[mask] = out[mask] + weight_flat[mask] * down_out
+        # 分离 gate 和 up
+        gate_out = gate_up_out[:, :inter_size]  # (N*K, I)
+        up_out = gate_up_out[:, inter_size:]   # (N*K, I)
+
+        # SILU activation
+        act_out = F.silu(gate_out) * up_out  # (N*K, I)
+
+        # 计算 down projection
+        # act_out: (N*K, I)
+        # down_weights: (N*K, H, I)
+        # result: (N*K, H)
+        down_out = torch.bmm(act_out.unsqueeze(1), down_weights.transpose(1, 2)).squeeze(1)
+
+        # 乘以权重
+        down_out = down_out * flat_weights  # (N*K, H)
+
+        # 现在需要把属于同一个 token 的结果加起来
+        # 用 view + sum
+        down_out = down_out.view(num_tokens, self.top_k, self.hidden_size)  # (N, K, H)
+        out = down_out.sum(dim=1)  # (N, H)
 
         return out
 
