@@ -5,16 +5,9 @@ DartMoQ mixed-precision quantization framework adapted for Qwen3.5 MoE architect
 ## Overview
 
 Qwen3.5 MoE uses a fundamentally different weight storage format that enables efficient group matrix multiplication.
-This project adapts the DartMoQ framework to work with this new architecture.
+This project adapts the [DartMoQ](https://github.com/zzningxp/DartMoQ) framework to work with this new architecture.
 
 ## Quick Start
-
-### Phase 1: Explore Architecture
-
-```bash
-cd dartmoq-qwen3.5
-python explore_qwen35.py /path/to/qwen3.5/model --device cpu --detailed
-```
 
 ### Phase 1: Evaluate FP16 Baseline
 
