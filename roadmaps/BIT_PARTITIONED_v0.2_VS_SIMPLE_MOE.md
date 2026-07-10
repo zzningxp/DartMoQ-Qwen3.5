@@ -140,7 +140,7 @@ for k in top_k:
 ## 7. 当前状态与下一步
 
 **当前状态**：
-- BitPartitionedGroupMoE v3 和 SimpleMoEBlock 性能持平
+- BitPartitionedGroupMoE v0.2 和 SimpleMoEBlock 性能持平
 - PPL 几乎一致 (6.6454 vs 6.6472)，正确性验证通过
 - 但比原始 Qwen3_5MoeSparseMoeBlock 还是慢约 1s
 
