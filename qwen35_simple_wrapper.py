@@ -23,6 +23,7 @@ from qwen35_layer_reconstruct import reconstruct_moe_from_existing
 from qwen35_utils import DEV, load_model
 
 from grouped_gemm_moe_adapter import convert_grouped_gemm_to_traditional, TraditionalMoEWrapper
+from bit_partitioned_moe import BitPartitionedGroupMoE
 
 
 def parse_quant_layers(quant_layers_str):
@@ -208,9 +209,12 @@ def construct_moe(model, moe_model_flag, layer, layer_idx, inp,
     print(f"quant_layer_mix_precision layer {layer_idx} time: {tick1 - tick0:.4f}", flush=True)
 
     if moe_model_flag and is_moe_layer:
-        # 跳过重组为 grouped_gemm 格式，直接使用 SimpleMoEBlock 验证
-        print(f"Skip restructuring - using SimpleMoEBlock directly (layer {layer_idx})...")
-        pass
+        # 重组为 BitPartitionedGroupMoE
+        tick_restructure = time.time()
+        print(f"Restructuring to BitPartitionedGroupMoE (layer {layer_idx})...")
+        layer.mlp = BitPartitionedGroupMoE.from_simple_moe(layer.mlp, layer_metadata)
+        tick_restructure_end = time.time()
+        print(f"Restructured in {tick_restructure_end - tick_restructure:.4f}s")
 
     moe_out = torch.zeros_like(hidden_states)
     for b_i in range(0, batchsize):
