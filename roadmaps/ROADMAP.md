@@ -252,6 +252,9 @@ python run_qwen35.py --quant_layers 0-5
 | Origin | Qwen3.5-35B-A3B | | | | fp16 | | 6.5807 | 9.6724 | ok | 320.21 | | 320.21 | |
 | SimpleMoEBlock | Qwen3.5-35B-A3B | 4 | global-a8s8m2bpw | turboquant_innerproduct | turboquant | [0, 1, 2, 3, 4] | 6.6454 | 9.7606 | ok | 1526.86 | 1156.54 | 370.32 | |
 | SimpleMoEBlock | Qwen3.5-35B-A3B | 4 | global-a8s8m2bpw | turboquant_innerproduct | turboquant | all | 7.6882 | 11.2645 | ok | 9533.79 | 9019.48 | 514.31 | |
+| SimpleMoEBlock | Qwen3.5-35B-A3B | 4 | global-a8s8m2bpw | turboquant_innerproduct | turboquant | [0, 1, 2, 3, 4] | 6.6454 | 9.7606 | ok | 1485.75 | 1155 | 330.75 | |
+| SimpleMoEBlock | Qwen3.5-35B-A3B | 4 | global-a8s8m2bpw | turboquant_innerproduct | turboquant | [0, 1, 2, 3, 4] | 6.6472 | 9.7624 | ok | 1496.25 | 1154.85 | 341.4 | |
+| BitPartitionedGroupMoE | Qwen3.5-35B-A3B | 4 | global-a8s8m2bpw | turboquant_innerproduct | turboquant | | 7.6864 | 11.2656 | ok | 8654.59 | 8253.99 | 400.6 | |
 
 TODO：当前目标应该是先将 all layer SimpleMoEBlock 的 t_ppl 时间优化到和 origin 相近。
 
