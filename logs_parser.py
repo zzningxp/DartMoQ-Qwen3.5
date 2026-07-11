@@ -20,7 +20,7 @@ from typing import Iterable
 
 
 FIELDNAMES = [
-    "model_name", "slices", "quant_scheme", "rank_mode",
+    "git_hash", "model_name", "slices", "quant_scheme", "rank_mode",
     "moe_struct", "quantmode", "disable_0bit_prune", "standby_layer_cpu", "quant_layers", "bpw", "ppl_wikitext2", "ppl_c4",
     "status", "runtime_ppl", "runtime_quant", "runtime_ppl_eval",
 ]
@@ -29,6 +29,7 @@ FIELDNAMES = [
 START_RUN_RE = re.compile(r"DartMoQ for Qwen3.5 MoE")
 EVAL_START_RUN_RE = re.compile(r"Qwen3.5 MoE Evaluation")
 NEW_MODEL_RE = re.compile(r"^Model:\s+(?P<path>\S+)")
+NEW_GIT_HASH_RE = re.compile(r"^Git HEAD:\s+(?P<git_hash>[a-f0-9]+\+?)")
 NEW_QUANT_SCHEME_RE = re.compile(r"^Quant scheme:\s+(?P<quant_scheme>\S+)")
 NEW_RANK_MODE_RE = re.compile(r"^Rank mode:\s+(?P<rank_mode>\S+)")
 NEW_SLICES_RE = re.compile(r"^Slices per expert:\s+(?P<slices>\S+)")
@@ -86,6 +87,7 @@ class RunRecord:
     disable_0bit_prune: str = ""
     standby_layer_cpu: str = ""
     quant_layers: str = ""
+    git_hash: str = ""
     bpw: str = ""
     ppl_wikitext2: str = ""
     ppl_c4: str = ""
@@ -281,6 +283,12 @@ def parse_log(path: str) -> list[RunRecord]:
                 current.model_name = _last_path_component(current.model_path)
                 continue
 
+            # Parse git hash
+            git_hash_match = NEW_GIT_HASH_RE.search(line)
+            if git_hash_match:
+                current.git_hash = git_hash_match.group("git_hash")
+                continue
+
             # Eval format parsing
             if using_eval_format:
                 # Eval-specific fields
@@ -463,7 +471,7 @@ def write_csv(records: list[RunRecord], out) -> None:
 
 
 DISPLAY_FIELDS = [
-    "model_name", "slices", "quant_scheme", "rank_mode", "quantmode", "quant_layers", "bpw",
+    "git_hash", "model_name", "slices", "quant_scheme", "rank_mode", "quantmode", "quant_layers", "bpw",
     "ppl_wikitext2", "ppl_c4",
     "status",
     "runtime_ppl", "runtime_quant", "runtime_ppl_eval", "error",
@@ -479,6 +487,7 @@ PLAIN_HEADERS = {
     "disable_0bit_prune": "no0prune",
     "standby_layer_cpu": "stdbycpu",
     "quant_layers": "qlayers",
+    "git_hash": "git",
     "bpw": "bpw",
     "ppl_wikitext2": "wiki",
     "ppl_c4": "c4",
@@ -499,6 +508,7 @@ EXPORT_HEADERS = {
     "disable_0bit_prune": "disable_0bit_prune",
     "standby_layer_cpu": "standby_layer_cpu",
     "quant_layers": "quant_layers",
+    "git_hash": "git_hash",
     "bpw": "bpw",
     "ppl_wikitext2": "ppl_wikitext2",
     "ppl_c4": "ppl_c4",

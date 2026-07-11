@@ -10,12 +10,14 @@ import torch
 import torch.nn as nn
 import argparse
 import sys
+import os
+import subprocess
 
 # Add parent directory to import data_utils
 sys.path.insert(0, '..')
 
 from qwen35_utils import load_model, DEV
-from data_utils import get_loaders
+from data_utils import get_loaders, get_git_hash
 
 
 @torch.no_grad()
@@ -349,6 +351,9 @@ def main():
     args = parser.parse_args()
 
     print("Qwen3.5 MoE Evaluation (Phase 1: FP16 Baseline)")
+    git_hash = get_git_hash()
+    if git_hash:
+        print(f"Git HEAD: {git_hash}")
     print(f"Model: {args.model}")
     print(f"Datasets: {args.datasets}")
     print(f"Sequential eval: {args.sequential_eval}")
