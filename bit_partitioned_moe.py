@@ -161,6 +161,8 @@ class BitPartitionedGroupMoE(nn.Module):
         return moe
 
     def forward(self, hidden_states):
+        import gc
+
         t0 = time.time()
 
         batch_size, seq_len, hidden_dim = hidden_states.shape
@@ -174,6 +176,8 @@ class BitPartitionedGroupMoE(nn.Module):
             shared_out = self.shared_expert(x)
             shared_gate_val = torch.sigmoid(self.shared_expert_gate(x))
             final_hidden_states.add_(shared_out * shared_gate_val)
+            # Cleanup shared expert variables
+            del shared_out, shared_gate_val
         t2 = time.time()
 
         # Router
@@ -183,6 +187,9 @@ class BitPartitionedGroupMoE(nn.Module):
         else:
             router_logits = gate_output.softmax(dim=-1)
             topk_weights, topk_indices = router_logits.topk(self.top_k, dim=-1)
+            del router_logits
+        # Cleanup gate_output
+        del gate_output
         t3 = time.time()
 
         # 详细统计 compute 内部各部分时间
@@ -194,114 +201,88 @@ class BitPartitionedGroupMoE(nn.Module):
 
         active_experts_total = 0
 
-        # 创建 CUDA streams 用于并行发射不同 bit 的 kernel
-        streams = []
-        if x.is_cuda:
-            streams = [torch.cuda.Stream(device=x.device) for _ in self.bit_list]
+        # 优化结构：expert -> bit (反向索引，每个 expert 只处理一次)
+        # 先构建反向索引：expert_idx -> list of (token_idx, k_position)
+        from collections import defaultdict
+        expert_to_tokens = defaultdict(list)
 
-        # 优化后的结构：top_k -> expert -> bit (with CUDA streams)
-        # 对每个 k 位置单独处理
-        for k in range(self.top_k):
-            expert_indices_k = topk_indices[:, k]  # (N,)
-            weights_k = topk_weights[:, k:k+1]  # (N, 1)
+        for token_idx in range(x.shape[0]):
+            for k in range(self.top_k):
+                expert_idx = topk_indices[token_idx, k].item()
+                expert_to_tokens[expert_idx].append((token_idx, k))
 
-            # 对每个专家，收集选了它的 token
-            for expert_idx in range(self.num_experts):
-                t_mask_start = time.time()
-                mask = expert_indices_k == expert_idx
-                if not mask.any():
+        # 对每个 expert 处理所有选择它的 token（来自任意 k 位置）
+        for expert_idx in range(self.num_experts):
+            token_k_list = expert_to_tokens.get(expert_idx, [])
+            if not token_k_list:
+                continue
+
+            active_experts_total += 1
+
+            t_mask_start = time.time()
+            token_indices = [t for t, k in token_k_list]
+            k_positions = [k for t, k in token_k_list]
+
+            token_x = x[token_indices]  # (M, H)
+            token_w = topk_weights[token_indices, k_positions].unsqueeze(1)  # (M, 1)
+            t_mask_end = time.time()
+            t_mask_total += t_mask_end - t_mask_start
+
+            # 对同一个 expert 的所有 token，串行处理所有 bit
+            expert_out = torch.zeros_like(token_x)
+
+            for bit in self.bit_list:
+                bit_str = str(bit)
+                if bit_str not in self.bit_weights.gate_up:
                     continue
-                active_experts_total += 1
 
-                token_x = x[mask]  # (M, H)
-                token_w = weights_k[mask]  # (M, 1)
-                t_mask_end = time.time()
-                t_mask_total += t_mask_end - t_mask_start
+                gate_up = self.bit_weights.gate_up[bit_str]
+                down = self.bit_weights.down[bit_str]
+                inter_size = self.inter_size_by_bit[bit]
 
-                # 对同一个 (token, expert)，用 CUDA streams 并行处理所有 bit
-                expert_out = torch.zeros_like(token_x)
+                # 获取这个 expert 的权重
+                e_gate_up = gate_up[expert_idx]  # (2I_b, H)
+                e_down = down[expert_idx]        # (H, I_b)
 
-                # 存储每个 bit 的中间结果，最后再累加
-                bit_down_outs = []
+                t_gate_up_start = time.time()
+                gate_up_out = token_x @ e_gate_up.t()
+                t_gate_up_end = time.time()
+                t_gate_up_matmul_total += t_gate_up_end - t_gate_up_start
 
-                # 第一阶段：用不同 stream 并行发射所有 bit 的计算
-                for bit_idx, bit in enumerate(self.bit_list):
-                    bit_str = str(bit)
-                    if bit_str not in self.bit_weights.gate_up:
-                        bit_down_outs.append(None)
-                        continue
+                gate_out = gate_up_out[:, :inter_size]
+                up_out = gate_up_out[:, inter_size:]
+                del gate_up_out
 
-                    gate_up = self.bit_weights.gate_up[bit_str]
-                    down = self.bit_weights.down[bit_str]
-                    inter_size = self.inter_size_by_bit[bit]
+                # SILU
+                t_silu_start = time.time()
+                act_out = F.silu(gate_out) * up_out
+                t_silu_end = time.time()
+                t_silu_total += t_silu_end - t_silu_start
+                del gate_out, up_out
 
-                    # 获取这个 expert 的权重
-                    e_gate_up = gate_up[expert_idx]  # (2I_b, H)
-                    e_down = down[expert_idx]        # (H, I_b)
+                # (M, H) = (M, I_b) @ (I_b, H)
+                t_down_start = time.time()
+                down_out = act_out @ e_down.t()
+                t_down_end = time.time()
+                t_down_matmul_total += t_down_end - t_down_start
+                del act_out
 
-                    if x.is_cuda and bit_idx < len(streams):
-                        # 使用指定的 stream
-                        stream = streams[bit_idx]
-                        with torch.cuda.stream(stream):
-                            t_gate_up_start = time.time()
-                            gate_up_out = token_x @ e_gate_up.t()
-                            t_gate_up_end = time.time()
-                            t_gate_up_matmul_total += t_gate_up_end - t_gate_up_start
+                expert_out += down_out
 
-                            gate_out = gate_up_out[:, :inter_size]
-                            up_out = gate_up_out[:, inter_size:]
+                # Cleanup references for this bit
+                del e_gate_up, e_down, gate_up, down, down_out
 
-                            # SILU
-                            t_silu_start = time.time()
-                            act_out = F.silu(gate_out) * up_out
-                            t_silu_end = time.time()
-                            t_silu_total += t_silu_end - t_silu_start
+            # 最后把结果累加回 final_hidden_states
+            t_accum_start = time.time()
+            final_hidden_states[token_indices] += expert_out * token_w
+            t_accum_end = time.time()
+            t_accum_total += t_accum_end - t_accum_start
 
-                            # (M, H) = (M, I_b) @ (I_b, H)
-                            t_down_start = time.time()
-                            down_out = act_out @ e_down.t()
-                            t_down_end = time.time()
-                            t_down_matmul_total += t_down_end - t_down_start
+            # Cleanup for this expert
+            del expert_out, token_x, token_w, token_indices, k_positions
 
-                            bit_down_outs.append(down_out)
-                    else:
-                        # CPU 或没有足够 streams，串行执行
-                        t_gate_up_start = time.time()
-                        gate_up_out = token_x @ e_gate_up.t()
-                        t_gate_up_end = time.time()
-                        t_gate_up_matmul_total += t_gate_up_end - t_gate_up_start
-
-                        gate_out = gate_up_out[:, :inter_size]
-                        up_out = gate_up_out[:, inter_size:]
-
-                        # SILU
-                        t_silu_start = time.time()
-                        act_out = F.silu(gate_out) * up_out
-                        t_silu_end = time.time()
-                        t_silu_total += t_silu_end - t_silu_start
-
-                        # (M, H) = (M, I_b) @ (I_b, H)
-                        t_down_start = time.time()
-                        down_out = act_out @ e_down.t()
-                        t_down_end = time.time()
-                        t_down_matmul_total += t_down_end - t_down_start
-
-                        bit_down_outs.append(down_out)
-
-                # 同步所有 streams，确保所有 bit 的计算都完成
-                if x.is_cuda:
-                    torch.cuda.synchronize(device=x.device)
-
-                # 累加所有 bit 的结果
-                for down_out in bit_down_outs:
-                    if down_out is not None:
-                        expert_out += down_out
-
-                # 最后把所有 bit 的结果累加回 final_hidden_states
-                t_accum_start = time.time()
-                final_hidden_states[mask] += expert_out * token_w
-                t_accum_end = time.time()
-                t_accum_total += t_accum_end - t_accum_start
+        # Cleanup
+        del expert_to_tokens
 
         t4 = time.time()
 
@@ -309,8 +290,12 @@ class BitPartitionedGroupMoE(nn.Module):
         t5 = time.time()
 
         # 打印详细 profiling
-        print(f"  [BitPartitioned_stream] total={t5-t0:.4f}s | init={t1-t0:.4f}s | shared={t2-t1:.4f}s | router={t3-t2:.4f}s | compute={t4-t3:.4f}s | reshape={t5-t4:.4f}s")
+        print(f"  [BitPartitioned_inverted] total={t5-t0:.4f}s | init={t1-t0:.4f}s | shared={t2-t1:.4f}s | router={t3-t2:.4f}s | compute={t4-t3:.4f}s | reshape={t5-t4:.4f}s")
         print(f"    [Compute_detail] mask={t_mask_total:.4f}s | gate_up_matmul={t_gate_up_matmul_total:.4f}s | silu={t_silu_total:.4f}s | down_matmul={t_down_matmul_total:.4f}s | accum={t_accum_total:.4f}s | active_experts={active_experts_total} | active_bits={self.bit_list}")
+
+        # Final cleanup
+        del x, final_hidden_states, topk_indices, topk_weights
+        gc.collect()
 
         return result
 

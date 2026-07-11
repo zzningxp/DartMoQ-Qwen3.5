@@ -158,6 +158,10 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
     for layer_idx, layer in enumerate(layers):
         if layer_idx % 10 == 0:
             print(f"Processing layer {layer_idx}/{len(layers)}...", flush=True)
+            # Print memory usage every 10 layers
+            if torch.cuda.is_available():
+                for i in range(torch.cuda.device_count()):
+                    print(f"  [Memory] CUDA {i}: {torch.cuda.memory_allocated(i) / 1024**3:.2f} GB allocated, {torch.cuda.memory_reserved(i) / 1024**3:.2f} GB reserved")
 
         tick_layer = time.time()
 
@@ -207,6 +211,9 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
             # Save output
             if isinstance(layer_outputs, tuple):
                 batch_output = layer_outputs[0]
+                # Cleanup any additional outputs in the tuple
+                for extra_output in layer_outputs[1:]:
+                    del extra_output
             else:
                 batch_output = layer_outputs
 
@@ -214,14 +221,18 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
             for i in range(actual_batch_size):
                 new_hidden_states.append(batch_output[i:i+1].cpu())
 
-            # Cleanup
+            # Cleanup batch variables aggressively
             del batch_hidden, layer_outputs, batch_output
+            del layer_kwargs
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-        # Update hidden states for next layer
+        # Update hidden states for next layer - delete old ones first to free memory
+        old_hidden_states = all_hidden_states
         all_hidden_states = new_hidden_states
+        del old_hidden_states
+        del new_hidden_states
 
         # Move layer back to CPU
         layer = layer.to('cpu')
