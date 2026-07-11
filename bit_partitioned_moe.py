@@ -194,7 +194,12 @@ class BitPartitionedGroupMoE(nn.Module):
 
         active_experts_total = 0
 
-        # 优化后的结构：top_k -> expert -> bit
+        # 创建 CUDA streams 用于并行发射不同 bit 的 kernel
+        streams = []
+        if x.is_cuda:
+            streams = [torch.cuda.Stream(device=x.device) for _ in self.bit_list]
+
+        # 优化后的结构：top_k -> expert -> bit (with CUDA streams)
         # 对每个 k 位置单独处理
         for k in range(self.top_k):
             expert_indices_k = topk_indices[:, k]  # (N,)
@@ -213,12 +218,17 @@ class BitPartitionedGroupMoE(nn.Module):
                 t_mask_end = time.time()
                 t_mask_total += t_mask_end - t_mask_start
 
-                # 对同一个 (token, expert)，一次性处理所有 bit
+                # 对同一个 (token, expert)，用 CUDA streams 并行处理所有 bit
                 expert_out = torch.zeros_like(token_x)
 
-                for bit in self.bit_list:
+                # 存储每个 bit 的中间结果，最后再累加
+                bit_down_outs = []
+
+                # 第一阶段：用不同 stream 并行发射所有 bit 的计算
+                for bit_idx, bit in enumerate(self.bit_list):
                     bit_str = str(bit)
                     if bit_str not in self.bit_weights.gate_up:
+                        bit_down_outs.append(None)
                         continue
 
                     gate_up = self.bit_weights.gate_up[bit_str]
@@ -229,29 +239,63 @@ class BitPartitionedGroupMoE(nn.Module):
                     e_gate_up = gate_up[expert_idx]  # (2I_b, H)
                     e_down = down[expert_idx]        # (H, I_b)
 
-                    # 批量计算
-                    t_gate_up_start = time.time()
-                    gate_up_out = token_x @ e_gate_up.t()
-                    t_gate_up_end = time.time()
-                    t_gate_up_matmul_total += t_gate_up_end - t_gate_up_start
+                    if x.is_cuda and bit_idx < len(streams):
+                        # 使用指定的 stream
+                        stream = streams[bit_idx]
+                        with torch.cuda.stream(stream):
+                            t_gate_up_start = time.time()
+                            gate_up_out = token_x @ e_gate_up.t()
+                            t_gate_up_end = time.time()
+                            t_gate_up_matmul_total += t_gate_up_end - t_gate_up_start
 
-                    gate_out = gate_up_out[:, :inter_size]
-                    up_out = gate_up_out[:, inter_size:]
+                            gate_out = gate_up_out[:, :inter_size]
+                            up_out = gate_up_out[:, inter_size:]
 
-                    # SILU
-                    t_silu_start = time.time()
-                    act_out = F.silu(gate_out) * up_out
-                    t_silu_end = time.time()
-                    t_silu_total += t_silu_end - t_silu_start
+                            # SILU
+                            t_silu_start = time.time()
+                            act_out = F.silu(gate_out) * up_out
+                            t_silu_end = time.time()
+                            t_silu_total += t_silu_end - t_silu_start
 
-                    # (M, H) = (M, I_b) @ (I_b, H)
-                    t_down_start = time.time()
-                    down_out = act_out @ e_down.t()
-                    t_down_end = time.time()
-                    t_down_matmul_total += t_down_end - t_down_start
+                            # (M, H) = (M, I_b) @ (I_b, H)
+                            t_down_start = time.time()
+                            down_out = act_out @ e_down.t()
+                            t_down_end = time.time()
+                            t_down_matmul_total += t_down_end - t_down_start
 
-                    # 累加到 expert_out
-                    expert_out += down_out
+                            bit_down_outs.append(down_out)
+                    else:
+                        # CPU 或没有足够 streams，串行执行
+                        t_gate_up_start = time.time()
+                        gate_up_out = token_x @ e_gate_up.t()
+                        t_gate_up_end = time.time()
+                        t_gate_up_matmul_total += t_gate_up_end - t_gate_up_start
+
+                        gate_out = gate_up_out[:, :inter_size]
+                        up_out = gate_up_out[:, inter_size:]
+
+                        # SILU
+                        t_silu_start = time.time()
+                        act_out = F.silu(gate_out) * up_out
+                        t_silu_end = time.time()
+                        t_silu_total += t_silu_end - t_silu_start
+
+                        # (M, H) = (M, I_b) @ (I_b, H)
+                        t_down_start = time.time()
+                        down_out = act_out @ e_down.t()
+                        t_down_end = time.time()
+                        t_down_matmul_total += t_down_end - t_down_start
+
+                        bit_down_outs.append(down_out)
+
+                # 同步所有 streams，确保所有 bit 的计算都完成
+                if x.is_cuda:
+                    torch.cuda.synchronize(device=x.device)
+
+                # 累加所有 bit 的结果
+                for down_out in bit_down_outs:
+                    if down_out is not None:
+                        expert_out += down_out
 
                 # 最后把所有 bit 的结果累加回 final_hidden_states
                 t_accum_start = time.time()
@@ -265,11 +309,8 @@ class BitPartitionedGroupMoE(nn.Module):
         t5 = time.time()
 
         # 打印详细 profiling
-        print(f"  [BitPartitioned_optimized] total={t5-t0:.4f}s | init={t1-t0:.4f}s | "
-              f"shared={t2-t1:.4f}s | router={t3-t2:.4f}s | compute={t4-t3:.4f}s | reshape={t5-t4:.4f}s")
-        print(f"    [Compute_detail] mask={t_mask_total:.4f}s | gate_up_matmul={t_gate_up_matmul_total:.4f}s | "
-              f"silu={t_silu_total:.4f}s | down_matmul={t_down_matmul_total:.4f}s | accum={t_accum_total:.4f}s | "
-              f"active_experts={active_experts_total} | active_bits={self.bit_list}")
+        print(f"  [BitPartitioned_stream] total={t5-t0:.4f}s | init={t1-t0:.4f}s | shared={t2-t1:.4f}s | router={t3-t2:.4f}s | compute={t4-t3:.4f}s | reshape={t5-t4:.4f}s")
+        print(f"    [Compute_detail] mask={t_mask_total:.4f}s | gate_up_matmul={t_gate_up_matmul_total:.4f}s | silu={t_silu_total:.4f}s | down_matmul={t_down_matmul_total:.4f}s | accum={t_accum_total:.4f}s | active_experts={active_experts_total} | active_bits={self.bit_list}")
 
         return result
 
