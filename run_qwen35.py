@@ -6,8 +6,6 @@ import torch
 import torch.nn as nn
 import argparse
 import sys
-import os
-import subprocess
 
 sys.path.insert(0, '..')
 
@@ -34,8 +32,7 @@ def main():
 
     print("DartMoQ for Qwen3.5 MoE (Hybrid Mode Only)")
     git_hash = get_git_hash()
-    if git_hash:
-        print(f"Git HEAD: {git_hash}")
+    print(f"Git HEAD: {git_hash}")
     print(f"Model: {args.model}")
     print(f"Calibration dataset: {args.dataset}")
     print(f"Quant scheme: {args.quant_scheme}")

@@ -8,6 +8,8 @@ from datasets import load_dataset
 # os.environ['HF_DATASETS_OFFLINE'] = '1'
 # os.environ['HF_DATASETS_DOWNLOAD_MODE'] = 'reuse_dataset_if_exists'
 
+import os
+import subprocess
 
 def set_seed(seed):
     np.random.seed(seed)
