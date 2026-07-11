@@ -22,7 +22,7 @@ from typing import Iterable
 FIELDNAMES = [
     "git_hash", "model_name", "slices", "quant_scheme", "rank_mode",
     "moe_struct", "quantmode", "disable_0bit_prune", "standby_layer_cpu", "quant_layers", "bpw", "ppl_wikitext2", "ppl_c4",
-    "status", "runtime_ppl_wikitext2", "runtime_ppl_c4", "runtime_ppl", "runtime_quant", "runtime_ppl_eval",
+    "status", "runtime_ppl", "runtime_quant", "runtime_ppl_eval", "runtime_ppl_wikitext2", "runtime_ppl_c4", "error",
 ]
 
 # New log format patterns
@@ -490,7 +490,7 @@ DISPLAY_FIELDS = [
     "git_hash", "model_name", "slices", "quant_scheme", "rank_mode", "quantmode", "quant_layers", "bpw",
     "ppl_wikitext2", "ppl_c4",
     "status",
-    "runtime_ppl_wikitext2", "runtime_ppl_c4", "runtime_ppl", "runtime_quant", "runtime_ppl_eval", "error",
+    "runtime_ppl", "runtime_quant", "runtime_ppl_eval", "runtime_ppl_wikitext2", "runtime_ppl_c4", "error",
 ]
 
 PLAIN_HEADERS = {
@@ -508,11 +508,11 @@ PLAIN_HEADERS = {
     "ppl_wikitext2": "wiki",
     "ppl_c4": "c4",
     "status": "status",
-    "runtime_ppl_wikitext2": "t_wiki",
-    "runtime_ppl_c4": "t_c4",
     "runtime_ppl": "time",
     "runtime_quant": "t_quant",
     "runtime_ppl_eval": "t_ppl",
+    "runtime_ppl_wikitext2": "t_wiki",
+    "runtime_ppl_c4": "t_c4",
     "error": "err",
 }
 
@@ -531,11 +531,11 @@ EXPORT_HEADERS = {
     "ppl_wikitext2": "ppl_wikitext2",
     "ppl_c4": "ppl_c4",
     "status": "status",
-    "runtime_ppl_wikitext2": "t_wiki",
-    "runtime_ppl_c4": "t_c4",
     "runtime_ppl": "total_time",
     "runtime_quant": "quant_time",
     "runtime_ppl_eval": "ppl_eval_time",
+    "runtime_ppl_wikitext2": "t_wiki",
+    "runtime_ppl_c4": "t_c4",
 }
 
 
