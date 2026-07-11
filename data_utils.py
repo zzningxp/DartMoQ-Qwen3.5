@@ -8,11 +8,41 @@ from datasets import load_dataset
 # os.environ['HF_DATASETS_OFFLINE'] = '1'
 # os.environ['HF_DATASETS_DOWNLOAD_MODE'] = 'reuse_dataset_if_exists'
 
+import os
+import subprocess
 
 def set_seed(seed):
     np.random.seed(seed)
     torch.random.manual_seed(seed)
 
+def get_git_hash() -> str:
+    """Get git HEAD hash with optional + if workspace is dirty."""
+    try:
+        # Get short hash
+        hash_result = subprocess.run(
+            ['git', 'rev-parse', '--short', 'HEAD'],
+            capture_output=True,
+            text=True,
+            cwd=os.path.dirname(os.path.abspath(__file__))
+        )
+        if hash_result.returncode != 0:
+            return ""
+        git_hash = hash_result.stdout.strip()
+
+        # Check if workspace is dirty
+        status_result = subprocess.run(
+            ['git', 'status', '--porcelain'],
+            capture_output=True,
+            text=True,
+            cwd=os.path.dirname(os.path.abspath(__file__))
+        )
+        is_dirty = len(status_result.stdout.strip()) > 0
+
+        if is_dirty:
+            return f"{git_hash}+"
+        return git_hash
+    except Exception:
+        return ""
 
 def get_wikitext2(nsamples, seed, seqlen, tokenizer, bsz = 1):
     traindata = load_dataset('wikitext', 'wikitext-2-raw-v1', split='train')

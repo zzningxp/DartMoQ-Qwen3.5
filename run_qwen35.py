@@ -6,11 +6,10 @@ import torch
 import torch.nn as nn
 import argparse
 import sys
-import os
 
 sys.path.insert(0, '..')
 
-from data_utils import get_loaders
+from data_utils import get_loaders, get_git_hash
 from qwen35_utils import load_model
 from qwen35_simple_wrapper import dartmoq_quant_grouped_gemm_moe
 
@@ -32,6 +31,8 @@ def main():
     args = parser.parse_args()
 
     print("DartMoQ for Qwen3.5 MoE (Hybrid Mode Only)")
+    git_hash = get_git_hash()
+    print(f"Git HEAD: {git_hash}")
     print(f"Model: {args.model}")
     print(f"Calibration dataset: {args.dataset}")
     print(f"Quant scheme: {args.quant_scheme}")
