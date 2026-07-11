@@ -186,7 +186,6 @@ class BitPartitionedGroupMoE(nn.Module):
         t3 = time.time()
 
         # 详细统计 compute 内部各部分时间
-        t_bit_loop_total = 0.0
         t_mask_total = 0.0
         t_gate_up_matmul_total = 0.0
         t_silu_total = 0.0
@@ -194,23 +193,71 @@ class BitPartitionedGroupMoE(nn.Module):
         t_accum_total = 0.0
 
         active_experts_total = 0
-        active_bits_total = 0
 
-        # 对每个 bit group 分别计算
-        for bit in self.bit_list:
-            t_bit_start = time.time()
-            bit_out, stats = self._forward_bit_group(x, bit, topk_indices, topk_weights)
-            final_hidden_states.add_(bit_out)
-            t_bit_end = time.time()
+        # 优化后的结构：top_k -> expert -> bit
+        # 对每个 k 位置单独处理
+        for k in range(self.top_k):
+            expert_indices_k = topk_indices[:, k]  # (N,)
+            weights_k = topk_weights[:, k:k+1]  # (N, 1)
 
-            t_bit_loop_total += t_bit_end - t_bit_start
-            t_mask_total += stats['mask']
-            t_gate_up_matmul_total += stats['gate_up_matmul']
-            t_silu_total += stats['silu']
-            t_down_matmul_total += stats['down_matmul']
-            t_accum_total += stats['accum']
-            active_experts_total += stats['active_experts']
-            active_bits_total += 1
+            # 对每个专家，收集选了它的 token
+            for expert_idx in range(self.num_experts):
+                t_mask_start = time.time()
+                mask = expert_indices_k == expert_idx
+                if not mask.any():
+                    continue
+                active_experts_total += 1
+
+                token_x = x[mask]  # (M, H)
+                token_w = weights_k[mask]  # (M, 1)
+                t_mask_end = time.time()
+                t_mask_total += t_mask_end - t_mask_start
+
+                # 对同一个 (token, expert)，一次性处理所有 bit
+                expert_out = torch.zeros_like(token_x)
+
+                for bit in self.bit_list:
+                    bit_str = str(bit)
+                    if bit_str not in self.bit_weights.gate_up:
+                        continue
+
+                    gate_up = self.bit_weights.gate_up[bit_str]
+                    down = self.bit_weights.down[bit_str]
+                    inter_size = self.inter_size_by_bit[bit]
+
+                    # 获取这个 expert 的权重
+                    e_gate_up = gate_up[expert_idx]  # (2I_b, H)
+                    e_down = down[expert_idx]        # (H, I_b)
+
+                    # 批量计算
+                    t_gate_up_start = time.time()
+                    gate_up_out = token_x @ e_gate_up.t()
+                    t_gate_up_end = time.time()
+                    t_gate_up_matmul_total += t_gate_up_end - t_gate_up_start
+
+                    gate_out = gate_up_out[:, :inter_size]
+                    up_out = gate_up_out[:, inter_size:]
+
+                    # SILU
+                    t_silu_start = time.time()
+                    act_out = F.silu(gate_out) * up_out
+                    t_silu_end = time.time()
+                    t_silu_total += t_silu_end - t_silu_start
+
+                    # (M, H) = (M, I_b) @ (I_b, H)
+                    t_down_start = time.time()
+                    down_out = act_out @ e_down.t()
+                    t_down_end = time.time()
+                    t_down_matmul_total += t_down_end - t_down_start
+
+                    # 累加到 expert_out
+                    expert_out += down_out
+
+                # 最后把所有 bit 的结果累加回 final_hidden_states
+                t_accum_start = time.time()
+                final_hidden_states[mask] += expert_out * token_w
+                t_accum_end = time.time()
+                t_accum_total += t_accum_end - t_accum_start
 
         t4 = time.time()
 
@@ -218,11 +265,11 @@ class BitPartitionedGroupMoE(nn.Module):
         t5 = time.time()
 
         # 打印详细 profiling
-        print(f"  [BitPartitioned_v7_detail] total={t5-t0:.4f}s | init={t1-t0:.4f}s | "
-              f"shared={t2-t1:.4f}s | router={t3-t2:.4f}s | bit_loop={t4-t3:.4f}s | reshape={t5-t4:.4f}s")
+        print(f"  [BitPartitioned_optimized] total={t5-t0:.4f}s | init={t1-t0:.4f}s | "
+              f"shared={t2-t1:.4f}s | router={t3-t2:.4f}s | compute={t4-t3:.4f}s | reshape={t5-t4:.4f}s")
         print(f"    [Compute_detail] mask={t_mask_total:.4f}s | gate_up_matmul={t_gate_up_matmul_total:.4f}s | "
               f"silu={t_silu_total:.4f}s | down_matmul={t_down_matmul_total:.4f}s | accum={t_accum_total:.4f}s | "
-              f"active_experts={active_experts_total} | active_bits={active_bits_total}")
+              f"active_experts={active_experts_total} | active_bits={self.bit_list}")
 
         return result
 
