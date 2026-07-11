@@ -22,7 +22,7 @@ from typing import Iterable
 FIELDNAMES = [
     "git_hash", "model_name", "slices", "quant_scheme", "rank_mode",
     "moe_struct", "quantmode", "disable_0bit_prune", "standby_layer_cpu", "quant_layers", "bpw", "ppl_wikitext2", "ppl_c4",
-    "status", "runtime_ppl", "runtime_quant", "runtime_ppl_eval",
+    "status", "runtime_ppl_wikitext2", "runtime_ppl_c4", "runtime_ppl", "runtime_quant", "runtime_ppl_eval",
 ]
 
 # New log format patterns
@@ -91,6 +91,8 @@ class RunRecord:
     bpw: str = ""
     ppl_wikitext2: str = ""
     ppl_c4: str = ""
+    runtime_ppl_wikitext2: str = ""
+    runtime_ppl_c4: str = ""
     runtime_ppl: str = ""
     runtime_quant: str = ""
     runtime_ppl_eval: str = ""
@@ -242,9 +244,9 @@ def parse_log(path: str) -> list[RunRecord]:
 
             # If not using new format yet, check for old format patterns
             if not using_new_format and not using_eval_format:
-                start_match = START_TIME_RE.search(line)
-                if start_match:
-                    pending_start_time = start_match.group("value").strip()
+                start_time_match = START_TIME_RE.search(line)
+                if start_time_match:
+                    pending_start_time = start_time_match.group("value").strip()
 
                 loading_match = LOADING_RE.search(line)
                 if loading_match:
@@ -317,6 +319,7 @@ def parse_log(path: str) -> list[RunRecord]:
                         try:
                             t = float(time_value)
                             current._ppl_eval_times.append(t)
+                            setattr(current, f"runtime_ppl_{dataset}", f"{t:.2f}")
                         except ValueError:
                             pass
                     continue
@@ -380,6 +383,7 @@ def parse_log(path: str) -> list[RunRecord]:
                         try:
                             t = float(time_value)
                             current._ppl_eval_times.append(t)
+                            setattr(current, f"runtime_ppl_{dataset}", f"{t:.2f}")
                         except ValueError:
                             pass
                     continue
@@ -486,7 +490,7 @@ DISPLAY_FIELDS = [
     "git_hash", "model_name", "slices", "quant_scheme", "rank_mode", "quantmode", "quant_layers", "bpw",
     "ppl_wikitext2", "ppl_c4",
     "status",
-    "runtime_ppl", "runtime_quant", "runtime_ppl_eval", "error",
+    "runtime_ppl_wikitext2", "runtime_ppl_c4", "runtime_ppl", "runtime_quant", "runtime_ppl_eval", "error",
 ]
 
 PLAIN_HEADERS = {
@@ -504,6 +508,8 @@ PLAIN_HEADERS = {
     "ppl_wikitext2": "wiki",
     "ppl_c4": "c4",
     "status": "status",
+    "runtime_ppl_wikitext2": "t_wiki",
+    "runtime_ppl_c4": "t_c4",
     "runtime_ppl": "time",
     "runtime_quant": "t_quant",
     "runtime_ppl_eval": "t_ppl",
@@ -525,6 +531,8 @@ EXPORT_HEADERS = {
     "ppl_wikitext2": "ppl_wikitext2",
     "ppl_c4": "ppl_c4",
     "status": "status",
+    "runtime_ppl_wikitext2": "t_wiki",
+    "runtime_ppl_c4": "t_c4",
     "runtime_ppl": "total_time",
     "runtime_quant": "quant_time",
     "runtime_ppl_eval": "ppl_eval_time",
@@ -545,7 +553,7 @@ def _format_value(field: str, value) -> str:
 
 def _format_plain_value(record: RunRecord, field: str, value) -> str:
     if record.status in ("failed", "partial", "incomplete"):
-        if field in ("runtime_ppl", "error"):
+        if field == "error":
             return "----"
         if field != "status" and value == "":
             return "----"
@@ -597,7 +605,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("logs", nargs="+", help="slurm log files to parse")
     parser.add_argument(
         "--format", "-f", choices=("plain", "csv", "json", "md"), default="plain",
-        help="output format. plain prints to stdout; csv/json/md write to <logfile>.<format>.",
+        help="output format. plain prints to stdout; csv/json/md writes to <logfile>.<format>",
     )
     parser.add_argument(
         "--complete-only", action="store_true",

@@ -185,7 +185,7 @@ def construct_moe(model, moe_model_flag, layer, layer_idx, inp,
         if is_moe_layer:
             moe, layer_metadata = reconstruct_moe_from_existing(model, layer, layer_idx,
                                                 hidden_states,
-                                                n_experts, n_activated, slice_expert_num, 
+                                                n_experts, n_activated, slice_expert_num,
                                                 ori_activated, device,
                                                 qscheme, use_hybrid_moe, global_mode, quantmode, args)
             layer.mlp = moe
@@ -198,9 +198,9 @@ def construct_moe(model, moe_model_flag, layer, layer_idx, inp,
 
     tick0 = time.time()
     if_quant_attn = True
-    quant_layer_mix_precision(layer, layer_idx, if_quant_attn, 
+    quant_layer_mix_precision(layer, layer_idx, if_quant_attn,
                               n_experts, slice_expert_num,
-                              hidden_states_inorm, hidden_states, 
+                              hidden_states_inorm, hidden_states,
                               attention_mask, position_ids, position_embeddings,
                               qscheme, use_hybrid_moe, quantmode, seed=args.seed)
     gc.collect()
@@ -255,7 +255,7 @@ def dartmoq_quant_grouped_gemm_moe(model, tokenizer, dataloader, args, test_ppl=
     inps = torch.zeros(
         (args.nsamples//bsz, bsz, model.seqlen, model.config.hidden_size), dtype=dtype, device='cpu'
     )
-    print(inps.shape)
+    # print(inps.shape)
     cache = {'i': 0, 'attention_mask': None, 'position_ids': None, 'position_embeddings': None}
 
     if args.standby_layer_cpu:
@@ -375,9 +375,9 @@ def dartmoq_quant_grouped_gemm_moe(model, tokenizer, dataloader, args, test_ppl=
             layers_device.append(dev)
             if dev.type == 'cuda':
                 layer = layer.to('cpu')
-        for i in range(torch.cuda.device_count()):
-            print(f"CUDA {i} Allocated: {torch.cuda.memory_allocated(device=i) / 1024**3:.2f} GB")
-            print(f"CUDA {i} Reserved: {torch.cuda.memory_reserved(device=i) / 1024**3:.2f} GB")
+        # for i in range(torch.cuda.device_count()):
+        #     print(f"CUDA {i} Allocated: {torch.cuda.memory_allocated(device=i) / 1024**3:.2f} GB")
+        #     print(f"CUDA {i} Reserved: {torch.cuda.memory_reserved(device=i) / 1024**3:.2f} GB")
 
     qscheme_str = args.quant_scheme
     qscheme = {}
@@ -475,9 +475,9 @@ def dartmoq_quant_grouped_gemm_moe(model, tokenizer, dataloader, args, test_ppl=
         if args.standby_layer_cpu:
             layer = layer.to('cpu')
 
-        for i in range(torch.cuda.device_count()):
-            print(f"CUDA {i} Allocated: {torch.cuda.memory_allocated(device=i) / 1024**3:.2f} GB")
-            print(f"CUDA {i} Reserved: {torch.cuda.memory_reserved(device=i) / 1024**3:.2f} GB")
+        # for i in range(torch.cuda.device_count()):
+        #     print(f"CUDA {i} Allocated: {torch.cuda.memory_allocated(device=i) / 1024**3:.2f} GB")
+        #     print(f"CUDA {i} Reserved: {torch.cuda.memory_reserved(device=i) / 1024**3:.2f} GB")
 
         tick1 = time.time()
         print(f"Layer {layer_idx} total reconstruct and quantization time: {tick1 - tick0:.2f} s", flush=True)

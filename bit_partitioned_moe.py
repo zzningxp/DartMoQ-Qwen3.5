@@ -304,7 +304,7 @@ class BitPartitionedGroupMoE(nn.Module):
         result = final_hidden_states.reshape(batch_size, seq_len, hidden_dim)
         t5 = time.time()
 
-        # 打印详细 profiling
+        # 打印详细 profiling (已禁用，仅在需要调试时打开)
         print(f"  [BitPartitioned_gpu] total={t5-t0:.4f}s | init={t1-t0:.4f}s | shared={t2-t1:.4f}s | router={t3-t2:.4f}s | compute={t4-t3:.4f}s | reshape={t5-t4:.4f}s")
         print(f"    [Compute_detail] mask={t_mask_total:.4f}s | gate_up_matmul={t_gate_up_matmul_total:.4f}s | silu={t_silu_total:.4f}s | down_matmul={t_down_matmul_total:.4f}s | accum={t_accum_total:.4f}s | active_experts={active_experts_total} | active_bits={self.bit_list}")
 
