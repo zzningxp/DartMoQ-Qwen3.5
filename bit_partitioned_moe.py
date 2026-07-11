@@ -12,6 +12,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from collections import defaultdict
+import time
 
 
 class BitPartitionedGroupMoE(nn.Module):
@@ -160,16 +161,20 @@ class BitPartitionedGroupMoE(nn.Module):
         return moe
 
     def forward(self, hidden_states):
+        t0 = time.time()
+
         batch_size, seq_len, hidden_dim = hidden_states.shape
         x = hidden_states.reshape(-1, hidden_dim)
 
         final_hidden_states = torch.zeros_like(x)
+        t1 = time.time()
 
         # Shared expert
         if self.shared_expert is not None and self.shared_expert_gate is not None:
             shared_out = self.shared_expert(x)
             shared_gate_val = torch.sigmoid(self.shared_expert_gate(x))
             final_hidden_states.add_(shared_out * shared_gate_val)
+        t2 = time.time()
 
         # Router
         gate_output = self.gate(x)
@@ -178,13 +183,48 @@ class BitPartitionedGroupMoE(nn.Module):
         else:
             router_logits = gate_output.softmax(dim=-1)
             topk_weights, topk_indices = router_logits.topk(self.top_k, dim=-1)
+        t3 = time.time()
+
+        # 详细统计 compute 内部各部分时间
+        t_bit_loop_total = 0.0
+        t_mask_total = 0.0
+        t_gate_up_matmul_total = 0.0
+        t_silu_total = 0.0
+        t_down_matmul_total = 0.0
+        t_accum_total = 0.0
+
+        active_experts_total = 0
+        active_bits_total = 0
 
         # 对每个 bit group 分别计算
         for bit in self.bit_list:
-            bit_out = self._forward_bit_group(x, bit, topk_indices, topk_weights)
+            t_bit_start = time.time()
+            bit_out, stats = self._forward_bit_group(x, bit, topk_indices, topk_weights)
             final_hidden_states.add_(bit_out)
+            t_bit_end = time.time()
 
-        return final_hidden_states.reshape(batch_size, seq_len, hidden_dim)
+            t_bit_loop_total += t_bit_end - t_bit_start
+            t_mask_total += stats['mask']
+            t_gate_up_matmul_total += stats['gate_up_matmul']
+            t_silu_total += stats['silu']
+            t_down_matmul_total += stats['down_matmul']
+            t_accum_total += stats['accum']
+            active_experts_total += stats['active_experts']
+            active_bits_total += 1
+
+        t4 = time.time()
+
+        result = final_hidden_states.reshape(batch_size, seq_len, hidden_dim)
+        t5 = time.time()
+
+        # 打印详细 profiling
+        print(f"  [BitPartitioned_v7_detail] total={t5-t0:.4f}s | init={t1-t0:.4f}s | "
+              f"shared={t2-t1:.4f}s | router={t3-t2:.4f}s | bit_loop={t4-t3:.4f}s | reshape={t5-t4:.4f}s")
+        print(f"    [Compute_detail] mask={t_mask_total:.4f}s | gate_up_matmul={t_gate_up_matmul_total:.4f}s | "
+              f"silu={t_silu_total:.4f}s | down_matmul={t_down_matmul_total:.4f}s | accum={t_accum_total:.4f}s | "
+              f"active_experts={active_experts_total} | active_bits={active_bits_total}")
+
+        return result
 
     def _forward_bit_group(self, x, bit, topk_indices, topk_weights):
         """
@@ -192,9 +232,18 @@ class BitPartitionedGroupMoE(nn.Module):
 
         思路：对每个专家，收集所有选了这个专家的 token，然后批量计算
         """
+        stats = {
+            'mask': 0.0,
+            'gate_up_matmul': 0.0,
+            'silu': 0.0,
+            'down_matmul': 0.0,
+            'accum': 0.0,
+            'active_experts': 0
+        }
+
         bit_str = str(bit)
         if bit_str not in self.bit_weights.gate_up:
-            return torch.zeros_like(x)
+            return torch.zeros_like(x), stats
 
         out = torch.zeros_like(x)
 
@@ -209,12 +258,16 @@ class BitPartitionedGroupMoE(nn.Module):
 
             # 对每个专家，收集选了它的 token
             for expert_idx in range(self.num_experts):
+                t_mask_start = time.time()
                 mask = expert_indices_k == expert_idx
                 if not mask.any():
                     continue
+                stats['active_experts'] += 1
 
                 token_x = x[mask]  # (M, H)
                 token_w = weights_k[mask]  # (M, 1)
+                t_mask_end = time.time()
+                stats['mask'] += t_mask_end - t_mask_start
 
                 # 获取这个专家的权重
                 e_gate_up = gate_up[expert_idx]  # (2I_b, H)
@@ -222,18 +275,30 @@ class BitPartitionedGroupMoE(nn.Module):
 
                 # 批量计算
                 # (M, 2I_b) = (M, H) @ (H, 2I_b)
+                t_gate_up_start = time.time()
                 gate_up_out = token_x @ e_gate_up.t()
+                t_gate_up_end = time.time()
+                stats['gate_up_matmul'] += t_gate_up_end - t_gate_up_start
 
                 gate_out = gate_up_out[:, :inter_size]
                 up_out = gate_up_out[:, inter_size:]
 
                 # SILU
+                t_silu_start = time.time()
                 act_out = F.silu(gate_out) * up_out
+                t_silu_end = time.time()
+                stats['silu'] += t_silu_end - t_silu_start
 
                 # (M, H) = (M, I_b) @ (I_b, H)
+                t_down_start = time.time()
                 down_out = act_out @ e_down.t()
+                t_down_end = time.time()
+                stats['down_matmul'] += t_down_end - t_down_start
 
                 # 累加
+                t_accum_start = time.time()
                 out[mask] += down_out * token_w
+                t_accum_end = time.time()
+                stats['accum'] += t_accum_end - t_accum_start
 
-        return out
+        return out, stats
