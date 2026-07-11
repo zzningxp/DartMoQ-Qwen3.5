@@ -201,35 +201,43 @@ class BitPartitionedGroupMoE(nn.Module):
 
         active_experts_total = 0
 
-        # 优化结构：expert -> bit (反向索引，每个 expert 只处理一次)
-        # 先构建反向索引：expert_idx -> list of (token_idx, k_position)
-        from collections import defaultdict
-        expert_to_tokens = defaultdict(list)
+        # 优化结构：expert -> bit (GPU 反向索引，参考 deepseek)
+        t_mask_start = time.time()
 
-        for token_idx in range(x.shape[0]):
-            for k in range(self.top_k):
-                expert_idx = topk_indices[token_idx, k].item()
-                expert_to_tokens[expert_idx].append((token_idx, k))
+        # Flatten: (N, top_k) -> (N * top_k,)
+        flat_expert_indices = topk_indices.flatten()
+        flat_expert_weights = topk_weights.flatten()
+        flat_token_indices = torch.arange(x.shape[0], device=x.device).repeat_interleave(self.top_k)
 
-        # 对每个 expert 处理所有选择它的 token（来自任意 k 位置）
+        # 按 expert 排序
+        idxs = flat_expert_indices.argsort()
+        sorted_experts = flat_expert_indices[idxs]
+        sorted_weights = flat_expert_weights[idxs]
+        sorted_tokens = flat_token_indices[idxs]
+
+        # 统计每个 expert 的 token 数，得到结束位置
+        tokens_per_expert = sorted_experts.bincount(minlength=self.num_experts).cpu().numpy().cumsum(0)
+
+        t_mask_end = time.time()
+        t_mask_total += t_mask_end - t_mask_start
+
+        # 对每个 expert 处理所有选择它的 token
         for expert_idx in range(self.num_experts):
-            token_k_list = expert_to_tokens.get(expert_idx, [])
-            if not token_k_list:
+            end_idx = tokens_per_expert[expert_idx]
+            start_idx = 0 if expert_idx == 0 else tokens_per_expert[expert_idx - 1]
+
+            if start_idx == end_idx:
                 continue
 
             active_experts_total += 1
 
-            t_mask_start = time.time()
-            token_indices = [t for t, k in token_k_list]
-            k_positions = [k for t, k in token_k_list]
-
-            token_x = x[token_indices]  # (M, H)
-            token_w = topk_weights[token_indices, k_positions].unsqueeze(1)  # (M, 1)
-            t_mask_end = time.time()
-            t_mask_total += t_mask_end - t_mask_start
+            # 取当前 expert 的所有 token
+            exp_token_idx = sorted_tokens[start_idx:end_idx]
+            expert_tokens = x[exp_token_idx]
+            expert_weights = sorted_weights[start_idx:end_idx].unsqueeze(1)
 
             # 对同一个 expert 的所有 token，串行处理所有 bit
-            expert_out = torch.zeros_like(token_x)
+            expert_out = torch.zeros_like(expert_tokens)
 
             for bit in self.bit_list:
                 bit_str = str(bit)
@@ -245,7 +253,7 @@ class BitPartitionedGroupMoE(nn.Module):
                 e_down = down[expert_idx]        # (H, I_b)
 
                 t_gate_up_start = time.time()
-                gate_up_out = token_x @ e_gate_up.t()
+                gate_up_out = expert_tokens @ e_gate_up.t()
                 t_gate_up_end = time.time()
                 t_gate_up_matmul_total += t_gate_up_end - t_gate_up_start
 
@@ -272,17 +280,24 @@ class BitPartitionedGroupMoE(nn.Module):
                 # Cleanup references for this bit
                 del e_gate_up, e_down, gate_up, down, down_out
 
-            # 最后把结果累加回 final_hidden_states
+            # 最后把结果累加回 final_hidden_states (用 scatter_reduce_)
             t_accum_start = time.time()
-            final_hidden_states[token_indices] += expert_out * token_w
+            expert_out.mul_(expert_weights)
+            final_hidden_states.scatter_reduce_(
+                0,
+                exp_token_idx.view(-1, 1).repeat(1, x.shape[-1]),
+                expert_out,
+                reduce='sum'
+            )
             t_accum_end = time.time()
             t_accum_total += t_accum_end - t_accum_start
 
             # Cleanup for this expert
-            del expert_out, token_x, token_w, token_indices, k_positions
+            del expert_out, expert_tokens, expert_weights, exp_token_idx
 
         # Cleanup
-        del expert_to_tokens
+        del flat_expert_indices, flat_expert_weights, flat_token_indices
+        del idxs, sorted_experts, sorted_weights, sorted_tokens, tokens_per_expert
 
         t4 = time.time()
 
@@ -290,7 +305,7 @@ class BitPartitionedGroupMoE(nn.Module):
         t5 = time.time()
 
         # 打印详细 profiling
-        print(f"  [BitPartitioned_inverted] total={t5-t0:.4f}s | init={t1-t0:.4f}s | shared={t2-t1:.4f}s | router={t3-t2:.4f}s | compute={t4-t3:.4f}s | reshape={t5-t4:.4f}s")
+        print(f"  [BitPartitioned_gpu] total={t5-t0:.4f}s | init={t1-t0:.4f}s | shared={t2-t1:.4f}s | router={t3-t2:.4f}s | compute={t4-t3:.4f}s | reshape={t5-t4:.4f}s")
         print(f"    [Compute_detail] mask={t_mask_total:.4f}s | gate_up_matmul={t_gate_up_matmul_total:.4f}s | silu={t_silu_total:.4f}s | down_matmul={t_down_matmul_total:.4f}s | accum={t_accum_total:.4f}s | active_experts={active_experts_total} | active_bits={self.bit_list}")
 
         # Final cleanup

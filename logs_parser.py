@@ -352,6 +352,14 @@ def parse_log(path: str) -> list[RunRecord]:
                 if quant_layers_match:
                     current.quant_layers = quant_layers_match.group("quant_layers")
                     continue
+                # Handle "Quantize layers:" (without "ing") case from run_qwen35.py
+                if line.startswith("Quantize layers: "):
+                    value = line[len("Quantize layers: "):].strip()
+                    if value.lower() == "all":
+                        current.quant_layers = "all"
+                    else:
+                        current.quant_layers = value
+                    continue
                 # Handle "Quantizing all layers" case
                 if "Quantizing all layers" in line:
                     current.quant_layers = "all"
