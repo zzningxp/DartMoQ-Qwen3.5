@@ -230,8 +230,9 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
         hidden_states = new_hidden_states
         del new_hidden_states
 
-        # Move layer back to CPU
-        layer = layer.to('cpu')
+        # Do NOT move layer back to CPU - layers[layer_idx] still points to CPU original
+        # The local `layer` variable will go out of scope in next iteration, allowing GPU memory to be freed
+        del layer
 
         # Cleanup
         gc.collect()
