@@ -56,7 +56,12 @@ class BitPartitionedGroupMoE(nn.Module):
                 self.down = nn.ParameterDict()
 
         self.bit_weights = BitWeights()
+        # 紧凑存储格式：
+        # - gate_up[bit_str]: (total_neurons_2x, H)  # 所有 expert 的 gate/up 权重拼接，2x 因为 gate+up
+        # - down[bit_str]: (H, total_neurons)       # 所有 expert 的 down 权重拼接
+        # - expert_offsets[bit_str]: (E+1,)          # 每个 expert 的 start idx，cumsum 格式
         self.inter_size_by_bit = {}
+        self.expert_offsets = {}  # bit_str -> LongTensor: expert_idx -> start_pos (cumsum格式)
 
     @classmethod
     def from_simple_moe(cls, simple_moe, layer_metadata):
@@ -94,39 +99,37 @@ class BitPartitionedGroupMoE(nn.Module):
         dtype = next(simple_moe.parameters()).dtype
         device = next(simple_moe.parameters()).device
 
-        # 第一步：确定每个 bit 在所有专家中的最大神经元数
-        max_neurons_by_bit = defaultdict(int)
+        # 第一步：收集每个 expert 在每个 bit 的神经元数
+        neurons_by_bit_expert = defaultdict(list)  # bit -> list[int]
         for expert_idx in range(num_experts):
             bit_indices = expert_bit_indices[expert_idx]
             for bit in bit_list:
                 indices = bit_indices.get(bit, [])
-                max_neurons_by_bit[bit] = max(max_neurons_by_bit[bit], len(indices))
+                neurons_by_bit_expert[bit].append(len(indices))
 
-        # 第二步：为每个 bit 初始化独立的权重张量
+        # 第二步：为每个 bit 初始化紧凑格式的权重张量（无 padding）
         for bit in bit_list:
-            max_n = max_neurons_by_bit[bit]
-            if max_n == 0:
+            bit_str = str(bit)
+            neuron_counts = neurons_by_bit_expert[bit]
+            total_neurons = sum(neuron_counts)
+            if total_neurons == 0:
                 continue
 
-            bit_str = str(bit)
+            # 计算 expert offsets (cumsum 格式，方便索引)
+            expert_offsets = torch.zeros(num_experts + 1, dtype=torch.long, device=device)
+            expert_offsets[1:] = torch.tensor(neuron_counts, dtype=torch.long, device=device).cumsum(dim=0)
 
-            # (E, 2I_b, H)
-            gate_up = torch.zeros(
-                num_experts, 2 * max_n, hidden_size,
-                dtype=dtype, device=device
-            )
-
-            # (E, H, I_b)
-            down = torch.zeros(
-                num_experts, hidden_size, max_n,
-                dtype=dtype, device=device
-            )
+            # (total_neurons_2x, H): 所有 expert 的 gate/up 拼接，每个 expert 是 [gate, up]
+            gate_up = torch.zeros(2 * total_neurons, hidden_size, dtype=dtype, device=device)
+            # (H, total_neurons): 所有 expert 的 down 拼接
+            down = torch.zeros(hidden_size, total_neurons, dtype=dtype, device=device)
 
             moe.bit_weights.gate_up[bit_str] = nn.Parameter(gate_up, requires_grad=False)
             moe.bit_weights.down[bit_str] = nn.Parameter(down, requires_grad=False)
-            moe.inter_size_by_bit[bit] = max_n
+            moe.expert_offsets[bit_str] = expert_offsets
+            moe.inter_size_by_bit[bit] = total_neurons  # 这里存 total 只是标记该 bit 有神经元
 
-        # 第三步：从每个 expert 的 sub_expert 中提取权重，填充到对应 bit 位置
+        # 第三步：从每个 expert 的 sub_expert 中提取权重，填充到紧凑格式中
         for expert_idx in range(num_experts):
             wrapper = simple_moe.experts[expert_idx]  # DartMoQHybridWrapper
 
@@ -150,13 +153,16 @@ class BitPartitionedGroupMoE(nn.Module):
                 if n_neurons == 0:
                     continue
 
-                # 填充 gate 和 up
-                # gate: 前一半, up: 后一半
-                moe.bit_weights.gate_up[bit_str][expert_idx, :n_neurons, :] = sub_expert.gate_proj.weight.data
-                moe.bit_weights.gate_up[bit_str][expert_idx, moe.inter_size_by_bit[bit]:moe.inter_size_by_bit[bit]+n_neurons, :] = sub_expert.up_proj.weight.data
+                # 获取该 expert 在该 bit 中的位置
+                start = moe.expert_offsets[bit_str][expert_idx]
+                end = moe.expert_offsets[bit_str][expert_idx + 1]
 
-                # 填充 down
-                moe.bit_weights.down[bit_str][expert_idx, :, :n_neurons] = sub_expert.down_proj.weight.data
+                # 填充 gate 和 up 到紧凑格式: [gate1, up1, gate2, up2, ...]
+                moe.bit_weights.gate_up[bit_str][2*start : 2*start + n_neurons] = sub_expert.gate_proj.weight.data
+                moe.bit_weights.gate_up[bit_str][2*start + n_neurons : 2*end] = sub_expert.up_proj.weight.data
+
+                # 填充 down 到紧凑格式
+                moe.bit_weights.down[bit_str][:, start:end] = sub_expert.down_proj.weight.data
 
                 # 立即清理这个 sub_expert 的权重，释放内存
                 del sub_expert.gate_proj
@@ -260,19 +266,25 @@ class BitPartitionedGroupMoE(nn.Module):
 
                 gate_up = self.bit_weights.gate_up[bit_str]
                 down = self.bit_weights.down[bit_str]
-                inter_size = self.inter_size_by_bit[bit]
+                offsets = self.expert_offsets[bit_str]
+                start = offsets[expert_idx]
+                end = offsets[expert_idx + 1]
+                actual_inter_size = end - start
 
-                # 获取这个 expert 的权重
-                e_gate_up = gate_up[expert_idx]  # (2I_b, H)
-                e_down = down[expert_idx]        # (H, I_b)
+                if actual_inter_size == 0:
+                    continue
+
+                # 获取这个 expert 的权重（紧凑格式）
+                e_gate_up = gate_up[2*start : 2*end]  # (2*actual_I_b, H)
+                e_down = down[:, start:end]           # (H, actual_I_b)
 
                 t_gate_up_start = time.time()
                 gate_up_out = expert_tokens @ e_gate_up.t()
                 t_gate_up_end = time.time()
                 t_gate_up_matmul_total += t_gate_up_end - t_gate_up_start
 
-                gate_out = gate_up_out[:, :inter_size]
-                up_out = gate_up_out[:, inter_size:]
+                gate_out = gate_up_out[:, :actual_inter_size]
+                up_out = gate_up_out[:, actual_inter_size:]
                 del gate_up_out
 
                 # SILU
@@ -335,7 +347,7 @@ class BitPartitionedGroupMoE(nn.Module):
 
     def _forward_bit_group(self, x, bit, topk_indices, topk_weights):
         """
-        单个 bit group 的前向计算
+        单个 bit group 的前向计算（保留用于测试，用紧凑格式）
 
         思路：对每个专家，收集所有选了这个专家的 token，然后批量计算
         """
@@ -356,7 +368,7 @@ class BitPartitionedGroupMoE(nn.Module):
 
         gate_up = self.bit_weights.gate_up[bit_str]
         down = self.bit_weights.down[bit_str]
-        inter_size = self.inter_size_by_bit[bit]
+        offsets = self.expert_offsets[bit_str]
 
         # 对每个 k 位置单独处理
         for k in range(self.top_k):
@@ -376,9 +388,16 @@ class BitPartitionedGroupMoE(nn.Module):
                 t_mask_end = time.time()
                 stats['mask'] += t_mask_end - t_mask_start
 
-                # 获取这个专家的权重
-                e_gate_up = gate_up[expert_idx]  # (2I_b, H)
-                e_down = down[expert_idx]        # (H, I_b)
+                # 获取这个 expert 的实际神经元数
+                start = offsets[expert_idx]
+                end = offsets[expert_idx + 1]
+                actual_inter_size = end - start
+                if actual_inter_size == 0:
+                    continue
+
+                # 获取这个专家的权重（紧凑格式）
+                e_gate_up = gate_up[2*start : 2*end]  # (2*actual_I_b, H)
+                e_down = down[:, start:end]           # (H, actual_I_b)
 
                 # 批量计算
                 # (M, 2I_b) = (M, H) @ (H, 2I_b)
@@ -387,8 +406,8 @@ class BitPartitionedGroupMoE(nn.Module):
                 t_gate_up_end = time.time()
                 stats['gate_up_matmul'] += t_gate_up_end - t_gate_up_start
 
-                gate_out = gate_up_out[:, :inter_size]
-                up_out = gate_up_out[:, inter_size:]
+                gate_out = gate_up_out[:, :actual_inter_size]
+                up_out = gate_up_out[:, actual_inter_size:]
 
                 # SILU
                 t_silu_start = time.time()
