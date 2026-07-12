@@ -230,14 +230,8 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
         hidden_states = new_hidden_states
         del new_hidden_states
 
-        # Do NOT move layer back to CPU - layers[layer_idx] still points to CPU original
-        # The local `layer` variable will go out of scope in next iteration, allowing GPU memory to be freed
-        del layer
-
-        # Cleanup
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        # Move layer back to CPU to free GPU memory (in-place, modifies layers[layer_idx])
+        layer = layer.to('cpu')
 
         # Debug: Print layer timing and memory info every 10 layers or first 10 layers
         if layer_idx < 50 or layer_idx % 10 == 0:
@@ -263,6 +257,12 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
 
             mem_str = " | ".join(mem_info)
             print(f"  [DEBUG] Layer {layer_idx} time: {layer_time:.2f}s, mlp_type={mlp_type} | Memory: {mem_str}", flush=True)
+
+        del layer
+        # Cleanup
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     # Final norm and lm_head - process in batches of 4
     print("Processing final norm and lm_head...")
