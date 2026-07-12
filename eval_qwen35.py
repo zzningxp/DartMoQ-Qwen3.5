@@ -22,7 +22,7 @@ from data_utils import get_loaders, get_git_hash
 def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
     """
     Sequential PPL evaluation for Qwen3.5 MoE: keeps layers on CPU and moves
-    them to GPU one by one. Processes samples in batches to save memory.
+    them to GPU one by one. Hidden states stay on GPU the entire time.
     """
     tick0 = time.time()
     use_cache = model.config.use_cache
@@ -114,11 +114,9 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
     if position_embeddings is not None:
         print(f"  position_embeddings type: {type(position_embeddings)}")
 
-    # Restore layer 0 and rotary emb
+    # Restore layer 0 and move back to CPU
     layers[0] = layers[0].module
     layers[0] = layers[0].to('cpu')
-    if hasattr(model.model, 'rotary_emb'):
-        model.model.rotary_emb = model.model.rotary_emb.to('cpu')
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -126,28 +124,22 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
     # Get all target ids first - keep on GPU!
     all_target_ids = testenc[:, :nsamples * model.seqlen].clone().to(DEV)
 
-    # Batch sizes - use smaller batch for memory constrained GPUs
-    batch_size_transformer = 32
-    batch_size_lm_head = 4
-
-    # Precompute embeddings for all samples and keep on CPU to save GPU memory!
-    print("Processing embeddings and caching on CPU...")
-    all_embeddings = []
+    # Precompute embeddings for all samples and KEEP ON GPU!
+    print("Processing embeddings and caching on GPU...")
+    all_hidden_states = []
     for sample_idx in range(nsamples):
         batch = testenc[:, (sample_idx * model.seqlen):((sample_idx + 1) * model.seqlen)].to(DEV)
         with torch.no_grad():
             hidden = model.model.embed_tokens(batch)
-        all_embeddings.append(hidden.cpu())  # Move to CPU immediately
-        del batch, hidden
+        all_hidden_states.append(hidden)  # Keep on GPU
+        del batch
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    # Process each transformer layer sequentially, with batches
-    # 合并成单个大张量，减少内存碎片 - 动态获取 dtype
-    hidden_dtype = all_embeddings[0].dtype
-    all_hidden_states = torch.cat(all_embeddings, dim=0).to(hidden_dtype)
-    del all_embeddings
+    # Concatenate into a single tensor on GPU
+    hidden_states = torch.cat(all_hidden_states, dim=0)
+    del all_hidden_states
     gc.collect()
 
     import inspect
@@ -158,6 +150,10 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
             mlp_type = type(layer.mlp).__name__ if hasattr(layer, 'mlp') else 'N/A'
             print(f"  Layer {layer_idx}: mlp_type={mlp_type}, full_type={type(layer).__name__}")
     print("============================\n")
+
+    # Batch sizes
+    batch_size_transformer = 32
+    batch_size_lm_head = 4
 
     for layer_idx, layer in enumerate(layers):
         if layer_idx % 10 == 0:
@@ -172,16 +168,15 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
         # Move layer to GPU
         layer = layer.to(DEV)
 
-        # Process samples in batches
-        # 预先分配新的 hidden states 张量 - 保持相同 dtype
-        new_hidden_states = torch.empty_like(all_hidden_states)
+        # Process samples in batches - hidden states stay on GPU
+        new_hidden_states = torch.empty_like(hidden_states)
 
         for batch_start in range(0, nsamples, batch_size_transformer):
             batch_end = min(batch_start + batch_size_transformer, nsamples)
             actual_batch_size = batch_end - batch_start
 
-            # Get this batch's hidden states and move to GPU - 直接索引
-            batch_hidden = all_hidden_states[batch_start:batch_end].to(DEV)
+            # Get this batch's hidden states - already on GPU
+            batch_hidden = hidden_states[batch_start:batch_end]
 
             # Prepare kwargs for this batch size - create on demand to save memory
             layer_kwargs = {}
@@ -223,20 +218,16 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
             else:
                 batch_output = layer_outputs
 
-            # 直接保存到预先分配的张量中
-            new_hidden_states[batch_start:batch_end].copy_(batch_output.cpu())
+            # Directly copy to new_hidden_states - everything on GPU
+            new_hidden_states[batch_start:batch_end].copy_(batch_output)
 
             # Cleanup batch variables aggressively
             del batch_hidden, layer_outputs, batch_output
             del layer_kwargs
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
 
-        # Update hidden states for next layer - delete old ones first to free memory
-        old_hidden_states = all_hidden_states
-        all_hidden_states = new_hidden_states
-        del old_hidden_states
+        # Swap hidden states pointers
+        del hidden_states
+        hidden_states = new_hidden_states
         del new_hidden_states
 
         # Move layer back to CPU
@@ -280,8 +271,8 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
         batch_end = min(batch_start + batch_size_lm_head, nsamples)
         actual_batch_size = batch_end - batch_start
 
-        # Get this batch's hidden states and move to GPU - 直接索引
-        batch_hidden = all_hidden_states[batch_start:batch_end].to(DEV)
+        # Get this batch's hidden states - already on GPU
+        batch_hidden = hidden_states[batch_start:batch_end]
 
         # Process this batch through norm and lm_head
         with torch.no_grad():
