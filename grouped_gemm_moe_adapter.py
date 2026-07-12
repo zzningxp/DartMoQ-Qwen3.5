@@ -46,14 +46,6 @@ class TraditionalMoEWrapper(nn.Module):
         # 保存原始类，用于后续重建
         self._original_mlp_class = original_mlp.__class__
 
-        # 复制所有属性
-        for attr_name in dir(original_mlp):
-            if not attr_name.startswith('_') and not callable(getattr(original_mlp, attr_name)):
-                try:
-                    setattr(self, attr_name, getattr(original_mlp, attr_name))
-                except:
-                    pass
-
         # 复制 gate
         self.gate = original_mlp.gate
 
@@ -94,6 +86,14 @@ class TraditionalMoEWrapper(nn.Module):
         self._gate_up_shape = tuple(gate_up_proj.shape)
         self._down_shape = tuple(down_proj.shape)
         self._dtype = str(dtype)
+
+        # 显式删除原始权重，释放 CPU 内存
+        del gate_up_proj
+        del down_proj
+        if hasattr(original_mlp.experts, 'gate_up_proj'):
+            del original_mlp.experts.gate_up_proj
+        if hasattr(original_mlp.experts, 'down_proj'):
+            del original_mlp.experts.down_proj
 
     def forward(self, x, *args, **kwargs):
         batch_size, seq_len, hidden_dim = x.shape
@@ -270,5 +270,12 @@ def convert_single_layer(layer):
     if is_grouped_gemm_moe_layer(layer):
         original_mlp = layer.mlp
         layer.mlp = TraditionalMoEWrapper(original_mlp)
+        # 清理原始 mlp 的引用以帮助释放内存
+        for attr_name in dir(original_mlp):
+            if not attr_name.startswith('_') and hasattr(original_mlp, attr_name):
+                try:
+                    delattr(original_mlp, attr_name)
+                except:
+                    pass
         return layer, original_mlp
     return layer, None

@@ -13,6 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from collections import defaultdict
 import time
+import gc
 
 
 class BitPartitionedGroupMoE(nn.Module):
@@ -179,6 +180,13 @@ class BitPartitionedGroupMoE(nn.Module):
 
             # 清理 simple_moe.experts 中这个位置的引用
             simple_moe.experts[expert_idx] = None
+
+        # 清理 simple_moe 的 experts 列表引用
+        if hasattr(simple_moe, 'experts'):
+            del simple_moe.experts
+
+        # 强制垃圾回收，释放 CPU 内存
+        gc.collect()
 
         return moe
 
