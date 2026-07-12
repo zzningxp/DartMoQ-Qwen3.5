@@ -3,6 +3,7 @@ import torch.nn as nn
 import time
 import gc
 import sys
+import psutil
 
 # Add parent directory to path to import original utils
 sys.path.insert(0, '..')
@@ -194,6 +195,31 @@ def inspect_grouped_gemm_moe_layer(layer, verbose=False):
         for k, v in info.items():
             print(f"  {k}: {v}")
     return info
+
+
+def get_memory_info_str():
+    """Get memory info string (CUDA + CPU) for debugging"""
+    mem_info = []
+    if torch.cuda.is_available():
+        for i in range(torch.cuda.device_count()):
+            alloc = torch.cuda.memory_allocated(i) / 1024**3
+            resvd = torch.cuda.memory_reserved(i) / 1024**3
+            mem_info.append(f"CUDA {i}: {alloc:.2f}GB/{resvd:.2f}GB")
+
+    try:
+        process = psutil.Process()
+        cpu_mem = process.memory_info().rss / 1024**3
+        mem_info.append(f"CPU: {cpu_mem:.2f}GB")
+    except ImportError:
+        pass
+
+    return " | ".join(mem_info)
+
+
+def print_memory_info(prefix="  [Memory] "):
+    """Print memory info (CUDA + CPU) for debugging"""
+    mem_str = get_memory_info_str()
+    print(f"{prefix}{mem_str}", flush=True)
 
 
 class TraditionalExpertMLP(nn.Module):

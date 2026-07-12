@@ -20,7 +20,7 @@ from dartmoq_utils import *
 from data_utils import *
 from eval_qwen35 import qwen35_ppl_eval as cmoe_ppl_eval
 from qwen35_layer_reconstruct import reconstruct_moe_from_existing
-from qwen35_utils import DEV, load_model
+from qwen35_utils import DEV, load_model, print_memory_info, get_memory_info_str
 
 from grouped_gemm_moe_adapter import convert_grouped_gemm_to_traditional, TraditionalMoEWrapper
 from bit_partitioned_moe import BitPartitionedGroupMoE
@@ -87,16 +87,16 @@ def construct_moe(model, moe_model_flag, layer, layer_idx, inp,
     batchsize = inp.shape[0]
     print(f"  [DEBUG] construct_moe: batchsize={batchsize}")
 
-    device = next(layer.parameters()).device
+    device = DEV  # inp is already on DEV (GPU)
 
     # Forward attention
     tick_attn = time.time()
-    inp = inp.to(device)
+    # inp is already on GPU, no need to move!
     if attention_mask is not None:
-        attention_mask = attention_mask.to(device)
+        attention_mask = attention_mask.to(DEV)
 
     if position_ids is not None:
-        position_ids = position_ids.to(device)
+        position_ids = position_ids.to(DEV)
 
     residual = inp
     with torch.no_grad():
@@ -291,8 +291,9 @@ def dartmoq_quant_grouped_gemm_moe(model, tokenizer, dataloader, args, test_ppl=
     dtype = next(iter(model.parameters())).dtype
     bsz = 1
 
+    # Hidden states stay on GPU!
     inps = torch.zeros(
-        (args.nsamples//bsz, bsz, model.seqlen, model.config.hidden_size), dtype=dtype, device='cpu'
+        (args.nsamples//bsz, bsz, model.seqlen, model.config.hidden_size), dtype=dtype, device=DEV
     )
     # print(inps.shape)
     cache = {'i': 0, 'attention_mask': None, 'position_ids': None, 'position_embeddings': None}
@@ -306,7 +307,7 @@ def dartmoq_quant_grouped_gemm_moe(model, tokenizer, dataloader, args, test_ppl=
             super().__init__()
             self.module = module
         def forward(self, inp, **kwargs):
-            inps[cache['i']] = inp.cpu()
+            inps[cache['i']] = inp  # Keep on GPU!
             cache['i'] += 1
             cache['attention_mask'] = kwargs['attention_mask']
             cache['position_ids'] = kwargs['position_ids']
@@ -334,10 +335,15 @@ def dartmoq_quant_grouped_gemm_moe(model, tokenizer, dataloader, args, test_ppl=
 
     torch.cuda.empty_cache()
 
-    attention_mask = cache['attention_mask']
-    position_ids = cache['position_ids']
+    attention_mask = cache['attention_mask'].to(DEV) if cache['attention_mask'] is not None else None
+    position_ids = cache['position_ids'].to(DEV) if cache['position_ids'] is not None else None
 
     position_embeddings = cache.get('position_embeddings')
+    if position_embeddings is not None:
+        if isinstance(position_embeddings, tuple):
+            position_embeddings = tuple(pe.to(DEV) if pe is not None else None for pe in position_embeddings)
+        else:
+            position_embeddings = position_embeddings.to(DEV)
     if position_embeddings is None and hasattr(model.model, 'rotary_emb'):
         with torch.no_grad():
             for batch in dataloader:
@@ -480,10 +486,13 @@ def dartmoq_quant_grouped_gemm_moe(model, tokenizer, dataloader, args, test_ppl=
 
         tick0 = time.time()
         print(f"\nProcessing layer {layer_idx}/{len(layers)}")
+        if layer_idx % 10 == 0:
+            print_memory_info("  [Memory] ")
 
         if args.standby_layer_cpu:
             target_dev = layers_device[layer_idx] if layer_idx < len(layers_device) and layers_device[layer_idx].type == 'cuda' else DEV
-            layer = layer.to(target_dev)
+            layers[layer_idx] = layers[layer_idx].to(target_dev)  # Directly modify layers list
+            layer = layers[layer_idx]
             if hasattr(model.model, 'rotary_emb'):
                 model.model.rotary_emb = model.model.rotary_emb.to(DEV)
 
@@ -512,14 +521,18 @@ def dartmoq_quant_grouped_gemm_moe(model, tokenizer, dataloader, args, test_ppl=
         inps = moe_out
 
         if args.standby_layer_cpu:
-            layer = layer.to('cpu')
+            layers[layer_idx] = layers[layer_idx].to('cpu')  # Directly modify layers list
+            del layer  # Clean up reference to help GPU memory release
+            gc.collect()
+            torch.cuda.empty_cache()
 
         # for i in range(torch.cuda.device_count()):
         #     print(f"CUDA {i} Allocated: {torch.cuda.memory_allocated(device=i) / 1024**3:.2f} GB")
         #     print(f"CUDA {i} Reserved: {torch.cuda.memory_reserved(device=i) / 1024**3:.2f} GB")
 
         tick1 = time.time()
-        print(f"Layer {layer_idx} total reconstruct and quantization time: {tick1 - tick0:.2f} s", flush=True)
+        mem_str = get_memory_info_str()
+        print(f"Layer {layer_idx} total reconstruct and quantization time: {tick1 - tick0:.2f} s | Memory: {mem_str}", flush=True)
         print("." * 100, flush=True)
 
         # Aggressive memory cleanup after each layer

@@ -14,7 +14,7 @@ import sys
 # Add parent directory to import data_utils
 sys.path.insert(0, '..')
 
-from qwen35_utils import load_model, DEV
+from qwen35_utils import load_model, DEV, print_memory_info, get_memory_info_str
 from data_utils import get_loaders, get_git_hash
 
 
@@ -159,9 +159,7 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
         if layer_idx % 10 == 0:
             print(f"Processing layer {layer_idx}/{len(layers)}...", flush=True)
             # Print memory usage every 10 layers
-            if torch.cuda.is_available():
-                for i in range(torch.cuda.device_count()):
-                    print(f"  [Memory] CUDA {i}: {torch.cuda.memory_allocated(i) / 1024**3:.2f} GB allocated, {torch.cuda.memory_reserved(i) / 1024**3:.2f} GB reserved")
+            print_memory_info("  [Memory] ")
 
         tick_layer = time.time()
 
@@ -238,24 +236,7 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
             layer_time = time.time() - tick_layer
             mlp_type = type(layer.mlp).__name__ if hasattr(layer, 'mlp') else 'N/A'
 
-            # Print memory info
-            mem_info = []
-            if torch.cuda.is_available():
-                for i in range(torch.cuda.device_count()):
-                    alloc = torch.cuda.memory_allocated(i) / 1024**3
-                    resvd = torch.cuda.memory_reserved(i) / 1024**3
-                    mem_info.append(f"CUDA {i}: {alloc:.2f}GB/{resvd:.2f}GB")
-
-            # Also print CPU memory info if possible
-            try:
-                import psutil
-                process = psutil.Process()
-                cpu_mem = process.memory_info().rss / 1024**3
-                mem_info.append(f"CPU: {cpu_mem:.2f}GB")
-            except ImportError:
-                pass
-
-            mem_str = " | ".join(mem_info)
+            mem_str = get_memory_info_str()
             print(f"  [DEBUG] Layer {layer_idx} time: {layer_time:.2f}s, mlp_type={mlp_type} | Memory: {mem_str}", flush=True)
 
         del layer
