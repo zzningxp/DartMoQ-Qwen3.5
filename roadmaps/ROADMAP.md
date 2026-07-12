@@ -9,85 +9,13 @@ Qwen3.5 MoE 有一个完全不同的权重存储设计，可以实现高效的�
 
 ## 架构背景
 
-### 传统 MoE vs Qwen3.5 MoE
+### Qwen3.5 MoE 的 grouped_gemm 原始格式
 
-**传统 MoE (DeepSeek, OLMoE 等):**
-```
-每个专家是独立的 Module:
-  - expert[i].gate_proj: Linear(in_dim, inter_dim)
-  - expert[i].up_proj: Linear(in_dim, inter_dim)
-  - expert[i].down_proj: Linear(inter_dim, out_dim)
-```
-
-**Qwen3.5 MoE:**
+**Qwen3.5 MoE 原生格式：**
 ```
 所有专家合并为两个大张量:
   - mlp.experts.gate_up_proj: (num_experts, 2 * intermediate_size, hidden_size)
   - mlp.experts.down_proj: (num_experts, hidden_size, intermediate_size)
-
-这可以实现高效的分组矩阵乘法！
-```
-
-### Qwen3.5 的 grouped_gemm 格式详解
-
-**grouped_gemm 的本质：只是 gate 和 up 合并，专家还是独立的**
-
-```
-假设：
-  num_experts = 4
-  hidden_size = 10
-  intermediate_size = 3
-
-Qwen3.5 的权重格式：
-  gate_up_proj: (4, 2*3, 10)  ← (num_experts, 2*inter_size, hidden_size)
-  down_proj: (4, 10, 3)       ← (num_experts, hidden_size, inter_size)
-
-让我们看看 gate_up_proj 的实际内容：
-
-gate_up_proj[0]:  ← 专家 0
-  [:, :10] = gate_proj of expert 0  ← 前一半是 gate
-  [:, 10:] = up_proj of expert 0    ← 后一半是 up
-
-gate_up_proj[1]:  ← 专家 1
-  [:, :10] = gate_proj of expert 1
-  [:, 10:] = up_proj of expert 1
-```
-
-**图解：Qwen3.5 的 grouped_gemm 格式**
-
-```
-gate_up_proj: (num_experts, 2*inter_size, hidden_size)
-
-  ┌─────────────────────────────────────────────────────────────┐
-  │  专家 0                      专家 1                          │
-  │ ┌─────────────┬─────────────┐ ┌─────────────┬─────────────┐ │
-  │ │   gate[0]   │    up[0]    │ │   gate[1]   │    up[1]    │ │
-  │ ├─────────────┼─────────────┤ ├─────────────┼─────────────┤ │
-  │ │ (3, 10)     │  (3, 10)    │ │  (3, 10)    │  (3, 10)    │ │
-  │ └─────────────┴─────────────┘ └─────────────┴─────────────┘ │
-  │ ┌─────────────┬─────────────┐ ┌─────────────┬─────────────┐ │
-  │ │   gate[2]   │    up[2]    │ │   gate[3]   │    up[3]    │ │
-  │ ├─────────────┼─────────────┤ ├─────────────┼─────────────┤ │
-  │ │ (3, 10)     │  (3, 10)    │ │  (3, 10)    │  (3, 10)    │ │
-  │ └─────────────┴─────────────┘ └─────────────┴─────────────┘ │
-  │  专家 2                      专家 3                          │
-  └─────────────────────────────────────────────────────────────┘
-         ↑                              ↑
-    gate 和 up 合并             但专家之间还是独立的！
-
-
-down_proj: (num_experts, hidden_size, inter_size)
-
-  ┌─────────────────────────────────────────────────────────────┐
-  │  专家 0         专家 1         专家 2         专家 3        │
-  │ ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐ │
-  │ │ down[0]  │   │ down[1]  │   │ down[2]  │   │ down[3]  │ │
-  │ ├──────────┤   ├──────────┤   ├──────────┤   ├──────────┤ │
-  │ │(10, 3)  │   │ (10, 3)  │   │ (10, 3)  │   │ (10, 3)  │ │
-  │ └──────────┘   └──────────┘   └──────────┘   └──────────┘ │
-  └─────────────────────────────────────────────────────────────┘
-         ↑
-    每个专家的 down_proj 也是独立的！
 ```
 
 ---
@@ -121,15 +49,48 @@ down_proj: (num_experts, hidden_size, inter_size)
 
 ---
 
-## 第一阶段: FP16 基线评估
+## 量化流程总览
 
-**目标:** 运行 Qwen3.5 MoE 原始的 FP16 困惑度评估，支持 CPU 待机模式。
+我们的量化为混合精度模型分为四个阶段，通过三次格式转换完成：
+
+```
+  原始 grouped_gemm (Qwen3.5 原生)
+       ↓ [Stage 1] TraditionalMoEWrapper 转换
+  传统 MoE 格式 (每个专家独立)
+       ↓ [Stage 2] DartMoQ 量化 + 神经元排序分组
+  MoEBuildBlock + DartMoQHybridWrapper (按 bit 分子专家)
+       ↓ [Stage 3] 重组为紧凑格式
+  BitPartitionedGroupMoE (最终格式，按 bit 分区存储)
+```
+
+---
+
+## 第一阶段: FP16 基线评估 + 格式转换
+
+**目标:** 运行 Qwen3.5 MoE 原始的 FP16 困惑度评估，并将 grouped_gemm 格式转换为传统 MoE 格式供 DartMoQ 量化。
+
+### 关键转换: TraditionalMoEWrapper
+
+**作用**: 将 Qwen3.5 原生的 grouped_gemm 大张量拆分为独立专家
+
+```python
+# 原始格式
+gate_up_proj: (num_experts, 2*inter_size, hidden_size)
+down_proj: (num_experts, hidden_size, inter_size)
+
+# 转换后
+experts[i].gate_proj.weight: (inter_size, hidden_size)
+experts[i].up_proj.weight: (inter_size, hidden_size)
+experts[i].down_proj.weight: (hidden_size, inter_size)
+```
+
+**内存优化**: 转换后立即删除原始权重，释放内存
 
 ### 任务:
 - [x] 创建文件夹结构并复制必要工具
 - [x] 为 Qwen3.5 MoE 适配 `load_model`
 - [x] 为 Qwen3.5 架构适配顺序评估（CPU 待机）
-- [ ] 验证困惑度符合预期结果
+- [x] 实现 TraditionalMoEWrapper 格式转换
 - [x] 探索并记录 Qwen3.5 MoE 的层结构
 
 ### 输入/输出:
@@ -140,12 +101,36 @@ down_proj: (num_experts, hidden_size, inter_size)
 - `qwen35_utils.py` - Qwen3.5 专用工具
 - `eval_qwen35.py` - 评估脚本
 - `explore_qwen35.py` - 架构探索脚本
+- `grouped_gemm_moe_adapter.py` - 格式转换适配层
 
 ---
 
-## 第二阶段: DartMoQ 混合 MoE + FP16 反量化 (已完成)
+## 第二阶段: DartMoQ 混合 MoE 量化
 
-**目标:** 将 DartMoQ 的混合精度量化方法应用到 Qwen3.5 MoE，仍然在 FP16 中评估（通过反量化）。
+**目标:** 将 DartMoQ 的混合精度量化方法应用到转换后的传统格式 MoE。
+
+### 关键流程
+
+1. **敏感度分析**: 根据权重分布确定每个神经元的最优 bit 宽度
+2. **神经元排序**: 将同 bit 宽度的神经元排在一起
+3. **分组**: 将神经元按 bit 分组，创建 sub_experts
+4. **动态规划位宽分配**: 全局优化位宽分配
+
+### 输出结构: MoEBuildBlock + DartMoQHybridWrapper
+
+```
+MoEBuildBlock
+├── gate (router)
+├── shared_expert (可选)
+└── experts (nn.ModuleList)
+    ├── expert[0]
+    │   └── sub_experts (nn.ModuleList)
+    │       ├── ExpertMLP (bit=2)
+    │       ├── ExpertMLP (bit=3)
+    │       └── ExpertMLP (bit=4)
+    ├── expert[1]
+    └── ...
+```
 
 ### 当前状态 (已完成)
 - [x] 为 Qwen3.5 的合并权重格式适配专家敏感度分析
@@ -155,269 +140,202 @@ down_proj: (num_experts, hidden_size, inter_size)
 
 ---
 
-## 第三阶段 (路线调整 - SimpleMoEBlock vs Qwen35HybridMLP)
+## 第三阶段: BitPartitionedGroupMoE 紧凑格式
 
-### 重要发现：SimpleMoEBlock 更优！(2026-07-09 更新)
+**目标:** 将量化后的结构重组为高效的紧凑格式，按 bit 分区存储所有权重。
 
-在实际调试中，我们对比了两种架构：
+### BitPartitionedGroupMoE 架构（当前采用）
 
-| 维度 | SimpleMoEBlock (nn.ModuleList) | Qwen35HybridMLP (大张量) |
-|------|-------------------------------|-------------------------|
-| **速度** | ✅ 更快 | ❌ 更慢 |
-| **内存** | ✅ 低，天然分散 | ❌ 高，易 OOM |
-| **W4A16 存储** | ✅ 适合，无 padding | ⚠️ 有 padding，浪费空间 |
-| **代码复杂度** | ✅ 简单直接 | ⚠️ 较复杂 |
+**设计思路**:
+- 只保留按 bit 分开的权重，内存最优
+- 优化前向计算：按 expert 批量计算，减少循环
+- 无 padding，紧凑存储
 
-**结论：直接使用 SimpleMoEBlock，不转回 grouped_gemm 格式！**
-
-### SimpleMoEBlock 架构（当前采用）
-
-**结构：**
+**存储结构（无冗余）**:
 ```
-SimpleMoEBlock
+BitPartitionedGroupMoE
 ├── gate (router)
-└── experts (nn.ModuleList)
-    ├── DartMoQHybridWrapper[0]
-    │   └── sub_experts (nn.ModuleList)
-    │       ├── ExpertMLP (bit=2)  ← 独立 nn.Linear
-    │       └── ExpertMLP (bit=4)  ← 独立 nn.Linear
-    ├── DartMoQHybridWrapper[1]
-    └── ...
+├── shared_expert (可选)
+└── bit_weights
+    ├── gate_up: ParameterDict[str, Tensor]
+    │   ├── '2': (total_neurons_2x, H)  # 所有专家 bit=2 的 gate+up 拼接
+    │   ├── '3': (total_neurons_2x, H)
+    │   └── '4': (total_neurons_2x, H)
+    ├── down: ParameterDict[str, Tensor]
+    │   ├── '2': (H, total_neurons)  # 所有专家 bit=2 的 down 拼接
+    │   ├── '3': (H, total_neurons)
+    │   └── '4': (H, total_neurons)
+    └── expert_offsets: Dict[str, LongTensor]
+        ├── '2': (E+1,)  # 每个专家在 bit=2 中的 start/end idx
+        ├── '3': (E+1,)
+        └── '4': (E+1,)
 ```
 
-**前向方式：** 逐个专家 mask 选择 + 独立 Linear forward
+**紧凑存储详解**:
+```
+gate_up['2']: [gate_e0, up_e0, gate_e1, up_e1, gate_e2, up_e2, ...]
+              ↑ 每个专家的 bit=2 神经元的 gate 和 up 拼接在一起
 
-**优势：**
-- ✅ 不会 OOM，内存天然分散
-- ✅ 每个 Linear 是独立的，标准量化流程直接用
-- ✅ 可以用现成的 LLM.int8, AWQ, GPTQ 等方案
-- ✅ 实际测试速度反而更快！
-- ✅ 无 padding，存储空间利用充分
+down['2']: [down_e0, down_e1, down_e2, ...]
+           ↑ 每个专家的 bit=2 神经元的 down 拼接在一起
 
-**W4A16 存储方案：**
-```python
-# 每个专家独立存储，清晰简单
-checkpoint = {
-    'layer_0.mlp.experts.0.sub_experts.0.gate_proj.weight': pack_int4(w_int4),
-    'layer_0.mlp.experts.0.sub_experts.0.gate_proj.scale': scale,
-    'layer_0.mlp.experts.0.sub_experts.0.gate_proj.bit': 2,
-    ...
-}
+expert_offsets['2']: [0, n0, n0+n1, n0+n1+n2, ...]
+                     ↑ 记录每个专家的起始位置
 ```
 
-### Qwen35HybridMLP 架构（已放弃）
+**前向计算优化**:
+1. **先按 expert 组织 token**: 对每个 token，先找出选择了哪些 expert
+2. **批量计算**: 对同一个 expert 的所有 token，一次性计算所有 bit
+3. **scatter_reduce 累加**: 高效地将结果累加回对应位置
 
-**结构：**
-```
-Qwen35HybridMLP
-├── gate (router)
-└── experts (Qwen35HybridExperts)
-    ├── bit_list: [1, 2, 4]
-    ├── gate_up_proj_by_bit (nn.ParameterDict)
-    │   ├── '1': Parameter (256, 2*max_n_1, 2048)  ← 大张量！
-    │   ├── '2': Parameter (256, 2*max_n_2, 2048)  ← 所有专家的 bit=2 权重拼一起
-    │   └── '4': Parameter (256, 2*max_n_4, 2048)
-    ├── down_proj_by_bit (nn.ParameterDict)
-    │   ├── '1': Parameter (256, 2048, max_n_1)
-    │   ├── '2': Parameter (256, 2048, max_n_2)
-    │   └── '4': Parameter (256, 2048, max_n_4)
-    └── inter_size_by_bit: {1: n1, 2: n2, 4: n4}
-```
+**优势**:
+- ✅ 内存最优：无 padding，无冗余存储
+- ✅ 速度快：批量计算，减少循环开销
+- ✅ 内存管理完善：转换后立即清理中间结构
 
-**问题：**
-- ❌ 易 OOM：需要一次性 gather 大张量
-- ❌ 有 padding：为了对齐 max_n，空间浪费
-- ❌ 速度慢：gather 开销大
-- ❌ 不适合 W4A16 存储：需要额外元数据描述 padding
+### 快速调试
 
-**当前状态：** 代码还在 (`qwen35_hybrid_moe.py`)，但默认不使用
+- [x] **按需单层 convert**: 只在要量化某一层时才 convert 那一层，而不是一开始全 convert
+- [x] **部分层量化调试模式**: 使用 `--quant_layers 0-5` 只量化前几层，后面直接 break，节省时间
 
-### 调试优化 (已完成)
-
-**问题：** 一开始就全 convert 所有层，调试时浪费时间。
-
-**解决方案：**
-- [x] **按需单层 convert**：只在要量化某一层时才 convert 那一层，而不是一开始全 convert
-- [x] **部分层量化调试模式**：使用 `--quant_layers 0-5` 只量化前几层，后面直接 break，节省时间
-
-**使用示例：**
 ```bash
 python run_qwen35.py --quant_layers 0-5
 ```
 
-### 测试结果：
+---
 
-| 模型类型 | 模型名称 | sli | q_scheme | rank | q_mode | q_layers | wiki | c4 | status | time | t_quant | t_ppl | err |
-|---------|---------|-----|----------|------|--------|----------|------|----|--------|------|---------|-------|-----|
-| Origin | Qwen3.5-35B-A3B | | | | fp16 | | 6.5807 | 9.6724 | ok | 320.21 | | 320.21 | |
-| SimpleMoEBlock | Qwen3.5-35B-A3B | 4 | global-a8s8m2bpw | turboquant_innerproduct | turboquant | [0, 1, 2, 3, 4] | 6.6454 | 9.7606 | ok | 1526.86 | 1156.54 | 370.32 | |
-| SimpleMoEBlock | Qwen3.5-35B-A3B | 4 | global-a8s8m2bpw | turboquant_innerproduct | turboquant | all | 7.6882 | 11.2645 | ok | 9533.79 | 9019.48 | 514.31 | |
-| SimpleMoEBlock | Qwen3.5-35B-A3B | 4 | global-a8s8m2bpw | turboquant_innerproduct | turboquant | [0, 1, 2, 3, 4] | 6.6454 | 9.7606 | ok | 1485.75 | 1155 | 330.75 | |
-| SimpleMoEBlock | Qwen3.5-35B-A3B | 4 | global-a8s8m2bpw | turboquant_innerproduct | turboquant | [0, 1, 2, 3, 4] | 6.6472 | 9.7624 | ok | 1496.25 | 1154.85 | 341.4 | |
-| BitPartitionedGroupMoE | Qwen3.5-35B-A3B | 4 | global-a8s8m2bpw | turboquant_innerproduct | turboquant | | 7.6864 | 11.2656 | ok | 8654.59 | 8253.99 | 400.6 | |
+## 测试结果
 
-TODO：当前目标应该是先将 all layer SimpleMoEBlock 的 t_ppl 时间优化到和 origin 相近。
-
-### 当前流程
-
-```
-原始 grouped_gemm
-  ↓ [convert_grouped_gemm_to_traditional]
-传统格式
-  ↓ [quantize] (神经元排序 + 分组)
-SimpleMoEBlock + DartMoQHybridWrapper  ← 最终用这个！
-  ↓ [直接验证] (不转回去)
-PPL 评估
-```
-
-**不需要：** 重组回 Qwen35HybridMLP / grouped_gemm 格式
+| git      | model            | sli  | q_scheme          | rank                     | q_mode       | q_layers          | wiki    | c4       | status  | time    | t_quant  | t_ppl   | t_wiki | t_c4   |
+|----------|------------------|------|-------------------|--------------------------|--------------|-------------------|---------|----------|---------|---------|----------|---------|--------|--------|
+| d6c5026  | Qwen3.5-35B-A3B  |      |                   |                          | fp16         |                   | 6.5807  | 9.6724   | ok      | 201.6   |          | 201.6   | 87.11  | 114.49 |
+| d6c5026  | Qwen3.5-35B-A3B  | 4    | global-a8s8m2bpw  | turboquant_innerproduct  | turboquant   | [0]               | 6.5743  | 9.6766   | ok      | 430.98  | 221.44   | 209.54  | 89.02  | 120.52 |
+| d6c5026  | Qwen3.5-35B-A3B  | 4    | global-a8s8m2bpw  | turboquant_innerproduct  | turboquant   | [0, 1, 2, 3, 4]  | 6.6445  | 9.7605   | ok      | 1284.25 | 1093.08  | 191.17  | 83.79  | 107.38 |
+| d6c5026  | Qwen3.5-35B-A3B  | 4    | global-a8s8m2bpw  | turboquant_innerproduct  | turboquant   | all               | 7.6874  | 11.2625  | ok      | 8089.54 | 7921.86  | 167.68  | 68.95  | 98.73  |
 
 ---
 
-## 第四阶段 (W4A16 真实量化存储)
+## 第四阶段 (W4A16 真实量化存储 + 纯整数推理)
 
-**目标：** 实现 W4A16 量化权重的紧凑存储，不反量化回 FP16，直接存 int4/int2。
+**目标：** 实现 W4A16 量化权重的紧凑存储 + 纯整数推理，不反量化回 FP16 做矩阵乘法。
 
-**量化流程：**
+**新的量化推理流程：**
 ```
 量化阶段：w_fp16 → quantize → w_int4 (存下来)
-推理阶段：w_int4 → dequantize → w_fp16 → x_fp16 @ w_fp16
+推理阶段：w_int4 → 直接整数推理 → (x_fp16 @ w_dequant) 等价于 (x_fp16 @ w_int4 + scale)
 ```
-
-### 方案：SimpleMoEBlock 独立存储（推荐）
-
-**存储格式：**
-```python
-# 每个 Linear 独立存储，清晰简单
-checkpoint = {
-    # 量化权重（packed int4）
-    'layer_0.mlp.experts.0.sub_experts.0.gate_proj.weight': pack_int4(w_int4),
-    'layer_0.mlp.experts.0.sub_experts.0.up_proj.weight': pack_int4(w_int4),
-    'layer_0.mlp.experts.0.sub_experts.0.down_proj.weight': pack_int4(w_int4),
-    
-    # 量化参数
-    'layer_0.mlp.experts.0.sub_experts.0.gate_proj.scale': scale,
-    'layer_0.mlp.experts.0.sub_experts.0.gate_proj.zero_point': zero_point,
-    'layer_0.mlp.experts.0.sub_experts.0.gate_proj.bit': 2,
-    
-    # shared expert（8bit）
-    'layer_0.mlp.shared_expert.gate_proj.weight': pack_int8(w_int8),
-    'layer_0.mlp.shared_expert.gate_proj.scale': scale,
-    ...
-}
-```
-
-### 优势
-
-| 特性 | SimpleMoEBlock | Qwen35HybridMLP |
-|------|----------------|-----------------|
-| **无 padding** | ✅ 每个专家刚好是自己的神经元数 | ❌ 为对齐 max_n 有 padding，浪费空间 |
-| **存储简单** | ✅ 每个 Linear 独立存，标准格式 | ⚠️ 需要存额外元数据描述 padding |
-| **兼容性** | ✅ 与现有量化 checkpoint 格式兼容 | ❌ 自定义格式，兼容性差 |
-| **推理解包** | ✅ 简单直接 | ⚠️ 需要先切片再解包 |
-
-### 任务清单
-- [ ] 实现 int4/int2 打包/解包函数
-- [ ] 在 `DartMoQHybridWrapper` 中保存量化参数
-- [ ] 实现 W4A16 checkpoint 存储/加载
-- [ ] 验证 ppl 不变（存储前 vs 加载后）
-- [ ] 测试存储体积压缩比
-
-### 关键文件
-- `qwen35_layer_reconstruct.py` - 量化后权重已在这里！
-- `dartmoq_hybridmoe.py` - DartMoQHybridWrapper 保存量化参数
-- `simple_moe_block.py` - SimpleMoEBlock（已有）
 
 ---
 
-## 关键设计决策
+### 目标架构一：快速验证版（Python + PyTorch 原生实现）
 
-### 最终决定 (2026-07-09): SimpleMoEBlock 路线
+**目标：** 快速验证 W4A16 纯整数推理的精度和性能可行性，使用 PyTorch 原生操作。
 
-**不转回 grouped_gemm 格式，直接使用 SimpleMoEBlock！**
-
-原因：
-1. ✅ SimpleMoEBlock 速度更快
-2. ✅ 不会 OOM，内存天然分散
-3. ✅ 更适合 W4A16 存储（无 padding）
-4. ✅ 代码简单直接
-
-### 选项对比总结
-
-| 选项 | 架构 | 状态 |
-|------|------|------|
-| 选项 A | Qwen35HybridMLP (按 bit 分组大张量) | ❌ 已放弃 |
-| 选项 B | SimpleMoEBlock (nn.ModuleList) | ✅ **当前采用** |
-
-### 架构对比详情
-
-**SimpleMoEBlock:**
+**文件夹结构：**
 ```
-组织方式：按专家组织 (ModuleList)
-最小单元：单个专家的 nn.Linear
-权重形状：(inter_size, hidden_size) 小矩阵
-前向方式：逐个专家 mask 选择
+dartmoq_qwen3.5/
+├── kernels/
+│   ├── __init__.py
+│   └── w4a16_kernels.py     # W4A16 纯整数推理 kernel (PyTorch 实现)
+├── quantization/
+│   ├── __init__.py
+│   ├── w4a16_quantizer.py   # 量化器，生成 W4A16 权重
+│   └── weight_packing.py    # 权重打包，适配 kernel 格式
+└── moe/
+    ├── __init__.py
+    └── w4a16_moe.py         # W4A16 版本的 MoE 推理模块
 ```
 
-**Qwen35HybridMLP:**
-```
-组织方式：按 bit 组织 (大张量)
-最小单元：所有专家某 bit 的权重拼在一起
-权重形状：(256, 2*inter_size, hidden_size) 大张量
-前向方式：按 bit gather + batch matmul
-```
+**核心设计：**
+1. **量化器**：支持 per-group 量化，可配置 group_size
+2. **权重打包**：将 INT4 打包为 INT32/INT64 存储
+3. **MoE 推理**：按 bit 分组，批量处理每个 expert
 
-### 为什么 SimpleMoEBlock 反而更快？
-
-1. 避免了大张量 gather 开销
-2. 内存局部性更好
-3. PyTorch 对 Linear layer 优化非常好
-4. 用 mask 只选择需要的专家，不做冗余计算
+**关键任务：**
+- [ ] 实现 W4A16Quantizer (per-group 量化)
+- [ ] 实现权重打包/解包函数
+- [ ] 实现 PyTorch 原生 W4A16 推理 kernel
+- [ ] 验证 ppl 精度 (对比现有反量化方案)
+- [ ] 初步性能测试
 
 ---
 
-## 关键文件
+### 目标架构二：高性能实现版（基于 Machete/Marlin）
 
-- `qwen35_layer_reconstruct.py` - Qwen3.5 层重构（构建 SimpleMoEBlock）
-- `qwen35_simple_wrapper.py` - 主量化流程（已跳过重组为 grouped_gemm）
-- `dartmoq_hybridmoe.py` - 混合 MoE 包装器
-- `grouped_gemm_moe_adapter.py` - 格式转换适配层（SimpleMoEBlock 定义在这里）
-- `qwen35_utils.py` - Qwen3.5 专用工具
+**目标：** 针对 RTX 5090 (Blackwell SM12.0) 架构优化的高性能推理。
 
-### 已放弃的文件
-- `qwen35_hybrid_moe.py` - 按 bit 分组的 grouped_gemm 实现（不再使用）
+**技术选型分析：**
+| 方案 | 优势 | 劣势 | 推荐度 |
+|------|------|------|--------|
+| **Machete** | 最新架构优化，支持 wgmma，来自 Neural Magic (Marlin 团队) | 仍在迭代中 | ⭐⭐⭐⭐⭐ |
+| **Marlin MoE** | 成熟稳定，已有 MoE 专用优化 | 使用旧版 mma 指令 | ⭐⭐⭐⭐ |
+| **exllamav3 EXL3** | 专门为 MoE 优化，有完整工具链 | 格式封闭 | ⭐⭐⭐ |
 
-### 第四阶段文件（待实现）
-- `qwen35_quant_storage.py` - W4A16 量化存储
-- `qwen35_inference.py` - 量化推理
+**文件夹结构：**
+```
+kernels/csrc/
+├── machete_moe/
+│   ├── machete_moe_kernel.cu   # Machete MoE kernel
+│   └── machete_moe_wrapper.cpp # 绑定代码
+├── marlin_moe/
+│   └── marlin_moe_wna16_kernel.cu  # Marlin MoE kernel (备选)
+└── utils/
+    ├── weight_packing.cu       # 权重打包工具
+    └── token_sorting.cu        # Token 排序工具
+```
+
+**核心设计：**
+1. **Machete Kernel**：基于 CUTLASS 3.5+，支持 Blackwell wgmma 指令
+2. **Marlin MoE Kernel**：备选方案，成熟稳定
+3. **Token 排序优化**：按选择的 expert 排序 token，提高 GPU 利用率
+4. **批量处理**：同一 expert 的所有 token 一起处理
+
+**关键优化点：**
+- **WGMMA 指令**：利用 Blackwell 新的 Tensor Core 指令
+- **Shared Memory 流水线**：更大的 shared memory (128KB per SM)
+- **Token 排序**：减少 warp 内分支，提高局部性
+- **动态批处理**：根据当前 batch 的 expert 分布调整
+
+**关键任务：**
+- [ ] 从 vLLM 提取 Machete kernel
+- [ ] 适配 MoE 场景
+- [ ] 实现 C++/CUDA 扩展
+- [ ] 集成到现有 BitPartitionedGroupMoE 架构
+- [ ] 性能 profiling 和调优
 
 ---
 
-## 文件夹结构
+### 量化后权重存储格式 (兼容两种架构)
 
 ```
-dartmoq-qwen3.5/
-├── README.md
-├── roadmaps/
-│   ├── ROADMAP.md (本文件)
-│   ├── PHASE3_DESIGN.md (第三阶段详细设计)
-│   ├── ROADMAP_ALTERNATIVE_QWENMULTILINEAR.md (备选方案参考)
-│   └── GROUPED_GEMM_VS_BLOCKSPARSE.md (格式对比参考)
-├── explore_qwen35.py          # 第一阶段: 架构探索
-├── eval_qwen35.py             # 第一阶段: FP16 评估
-├── qwen35_utils.py            # 第一阶段+: Qwen3.5 工具
-│
-├── qwen35_layer_reconstruct.py  # 第二阶段/第三阶段: 层重构
-├── qwen35_hybrid_moe.py         # 第三阶段: 按 bit 分组的 grouped_gemm 实现
-├── dartmoq_hybridmoe.py         # 第二阶段: 传统格式的混合 MoE 包装器
-├── run_qwen35.py                # 第二阶段/第三阶段: 主量化脚本
-├── grouped_gemm_moe_adapter.py  # 格式转换适配层
-│
-└── test/                      # 测试脚本
-    ├── test_phase1.py
-    ├── test_phase2.py
-    └── test_phase3.py
+BitPartitionedW4A16:
+├── gate: Router 权重 (保持 FP16)
+├── shared_expert: (可选，FP16 或 W8A16)
+└── w4a16_weights:
+    ├── gate_up:
+    │   ├── '2': (packed INT4, scales, zeros, g_idx)
+    │   ├── '3': (packed INT4, scales, zeros, g_idx)
+    │   └── '4': (packed INT4, scales, zeros, g_idx)
+    └── down:
+        ├── '2': (packed INT4, scales, zeros, g_idx)
+        ├── '3': (packed INT4, scales, zeros, g_idx)
+        └── '4': (packed INT4, scales, zeros, g_idx)
+    └── expert_offsets: (记录每个 expert 在每种 bit 中的起始位置)
 ```
+
+---
+
+### 验证策略
+
+**精度验证：**
+1. PPL 对比：wikitext2/c4 数据集上与现有方案对比
+2. Expert 输出对比：验证每个 expert 的输出差异
+3. 端到端生成测试：验证生成质量
+
+**性能验证：**
+1. Kernel microbenchmark：测量 kernel 的纯计算性能
+2. 端到端推理：测量完整 MoE 层的推理时间
+3. Memory 带宽测试：验证是否达到内存带宽瓶颈
 
 ---
 
@@ -436,47 +354,3 @@ dartmoq-qwen3.5/
 - 需要理解如何最好地适配我们的量化方法
 
 ---
-
-## 数学等价性保证 (Router Gate 设计)
-
-**设计思路：**
-原始路由：
-```
-gate_logits = gate(x)  # (batch, num_experts)
-topk_weights, topk_indices = topk(gate_logits)
-```
-
-目标：复用原始 gate（不重新训练），保证路由一致性
-
-**等价变换：**
-对于每个 bit b：
-1. 收集所有专家中，属于 bit b 的神经元索引
-2. 对于 gate 来说，路由决策只关心 "选哪些专家"，不关心 "专家内部怎么分组"
-3. 因此，可以完全复用原始 gate，只是在前向时对每个 bit 分别做 grouped_gemm
-
-**前向传播等价性：**
-```
-原始：
-  out = sum_{e in topk} weight_e * expert_e(x)
-
-等价分解：
-  out = sum_{e in topk} weight_e * [ sum_b expert_e^b(x) ]
-      = sum_b [ sum_{e in topk} weight_e * expert_e^b(x) ]
-
-其中 expert_e^b(x) 是 expert_e 中 bit b 的神经元贡献
-```
-
-因此，我们可以：
-- 保持原始 gate 不变（保证路由一致性）
-- 按 bit 分组专家的神经元
-- 前向时，先用原始 gate 路由，再分别对每个 bit 做 grouped_gemm
-
----
-
-## 依赖
-
-与主 DartMoQ 项目相同：
-- PyTorch
-- Transformers
-- (可选) 用于第四阶段自定义内核的 CUDA Toolkit
-- (可选) 用于零样本评估的 lm_eval
