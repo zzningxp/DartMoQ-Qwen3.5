@@ -217,7 +217,7 @@ def construct_moe(model, moe_model_flag, layer, layer_idx, inp,
         old_mlp = layer.mlp
 
         # 替换为新结构
-        layer.mlp = BitPartitionedGroupMoE.from_simple_moe(old_mlp, layer_metadata)
+        layer.mlp = BitPartitionedGroupMoE.from_build_block(old_mlp, layer_metadata)
 
         # 显式清理旧结构，释放内存
         if hasattr(old_mlp, 'experts'):

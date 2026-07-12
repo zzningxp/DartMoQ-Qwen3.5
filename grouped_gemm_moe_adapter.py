@@ -132,7 +132,7 @@ class TraditionalMoEWrapper(nn.Module):
         return final_hidden_states.reshape(batch_size, seq_len, hidden_dim)
 
 
-class SimpleMoEBlock(nn.Module):
+class MoEBuildBlock(nn.Module):
     """简单的 MoE 块，用于量化后重建，只需要支持基本 forward"""
     def __init__(self, config):
         super().__init__()

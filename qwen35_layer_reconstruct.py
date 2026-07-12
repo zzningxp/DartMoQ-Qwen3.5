@@ -26,7 +26,7 @@ from collections import Counter
 
 from dartmoq_hybridmoe import DartMoQHybridWrapper
 from dartmoq_hybridmoe import restructure_hybrid_qscheme
-from grouped_gemm_moe_adapter import SimpleMoEBlock
+from grouped_gemm_moe_adapter import MoEBuildBlock
 
 
 INTERMEDIATE_RESULT_DIR = "intermediate_result"
@@ -367,7 +367,7 @@ def reconstruct_moe_from_existing(model, layer, layer_idx, inps,
 
     # Hybrid mode only
     # 用简单的 MoE 块，不依赖原始类
-    moe = SimpleMoEBlock(model.config).to(device)
+    moe = MoEBuildBlock(model.config).to(device)
     moe.gate = layer.mlp.gate
     moe.num_experts = len(all_new_experts)
     moe.experts = nn.ModuleList([

@@ -65,12 +65,12 @@ class BitPartitionedGroupMoE(nn.Module):
         self.expert_offsets = {}  # bit_str -> LongTensor: expert_idx -> start_pos (cumsum格式)
 
     @classmethod
-    def from_simple_moe(cls, simple_moe, layer_metadata):
+    def from_build_block(cls, build_block, layer_metadata):
         """
-        从 SimpleMoEBlock 重构为 BitPartitionedGroupMoE
+        从 MoEBuildBlock 重构为 BitPartitionedGroupMoE
 
         参数：
-            simple_moe: SimpleMoEBlock 实例（包含 DartMoQHybridWrapper）
+            build_block: MoEBuildBlock 实例（包含 DartMoQHybridWrapper）
             layer_metadata: 量化过程中保存的元数据
 
         返回：
@@ -85,20 +85,20 @@ class BitPartitionedGroupMoE(nn.Module):
 
         # 创建实例
         moe = cls(
-            gate=simple_moe.gate,
+            gate=build_block.gate,
             num_experts=num_experts,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
-            top_k=getattr(simple_moe, 'top_k', 6),
-            shared_expert=getattr(simple_moe, 'shared_expert', None),
-            shared_expert_gate=getattr(simple_moe, 'shared_expert_gate', None),
+            top_k=getattr(build_block, 'top_k', 6),
+            shared_expert=getattr(build_block, 'shared_expert', None),
+            shared_expert_gate=getattr(build_block, 'shared_expert_gate', None),
         )
 
         moe.bit_list = bit_list
 
         # 获取 dtype 和 device
-        dtype = next(simple_moe.parameters()).dtype
-        device = next(simple_moe.parameters()).device
+        dtype = next(build_block.parameters()).dtype
+        device = next(build_block.parameters()).device
 
         # 第一步：收集每个 expert 在每个 bit 的神经元数
         neurons_by_bit_expert = defaultdict(list)  # bit -> list[int]
@@ -132,7 +132,7 @@ class BitPartitionedGroupMoE(nn.Module):
 
         # 第三步：从每个 expert 的 sub_expert 中提取权重，填充到紧凑格式中
         for expert_idx in range(num_experts):
-            wrapper = simple_moe.experts[expert_idx]  # DartMoQHybridWrapper
+            wrapper = build_block.experts[expert_idx]  # DartMoQHybridWrapper
 
             # 先为每个 bit 建立 sub_expert 的映射
             bit_to_subexpert = {}
@@ -178,12 +178,12 @@ class BitPartitionedGroupMoE(nn.Module):
             if hasattr(wrapper, 'bit_to_indices'):
                 del wrapper.bit_to_indices
 
-            # 清理 simple_moe.experts 中这个位置的引用
-            simple_moe.experts[expert_idx] = None
+            # 清理 build_block.experts 中这个位置的引用
+            build_block.experts[expert_idx] = None
 
-        # 清理 simple_moe 的 experts 列表引用
-        if hasattr(simple_moe, 'experts'):
-            del simple_moe.experts
+        # 清理 build_block 的 experts 列表引用
+        if hasattr(build_block, 'experts'):
+            del build_block.experts
 
         # 强制垃圾回收，释放 CPU 内存
         gc.collect()
