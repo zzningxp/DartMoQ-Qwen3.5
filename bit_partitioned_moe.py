@@ -158,11 +158,25 @@ class BitPartitionedGroupMoE(nn.Module):
                 # 填充 down
                 moe.bit_weights.down[bit_str][expert_idx, :, :n_neurons] = sub_expert.down_proj.weight.data
 
+                # 立即清理这个 sub_expert 的权重，释放内存
+                del sub_expert.gate_proj
+                del sub_expert.up_proj
+                del sub_expert.down_proj
+                del bit_to_subexpert[bit]
+
+            # 清理这个 wrapper 的引用
+            del bit_to_subexpert
+            if hasattr(wrapper, 'sub_experts'):
+                del wrapper.sub_experts
+            if hasattr(wrapper, 'bit_to_indices'):
+                del wrapper.bit_to_indices
+
+            # 清理 simple_moe.experts 中这个位置的引用
+            simple_moe.experts[expert_idx] = None
+
         return moe
 
     def forward(self, hidden_states):
-        import gc
-
         t0 = time.time()
 
         batch_size, seq_len, hidden_dim = hidden_states.shape
@@ -305,12 +319,17 @@ class BitPartitionedGroupMoE(nn.Module):
         t5 = time.time()
 
         # 打印详细 profiling (已禁用，仅在需要调试时打开)
-        print(f"  [BitPartitioned_gpu] total={t5-t0:.4f}s | init={t1-t0:.4f}s | shared={t2-t1:.4f}s | router={t3-t2:.4f}s | compute={t4-t3:.4f}s | reshape={t5-t4:.4f}s")
-        print(f"    [Compute_detail] mask={t_mask_total:.4f}s | gate_up_matmul={t_gate_up_matmul_total:.4f}s | silu={t_silu_total:.4f}s | down_matmul={t_down_matmul_total:.4f}s | accum={t_accum_total:.4f}s | active_experts={active_experts_total} | active_bits={self.bit_list}")
+        # print(f"  [BitPartitioned_gpu] total={t5-t0:.4f}s | init={t1-t0:.4f}s | shared={t2-t1:.4f}s | router={t3-t2:.4f}s | compute={t4-t3:.4f}s | reshape={t5-t4:.4f}s")
+        # print(f"    [Compute_detail] mask={t_mask_total:.4f}s | gate_up_matmul={t_gate_up_matmul_total:.4f}s | silu={t_silu_total:.4f}s | down_matmul={t_down_matmul_total:.4f}s | accum={t_accum_total:.4f}s | active_experts={active_experts_total} | active_bits={self.bit_list}")
 
-        # Final cleanup
-        del x, final_hidden_states, topk_indices, topk_weights
-        gc.collect()
+        # Optional: Print memory usage
+        # mem_str = []
+        # if torch.cuda.is_available():
+        #     for i in range(torch.cuda.device_count()):
+        #         alloc = torch.cuda.memory_allocated(i) / 1024**3
+        #         resvd = torch.cuda.memory_reserved(i) / 1024**3
+        #         mem_str.append(f"CUDA {i}: {alloc:.2f}GB/{resvd:.2f}GB")
+        # print(f"  [MoE Memory] {' | '.join(mem_str)}")
 
         return result
 

@@ -144,7 +144,11 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
         torch.cuda.empty_cache()
 
     # Process each transformer layer sequentially, with batches
-    all_hidden_states = [emb for emb in all_embeddings]  # Start with embeddings
+    # 合并成单个大张量，减少内存碎片 - 动态获取 dtype
+    hidden_dtype = all_embeddings[0].dtype
+    all_hidden_states = torch.cat(all_embeddings, dim=0).to(hidden_dtype)
+    del all_embeddings
+    gc.collect()
 
     import inspect
     # Debug: Print layer types at the beginning
@@ -169,13 +173,15 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
         layer = layer.to(DEV)
 
         # Process samples in batches
-        new_hidden_states = []
+        # 预先分配新的 hidden states 张量 - 保持相同 dtype
+        new_hidden_states = torch.empty_like(all_hidden_states)
+
         for batch_start in range(0, nsamples, batch_size_transformer):
             batch_end = min(batch_start + batch_size_transformer, nsamples)
             actual_batch_size = batch_end - batch_start
 
-            # Get this batch's hidden states and move to GPU
-            batch_hidden = torch.cat(all_hidden_states[batch_start:batch_end], dim=0).to(DEV)
+            # Get this batch's hidden states and move to GPU - 直接索引
+            batch_hidden = all_hidden_states[batch_start:batch_end].to(DEV)
 
             # Prepare kwargs for this batch size - create on demand to save memory
             layer_kwargs = {}
@@ -217,9 +223,8 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
             else:
                 batch_output = layer_outputs
 
-            # Split batch into individual samples and move to CPU
-            for i in range(actual_batch_size):
-                new_hidden_states.append(batch_output[i:i+1].cpu())
+            # 直接保存到预先分配的张量中
+            new_hidden_states[batch_start:batch_end].copy_(batch_output.cpu())
 
             # Cleanup batch variables aggressively
             del batch_hidden, layer_outputs, batch_output
@@ -242,11 +247,30 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        # Debug: Print layer timing every 10 layers or first 10 layers
-        if layer_idx < 10 or layer_idx % 10 == 0:
+        # Debug: Print layer timing and memory info every 10 layers or first 10 layers
+        if layer_idx < 50 or layer_idx % 10 == 0:
             layer_time = time.time() - tick_layer
             mlp_type = type(layer.mlp).__name__ if hasattr(layer, 'mlp') else 'N/A'
-            print(f"  [DEBUG] Layer {layer_idx} time: {layer_time:.2f}s, mlp_type={mlp_type}")
+
+            # Print memory info
+            mem_info = []
+            if torch.cuda.is_available():
+                for i in range(torch.cuda.device_count()):
+                    alloc = torch.cuda.memory_allocated(i) / 1024**3
+                    resvd = torch.cuda.memory_reserved(i) / 1024**3
+                    mem_info.append(f"CUDA {i}: {alloc:.2f}GB/{resvd:.2f}GB")
+
+            # Also print CPU memory info if possible
+            try:
+                import psutil
+                process = psutil.Process()
+                cpu_mem = process.memory_info().rss / 1024**3
+                mem_info.append(f"CPU: {cpu_mem:.2f}GB")
+            except ImportError:
+                pass
+
+            mem_str = " | ".join(mem_info)
+            print(f"  [DEBUG] Layer {layer_idx} time: {layer_time:.2f}s, mlp_type={mlp_type} | Memory: {mem_str}", flush=True)
 
     # Final norm and lm_head - process in batches of 4
     print("Processing final norm and lm_head...")
@@ -256,8 +280,8 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
         batch_end = min(batch_start + batch_size_lm_head, nsamples)
         actual_batch_size = batch_end - batch_start
 
-        # Get this batch's hidden states and move to GPU
-        batch_hidden = torch.cat(all_hidden_states[batch_start:batch_end], dim=0).to(DEV)
+        # Get this batch's hidden states and move to GPU - 直接索引
+        batch_hidden = all_hidden_states[batch_start:batch_end].to(DEV)
 
         # Process this batch through norm and lm_head
         with torch.no_grad():

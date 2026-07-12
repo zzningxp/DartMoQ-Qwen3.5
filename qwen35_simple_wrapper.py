@@ -212,7 +212,46 @@ def construct_moe(model, moe_model_flag, layer, layer_idx, inp,
         # 重组为 BitPartitionedGroupMoE
         tick_restructure = time.time()
         print(f"Restructuring to BitPartitionedGroupMoE (layer {layer_idx})...")
-        layer.mlp = BitPartitionedGroupMoE.from_simple_moe(layer.mlp, layer_metadata)
+
+        # 获取旧结构的引用，以便后续清理
+        old_mlp = layer.mlp
+
+        # 替换为新结构
+        layer.mlp = BitPartitionedGroupMoE.from_simple_moe(old_mlp, layer_metadata)
+
+        # 显式清理旧结构，释放内存
+        if hasattr(old_mlp, 'experts'):
+            for expert_wrapper in old_mlp.experts:
+                if hasattr(expert_wrapper, 'sub_experts'):
+                    # 清理每个子专家
+                    for sub_expert in expert_wrapper.sub_experts:
+                        if hasattr(sub_expert, 'gate_proj'):
+                            del sub_expert.gate_proj
+                        if hasattr(sub_expert, 'up_proj'):
+                            del sub_expert.up_proj
+                        if hasattr(sub_expert, 'down_proj'):
+                            del sub_expert.down_proj
+                    del expert_wrapper.sub_experts
+                # 清理 wrapper 自身的属性
+                if hasattr(expert_wrapper, 'bit_to_indices'):
+                    del expert_wrapper.bit_to_indices
+            del old_mlp.experts
+
+        # 清理 old_mlp 的其他可能属性
+        if hasattr(old_mlp, 'gate'):
+            del old_mlp.gate  # 注意：gate 实际上被新结构复用了，所以我们只删除引用，不删除对象本身
+        if hasattr(old_mlp, 'shared_expert'):
+            del old_mlp.shared_expert  # 同理，shared_expert 也被复用
+        if hasattr(old_mlp, 'shared_expert_gate'):
+            del old_mlp.shared_expert_gate
+
+        # 删除 old_mlp 引用
+        del old_mlp
+
+        # 强制垃圾回收
+        gc.collect()
+        torch.cuda.empty_cache()
+
         tick_restructure_end = time.time()
         print(f"Restructured in {tick_restructure_end - tick_restructure:.4f}s")
 
