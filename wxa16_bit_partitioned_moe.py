@@ -139,12 +139,16 @@ class WxA16BitPartitionedGroupMoE(nn.Module):
         Returns:
             WxA16BitPartitionedGroupMoE 实例
         """
+        tick_start = time.time()
         from bit_partitioned_moe import BitPartitionedGroupMoE
 
         # 先从 build_block 构建普通的 BitPartitionedGroupMoE（提取 fp16 权重）
+        tick_fp16moe = time.time()
         fp16_moe = BitPartitionedGroupMoE.from_build_block(build_block, layer_metadata)
+        print(f"  [DEBUG] BitPartitionedGroupMoE.from_build_block: {time.time() - tick_fp16moe:.4f}s")
 
         # 创建 WxA16 版本
+        tick_create = time.time()
         moe = cls(
             gate=fp16_moe.gate,
             num_experts=fp16_moe.num_experts,
@@ -154,6 +158,7 @@ class WxA16BitPartitionedGroupMoE(nn.Module):
             shared_expert=fp16_moe.shared_expert,
             shared_expert_gate=fp16_moe.shared_expert_gate,
         )
+        print(f"  [DEBUG] Create WxA16BitPartitionedGroupMoE instance: {time.time() - tick_create:.4f}s")
 
         moe.bit_list = fp16_moe.bit_list
 
@@ -162,8 +167,10 @@ class WxA16BitPartitionedGroupMoE(nn.Module):
         device = next(build_block.parameters()).device
 
         # 对每个 bit 的权重进行 WxA16 量化
+        tick_quantize = time.time()
         for bit_str, gate_up_weight in fp16_moe.bit_weights.gate_up.items():
             bit = int(bit_str)
+            tick_bit = time.time()
 
             print(f"  Quantizing MoE weights for {bit} bit...")
 
@@ -172,6 +179,7 @@ class WxA16BitPartitionedGroupMoE(nn.Module):
 
             # 由于 gate_up 是拼接的权重 (2x_neurons, hidden_size)，我们需要特殊处理
             # gate_proj 和 up_proj 是拼接的
+            tick_gateup = time.time()
             gate_up_packed = turboquant_quantize_packed_full(
                 gate_up_weight.data,
                 bit_width=bit,
@@ -179,7 +187,9 @@ class WxA16BitPartitionedGroupMoE(nn.Module):
                 seed=42 + bit,
                 keep_on_gpu=True,
             )
+            print(f"    [DEBUG] turboquant_quantize_packed_full (gate_up): {time.time() - tick_gateup:.4f}s")
 
+            tick_down = time.time()
             down_packed = turboquant_quantize_packed_full(
                 down_weight.data,
                 bit_width=bit,
@@ -187,12 +197,17 @@ class WxA16BitPartitionedGroupMoE(nn.Module):
                 seed=42 + bit + 1000,
                 keep_on_gpu=True,
             )
+            print(f"    [DEBUG] turboquant_quantize_packed_full (down): {time.time() - tick_down:.4f}s")
 
             # 创建 WxA16Weights
+            tick_weights = time.time()
             wxa16_weights = WxA16Weights(bit, moe.hidden_size)
+            print(f"    [DEBUG] Create WxA16Weights: {time.time() - tick_weights:.4f}s")
 
             # 存储 packed 数据并注册为 buffer
+            tick_setpacked = time.time()
             wxa16_weights.set_packed_data(gate_up_packed, down_packed)
+            print(f"    [DEBUG] set_packed_data: {time.time() - tick_setpacked:.4f}s")
 
             # 复制 offset 信息
             moe.expert_offsets[bit_str] = fp16_moe.expert_offsets[bit_str]
@@ -200,13 +215,18 @@ class WxA16BitPartitionedGroupMoE(nn.Module):
 
             moe.bit_weights[bit_str] = wxa16_weights
 
-            print(f"  Done quantizing {bit} bit")
+            print(f"  Done quantizing {bit} bit: {time.time() - tick_bit:.4f}s")
+
+        print(f"  [DEBUG] Quantize all bits: {time.time() - tick_quantize:.4f}s")
 
         # 清理 fp16_moe
+        tick_cleanup = time.time()
         del fp16_moe
         gc.collect()
         torch.cuda.empty_cache()
+        print(f"  [DEBUG] Cleanup fp16_moe: {time.time() - tick_cleanup:.4f}s")
 
+        print(f"  [DEBUG] from_build_block total time: {time.time() - tick_start:.4f}s")
         return moe
 
     @torch.no_grad()

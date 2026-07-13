@@ -106,68 +106,76 @@ def construct_moe(model, moe_model_flag, layer, layer_idx, inp,
         hidden_states_inorm = layer.input_layernorm(inp)
 
     attn_out = torch.zeros_like(hidden_states_inorm)
-    for b_i in range(0, batchsize):
-        # ============ 改动1：支持 self_attn/linear_attn 交替 ============
+    tick_attn_parallel = time.time()
+    mini_batch = 16  # 分成小 batch，避免爆显存
+    print(f"  [DEBUG] Starting Attention forward pass (parallel, mini_batch={mini_batch}) for {batchsize} samples...")
+    # ============ 小 batch 并行 Attention 推理 ============
+    for start_idx in range(0, batchsize, mini_batch):
+        end_idx = min(start_idx + mini_batch, batchsize)
+        tick_batch = time.time()
+        batch_hidden = hidden_states_inorm[start_idx:end_idx]
+
         if modeltype == 'olmoe' or modeltype == 'llama' or modeltype == 'qwen3' or modeltype == 'qwen3_moe' or modeltype == 'qwen3_5' or modeltype == 'deepseek_v3':
             with torch.no_grad():
                 if hasattr(layer, 'self_attn'):
-                    # Use inspect to check what arguments the attention layer accepts
                     attn_forward = layer.self_attn.forward
                     forward_signature = inspect.signature(attn_forward)
                     attn_kwargs = {
-                        'hidden_states': hidden_states_inorm[b_i:b_i+1]
+                        'hidden_states': batch_hidden
                     }
-                    if 'attention_mask' in forward_signature.parameters:
+                    if 'attention_mask' in forward_signature.parameters and attention_mask is not None:
                         attn_kwargs['attention_mask'] = attention_mask
-                    if 'position_ids' in forward_signature.parameters:
+                    if 'position_ids' in forward_signature.parameters and position_ids is not None:
                         attn_kwargs['position_ids'] = position_ids
-                    if 'position_embeddings' in forward_signature.parameters:
+                    if 'position_embeddings' in forward_signature.parameters and position_embeddings is not None:
                         attn_kwargs['position_embeddings'] = position_embeddings
-                    attn_out[b_i:b_i+1] = layer.self_attn(**attn_kwargs)[0]
+                    attn_out_batch = layer.self_attn(**attn_kwargs)[0]
                 elif hasattr(layer, 'linear_attn'):
-                    # Use inspect to check what arguments the attention layer accepts
                     attn_forward = layer.linear_attn.forward
                     forward_signature = inspect.signature(attn_forward)
                     attn_kwargs = {
-                        'hidden_states': hidden_states_inorm[b_i:b_i+1]
+                        'hidden_states': batch_hidden
                     }
-                    if 'attention_mask' in forward_signature.parameters:
+                    if 'attention_mask' in forward_signature.parameters and attention_mask is not None:
                         attn_kwargs['attention_mask'] = attention_mask
-                    if 'position_ids' in forward_signature.parameters:
+                    if 'position_ids' in forward_signature.parameters and position_ids is not None:
                         attn_kwargs['position_ids'] = position_ids
-                    if 'position_embeddings' in forward_signature.parameters:
+                    if 'position_embeddings' in forward_signature.parameters and position_embeddings is not None:
                         attn_kwargs['position_embeddings'] = position_embeddings
-                    attn_out[b_i:b_i+1] = layer.linear_attn(**attn_kwargs)[0]
+                    attn_out_batch = layer.linear_attn(**attn_kwargs)[0]
         else:
             with torch.no_grad():
                 if hasattr(layer, 'self_attn'):
-                    # Use inspect to check what arguments the attention layer accepts
                     attn_forward = layer.self_attn.forward
                     forward_signature = inspect.signature(attn_forward)
                     attn_kwargs = {
-                        'hidden_states': hidden_states_inorm[b_i:b_i+1]
+                        'hidden_states': batch_hidden
                     }
-                    if 'attention_mask' in forward_signature.parameters:
+                    if 'attention_mask' in forward_signature.parameters and attention_mask is not None:
                         attn_kwargs['attention_mask'] = attention_mask
-                    if 'position_ids' in forward_signature.parameters:
+                    if 'position_ids' in forward_signature.parameters and position_ids is not None:
                         attn_kwargs['position_ids'] = position_ids
-                    if 'position_embeddings' in forward_signature.parameters:
+                    if 'position_embeddings' in forward_signature.parameters and position_embeddings is not None:
                         attn_kwargs['position_embeddings'] = position_embeddings
-                    attn_out[b_i:b_i+1] = layer.self_attn(**attn_kwargs)[0]
+                    attn_out_batch = layer.self_attn(**attn_kwargs)[0]
                 elif hasattr(layer, 'linear_attn'):
-                    # Use inspect to check what arguments the attention layer accepts
                     attn_forward = layer.linear_attn.forward
                     forward_signature = inspect.signature(attn_forward)
                     attn_kwargs = {
-                        'hidden_states': hidden_states_inorm[b_i:b_i+1]
+                        'hidden_states': batch_hidden
                     }
-                    if 'attention_mask' in forward_signature.parameters:
+                    if 'attention_mask' in forward_signature.parameters and attention_mask is not None:
                         attn_kwargs['attention_mask'] = attention_mask
-                    if 'position_ids' in forward_signature.parameters:
+                    if 'position_ids' in forward_signature.parameters and position_ids is not None:
                         attn_kwargs['position_ids'] = position_ids
-                    if 'position_embeddings' in forward_signature.parameters:
+                    if 'position_embeddings' in forward_signature.parameters and position_embeddings is not None:
                         attn_kwargs['position_embeddings'] = position_embeddings
-                    attn_out[b_i:b_i+1] = layer.linear_attn(**attn_kwargs)[0]
+                    attn_out_batch = layer.linear_attn(**attn_kwargs)[0]
+
+        attn_out[start_idx:end_idx] = attn_out_batch
+        print(f"  [DEBUG] Attention mini_batch {start_idx}-{end_idx} done: {time.time() - tick_batch:.4f}s")
+
+    print(f"  [DEBUG] Attention forward (parallel mini_batch) total time: {time.time() - tick_attn_parallel:.4f}s")
 
     hidden_states = residual + attn_out
     residual = hidden_states
@@ -278,12 +286,20 @@ def construct_moe(model, moe_model_flag, layer, layer_idx, inp,
         print_memory_stats_layer_after(layer, layer_idx, before_stats, qscheme)
 
     moe_out = torch.zeros_like(hidden_states)
-    for b_i in range(0, batchsize):
-        mlp_out = layer.mlp(hidden_states[b_i:b_i+1])
-        if isinstance(mlp_out, tuple):
-            moe_out[b_i:b_i+1] = mlp_out[0]
+    tick_moe_forward_start = time.time()
+    mini_batch = 16  # 分成小 batch，避免爆显存
+    print(f"  [DEBUG] Starting MoE forward pass for {batchsize} samples (parallel, mini_batch={mini_batch})...")
+    for start_idx in range(0, batchsize, mini_batch):
+        end_idx = min(start_idx + mini_batch, batchsize)
+        tick_batch = time.time()
+        batch_hidden = hidden_states[start_idx:end_idx]
+        mlp_out_batch = layer.mlp(batch_hidden)
+        if isinstance(mlp_out_batch, tuple):
+            moe_out[start_idx:end_idx] = mlp_out_batch[0]
         else:
-            moe_out[b_i:b_i+1] = mlp_out
+            moe_out[start_idx:end_idx] = mlp_out_batch
+        print(f"  [DEBUG] MoE mini_batch {start_idx}-{end_idx} done: {time.time() - tick_batch:.4f}s")
+    print(f"  [DEBUG] MoE forward (parallel mini_batch) total time: {time.time() - tick_moe_forward_start:.4f}s")
 
     with torch.no_grad():
         moe_out = moe_out + residual
