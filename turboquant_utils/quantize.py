@@ -32,6 +32,74 @@ from turboquant_model.rotation import (
 # ---------------------------------------------------------------------------
 
 
+def pack_nbit(indices: torch.Tensor, bit_width: int) -> torch.Tensor:
+    """将n-bit索引打包到uint8张量中。
+
+    支持 1/2/4/8 bit。
+
+    Args:
+        indices: 整数张量，形状为 (..., N)，值范围 [0, 2^bit_width - 1]
+        bit_width: 1/2/4/8
+
+    Returns:
+        packed: uint8张量，形状为 (..., packed_N)
+    """
+    supported_bits = {1, 2, 4, 8}
+    if bit_width not in supported_bits:
+        raise ValueError(f"Only {supported_bits} bits are supported, got {bit_width}")
+
+    elements_per_byte = 8 // bit_width
+    N = indices.shape[-1]
+
+    # 计算需要填充的数量
+    pad = (elements_per_byte - (N % elements_per_byte)) % elements_per_byte
+    if pad > 0:
+        indices = torch.nn.functional.pad(indices, (0, pad), value=0)
+
+    # 重塑为 (..., N_padded // elements_per_byte, elements_per_byte)
+    packed_shape = indices.shape[:-1] + (-1, elements_per_byte)
+    indices_reshaped = indices.reshape(packed_shape)
+
+    # 打包
+    packed = torch.zeros(indices.shape[:-1] + (indices.shape[-1] // elements_per_byte,),
+                        dtype=torch.uint8, device=indices.device)
+
+    mask = (1 << bit_width) - 1
+    for i in range(elements_per_byte):
+        packed |= (indices_reshaped[..., i].to(torch.uint8) & mask) << (i * bit_width)
+
+    return packed
+
+
+def unpack_nbit(packed: torch.Tensor, bit_width: int, N: int) -> torch.Tensor:
+    """将uint8打包数据解包为n-bit索引张量。
+
+    Args:
+        packed: uint8张量，形状为 (..., packed_N)
+        bit_width: 1/2/4/8
+        N: 原始最后一维的长度
+
+    Returns:
+        indices: int32张量，形状为 (..., N)
+    """
+    supported_bits = {1, 2, 4, 8}
+    if bit_width not in supported_bits:
+        raise ValueError(f"Only {supported_bits} bits are supported, got {bit_width}")
+
+    elements_per_byte = 8 // bit_width
+    mask = (1 << bit_width) - 1
+
+    # 重塑为 (..., packed_N, elements_per_byte)
+    indices = torch.zeros(packed.shape[:-1] + (packed.shape[-1] * elements_per_byte,),
+                         dtype=torch.int32, device=packed.device)
+
+    for i in range(elements_per_byte):
+        indices[..., i::elements_per_byte] = ((packed >> (i * bit_width)) & mask).to(torch.int32)
+
+    # 截取原始长度
+    return indices[..., :N]
+
+
 def pack_4bit(indices: torch.Tensor) -> torch.Tensor:
     """将4-bit索引(0-15)打包到uint8张量中，每字节存储2个索引。
 
@@ -272,3 +340,178 @@ def turboquant_quantize_packed(
         "shape": (M, N),
         "bit_width": bit_width,
     }
+
+
+@torch.no_grad()
+def turboquant_quantize_packed_full(
+    W: torch.Tensor,
+    bit_width: int,
+    group_size: Optional[int] = None,
+    seed: int = 42,
+    rotation: str = "qr",
+    keep_on_gpu: bool = False,
+) -> dict:
+    """全功能 TurboQuant 量化并返回打包表示，支持 1/2/4/8 bit。
+
+    Args:
+        W: 权重矩阵，形状为 (out_features, in_features)
+        bit_width: 1/2/4/8
+        group_size: 分组大小
+        seed: 旋转种子
+        rotation: "qr" 或 "hadamard" 或 "none"
+        keep_on_gpu: 是否保持在 GPU 上（默认移到 CPU 节省显存）
+
+    Returns:
+        dict 包含完整的量化信息
+    """
+    supported_bits = {1, 2, 4, 8}
+    if bit_width not in supported_bits:
+        raise ValueError(f"Only {supported_bits} bits are supported, got {bit_width}")
+
+    M, N = W.shape
+    if group_size is None:
+        group_size = N
+
+    orig_dtype = W.dtype
+    W = W.float()
+
+    # 获取码本
+    centroids, boundaries = get_codebook(bit_width)
+    centroids = centroids.to(W.device)
+    boundaries = boundaries.to(W.device)
+
+    # 收集每个分组的信息
+    all_norms = []
+    all_indices = []
+    all_rotations = []  # 如果需要存储旋转矩阵
+
+    # 按分组遍历
+    for g_start in range(0, N, group_size):
+        g_end = min(g_start + group_size, N)
+        g_dim = g_end - g_start
+        W_g = W[:, g_start:g_end]
+
+        # Step 1: 行归一化
+        norms = W_g.norm(dim=1, keepdim=True).clamp(min=1e-8)
+        W_norm = W_g / norms
+        all_norms.append(norms.squeeze(1))
+
+        # Step 2: 随机正交旋转
+        if rotation == "none":
+            Y = W_norm
+        elif rotation == "hadamard":
+            Y = hadamard_rotate(W_norm, seed=seed + g_start)
+        else:  # qr
+            Pi = generate_rotation_matrix(g_dim, seed=seed + g_start).to(W.device)
+            Y = W_norm @ Pi.T
+
+        # 归一化旋转后的方差
+        scale = math.sqrt(g_dim)
+        Y_scaled = Y * scale
+
+        # Step 3: Lloyd-Max 标量量化
+        indices = torch.searchsorted(boundaries, Y_scaled.reshape(-1))
+        indices = indices.clamp(0, len(centroids) - 1).reshape(M, g_dim)
+        all_indices.append(indices)
+
+    # 拼接所有分组的索引和范数
+    full_indices = torch.cat(all_indices, dim=1)
+    norms_out = torch.stack(all_norms, dim=1) if len(all_norms) > 1 else all_norms[0]
+
+    # 打包索引
+    packed = pack_nbit(full_indices, bit_width)
+
+    # 准备输出
+    target_device = W.device if keep_on_gpu else "cpu"
+
+    result = {
+        "indices_packed": packed.to(target_device),
+        "codebook": centroids.to("cpu"),  # 码本始终放 CPU，因为小且只读
+        "norms": norms_out.to(target_device),
+        "seed": seed,
+        "group_size": group_size,
+        "shape": (M, N),
+        "bit_width": bit_width,
+        "rotation": rotation,
+        "orig_dtype": str(orig_dtype),
+    }
+
+    return result
+
+
+@torch.no_grad()
+def turboquant_dequantize_packed(packed_data: dict, device: Optional[torch.device] = None) -> torch.Tensor:
+    """从打包表示反量化回权重矩阵。
+
+    Args:
+        packed_data: `turboquant_quantize_packed_full()` 的返回值
+        device: 目标设备（默认从 packed_data 推断）
+
+    Returns:
+        W_approx: 反量化后的权重矩阵
+    """
+    # 提取数据
+    indices_packed = packed_data["indices_packed"]
+    codebook = packed_data["codebook"]
+    norms = packed_data["norms"]
+    seed = packed_data["seed"]
+    group_size = packed_data["group_size"]
+    shape = packed_data["shape"]
+    bit_width = packed_data["bit_width"]
+    rotation = packed_data.get("rotation", "qr")
+    orig_dtype_str = packed_data.get("orig_dtype", "torch.float16")
+
+    # 解析原始 dtype
+    orig_dtype = getattr(torch, orig_dtype_str.split(".")[-1])
+
+    # 确定设备
+    if device is None:
+        device = indices_packed.device
+    else:
+        indices_packed = indices_packed.to(device)
+        norms = norms.to(device)
+    codebook = codebook.to(device)
+
+    M, N = shape
+
+    # 解包索引
+    full_indices = unpack_nbit(indices_packed, bit_width, N)
+
+    # 反量化
+    W_approx = torch.zeros((M, N), dtype=torch.float32, device=device)
+
+    # 确保 norms 是二维的
+    if norms.dim() == 1:
+        norms = norms.unsqueeze(1)
+
+    # 按分组反量化
+    group_idx = 0
+    for g_start in range(0, N, group_size):
+        g_end = min(g_start + group_size, N)
+        g_dim = g_end - g_start
+
+        # 提取当前分组的索引和范数
+        indices_g = full_indices[:, g_start:g_end]
+        norms_g = norms[:, group_idx].unsqueeze(1)
+        group_idx += 1
+
+        # 从码本还原
+        Y_quant_scaled = codebook[indices_g]
+
+        # 逆缩放
+        scale = math.sqrt(g_dim)
+        Y_unscaled = Y_quant_scaled / scale
+
+        # 逆旋转
+        if rotation == "none":
+            W_g_approx = Y_unscaled
+        elif rotation == "hadamard":
+            W_g_approx = hadamard_rotate_inverse(Y_unscaled, seed=seed + g_start)
+        else:  # qr
+            Pi = generate_rotation_matrix(g_dim, seed=seed + g_start).to(device)
+            W_g_approx = Y_unscaled @ Pi
+
+        # 恢复原始尺度
+        W_approx[:, g_start:g_end] = W_g_approx * norms_g
+
+    return W_approx.to(orig_dtype)

@@ -155,6 +155,10 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
     batch_size_transformer = 32
     batch_size_lm_head = 4
 
+    # 统计全局时间
+    total_time_forward = 0.0
+    total_time_move = 0.0
+
     for layer_idx, layer in enumerate(layers):
         if layer_idx % 10 == 0:
             print(f"Processing layer {layer_idx}/{len(layers)}...", flush=True)
@@ -164,10 +168,16 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
         tick_layer = time.time()
 
         # Move layer to GPU
+        t_move_start = time.time()
         layer = layer.to(DEV)
+        t_move_end = time.time()
+        time_move = t_move_end - t_move_start
+        total_time_move += time_move
 
         # Process samples in batches - hidden states stay on GPU
         new_hidden_states = torch.empty_like(hidden_states)
+
+        t_forward_start = time.time()
 
         for batch_start in range(0, nsamples, batch_size_transformer):
             batch_end = min(batch_start + batch_size_transformer, nsamples)
@@ -223,6 +233,10 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
             del batch_hidden, layer_outputs, batch_output
             del layer_kwargs
 
+        t_forward_end = time.time()
+        time_forward = t_forward_end - t_forward_start
+        total_time_forward += time_forward
+
         # Swap hidden states pointers
         del hidden_states
         hidden_states = new_hidden_states
@@ -237,13 +251,18 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
             mlp_type = type(layer.mlp).__name__ if hasattr(layer, 'mlp') else 'N/A'
 
             mem_str = get_memory_info_str()
-            print(f"  [DEBUG] Layer {layer_idx} time: {layer_time:.2f}s, mlp_type={mlp_type} | Memory: {mem_str}", flush=True)
+            print(f"  [Layer {layer_idx}] time: {layer_time:.2f}s (move: {time_move:.2f}s, forward: {time_forward:.2f}s), mlp_type={mlp_type} | Memory: {mem_str}", flush=True)
 
         del layer
         # Cleanup
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+    # 打印全局时间统计
+    print(f"\n  [Eval Global Stats]")
+    print(f"    Total move time: {total_time_move:.2f}s")
+    print(f"    Total forward time: {total_time_forward:.2f}s")
 
     # Final norm and lm_head - process in batches of 4
     print("Processing final norm and lm_head...")

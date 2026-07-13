@@ -758,3 +758,107 @@ def quant_layer_mix_precision(layer, layer_idx, quant_attn, n_experts, slice_exp
 
     torch.cuda.empty_cache()
     gc.collect()
+
+
+@torch.no_grad()
+def quant_layer_mix_precision_wxa16(layer, layer_idx, quant_attn, n_experts, slice_expert_num,
+                attn_hidden_states, ffn_hidden_states, attention_mask, position_ids, position_embeddings,
+                qscheme, use_hybrid_moe, quantmode, seed=42, group_size=128):
+    """
+    WxA16 版本：进行真实量化，将 nn.Linear 替换为 WxA16Linear，删除原始 fp16 权重。
+
+    注意：
+      - 这个函数先用原来的 fake quant 流程（需要 GPTQ/TurboQuant 分析）
+      - 然后再将已经 fake quant 好的 fp16 转换为 WxA16 packed 格式
+    """
+    print(f"Quantize layer {layer_idx} (WxA16 mode)")
+
+    # ========== 阶段 1: 正常 fake quant（保持现有逻辑不变） ==========
+    quant_layer_mix_precision(
+        layer, layer_idx, quant_attn, n_experts, slice_expert_num,
+        attn_hidden_states, ffn_hidden_states, attention_mask, position_ids, position_embeddings,
+        qscheme, use_hybrid_moe, quantmode, seed=seed,
+    )
+
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    # ========== 阶段 2: 将 fake quant 后的 fp16 转换为 WxA16 ==========
+    print(f"  Converting to WxA16 packed format...")
+    tick_convert_start = time.time()
+
+    from wxa16_linear import WxA16Linear, W8A16Linear
+    from wxa16_dartmoq_backend import wxa16_quantize_linear
+
+    ffn_filters = ['up_proj', 'gate_proj', 'down_proj']
+    attn_filters = ['q_proj', 'k_proj', 'v_proj', 'o_proj', 'kv_a_proj_with_mqa', 'kv_b_proj']
+
+    # 收集需要量化的层
+    all_modules = []
+
+    # Attention 层 (W8A16)
+    if quant_attn:
+        if hasattr(layer, 'self_attn'):
+            attn = layer.self_attn
+        elif hasattr(layer, 'linear_attn'):
+            attn = layer.linear_attn
+        else:
+            attn = None
+
+        if attn is not None:
+            bit_attn = qscheme['attn'][0] if isinstance(qscheme['attn'], (list, tuple)) else qscheme['attn']
+            for name in attn_filters:
+                if hasattr(attn, name):
+                    linear = getattr(attn, name)
+                    if isinstance(linear, nn.Linear):
+                        all_modules.append((attn, name, linear, bit_attn))
+
+    # Shared expert (W8A16)
+    if hasattr(layer.mlp, 'shared_expert') and layer.mlp.shared_expert is not None:
+        shared_expert = layer.mlp.shared_expert
+        bit_share = qscheme['share'][0] if isinstance(qscheme['share'], (list, tuple)) else qscheme['share']
+        for name in ffn_filters:
+            if hasattr(shared_expert, name):
+                linear = getattr(shared_expert, name)
+                if isinstance(linear, nn.Linear):
+                    all_modules.append((shared_expert, name, linear, bit_share))
+
+    # MoE experts (已经是 BitPartitionedGroupMoE，不需要在这里处理)
+    # MoE 的 WxA16 转换在 construct_moe 中调用 WxA16BitPartitionedGroupMoE 完成
+
+    # 对收集的层进行 WxA16 转换
+    for parent, name, linear, bit in all_modules:
+        if bit == 0:
+            # 0-bit 直接置零，保持 nn.Linear
+            with torch.no_grad():
+                linear.weight.zero_()
+                if linear.bias is not None:
+                    linear.bias.zero_()
+            continue
+
+        print(f"    Converting {name}: {bit} bit")
+
+        # 转换为 WxA16Linear
+        wxa16_linear = wxa16_quantize_linear(
+            linear,
+            bit_width=bit,
+            group_size=group_size,
+            seed=seed + layer_idx,
+            rotation="qr",
+            keep_on_gpu=True,
+        )
+
+        # 原地替换
+        setattr(parent, name, wxa16_linear)
+
+        # 显式删除原始 fp16 权重
+        del linear
+        gc.collect()
+
+    tick_convert_end = time.time()
+    print(f"  Done WxA16 conversion: {tick_convert_end - tick_convert_start:.4f}s")
+
+    torch.cuda.empty_cache()
+    gc.collect()
+
+    return before_stats

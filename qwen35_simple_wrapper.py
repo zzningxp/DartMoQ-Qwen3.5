@@ -74,6 +74,9 @@ def construct_moe(model, moe_model_flag, layer, layer_idx, inp,
     import inspect
     from grouped_gemm_moe_adapter import convert_single_layer, is_grouped_gemm_moe_layer
 
+    # WxA16 flag
+    use_wxa16 = getattr(args, 'wxa16', False)
+
     # Convert this single layer first if needed
     if is_grouped_gemm_moe_layer(layer):
         print(f"  Converting layer {layer_idx} to traditional format...")
@@ -198,26 +201,40 @@ def construct_moe(model, moe_model_flag, layer, layer_idx, inp,
 
     tick0 = time.time()
     if_quant_attn = True
-    quant_layer_mix_precision(layer, layer_idx, if_quant_attn,
+
+    before_stats = None
+    if use_wxa16:
+        from dartmoq_utils import quant_layer_mix_precision_wxa16
+        before_stats = quant_layer_mix_precision_wxa16(layer, layer_idx, if_quant_attn,
+                                      n_experts, slice_expert_num,
+                                      hidden_states_inorm, hidden_states,
+                                      attention_mask, position_ids, position_embeddings,
+                                      qscheme, use_hybrid_moe, quantmode, seed=args.seed, group_size=GROUPSIZE)
+    else:
+        quant_layer_mix_precision(layer, layer_idx, if_quant_attn,
                               n_experts, slice_expert_num,
                               hidden_states_inorm, hidden_states,
                               attention_mask, position_ids, position_embeddings,
                               qscheme, use_hybrid_moe, quantmode, seed=args.seed)
+
     gc.collect()
     torch.cuda.empty_cache()
     tick1 = time.time()
     print(f"quant_layer_mix_precision layer {layer_idx} time: {tick1 - tick0:.4f}", flush=True)
 
     if moe_model_flag and is_moe_layer:
-        # 重组为 BitPartitionedGroupMoE
+        # 重组为 BitPartitionedGroupMoE (或 WxA16 版本)
         tick_restructure = time.time()
-        print(f"Restructuring to BitPartitionedGroupMoE (layer {layer_idx})...")
 
-        # 获取旧结构的引用，以便后续清理
-        old_mlp = layer.mlp
-
-        # 替换为新结构
-        layer.mlp = BitPartitionedGroupMoE.from_build_block(old_mlp, layer_metadata)
+        if use_wxa16:
+            print(f"Restructuring to WxA16BitPartitionedGroupMoE (layer {layer_idx})...")
+            from wxa16_bit_partitioned_moe import WxA16BitPartitionedGroupMoE
+            old_mlp = layer.mlp
+            layer.mlp = WxA16BitPartitionedGroupMoE.from_build_block(old_mlp, layer_metadata, group_size=GROUPSIZE)
+        else:
+            print(f"Restructuring to BitPartitionedGroupMoE (layer {layer_idx})...")
+            old_mlp = layer.mlp
+            layer.mlp = BitPartitionedGroupMoE.from_build_block(old_mlp, layer_metadata)
 
         # 显式清理旧结构，释放内存
         if hasattr(old_mlp, 'experts'):
@@ -253,7 +270,12 @@ def construct_moe(model, moe_model_flag, layer, layer_idx, inp,
         torch.cuda.empty_cache()
 
         tick_restructure_end = time.time()
-        print(f"Restructured in {tick_restructure_end - tick_restructure:.4f}s")
+        print(f"Restructured in {tick_restructure_end - tick_restructure:.4f}s", flush=True)
+
+    # ========== WxA16: 量化后存储空间统计 ==========
+    if use_wxa16 and before_stats is not None:
+        from wxa16_memory_stats import print_memory_stats_layer_after
+        print_memory_stats_layer_after(layer, layer_idx, before_stats, qscheme)
 
     moe_out = torch.zeros_like(hidden_states)
     for b_i in range(0, batchsize):

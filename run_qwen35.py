@@ -27,6 +27,7 @@ def main():
     parser.add_argument("--sequential-eval", action="store_true", default=False, help="Use sequential PPL evaluation")
     parser.add_argument("--quantmode", type=str, default="turboquant", choices=["gptq", "turboquant"], help="Quantization mode")
     parser.add_argument("--quant-layers", type=str, default=None, help="Only quantize specific layers (e.g., '0-5,8,10' for layers 0-5, 8, and 10; default: all layers)")
+    parser.add_argument("--wxa16", action="store_true", default=False, help="Use WxA16 real quantization (stored packed format, not fake quant)")
 
     args = parser.parse_args()
 
@@ -40,6 +41,7 @@ def main():
     print(f"Slices per expert: {args.slices}")
     print(f"Hybrid MoE: Yes (always enabled)")
     print(f"Quant mode: {args.quantmode}")
+    print(f"WxA16 real quantization: {'Yes' if args.wxa16 else 'No (fake quant)'}")
     print(f"CPU standby: {'Yes' if args.standby_layer_cpu else 'No'}")
     if args.quant_layers:
         print(f"Quantize layers: {args.quant_layers}")
