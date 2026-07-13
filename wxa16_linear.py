@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+import time
 
 from turboquant_utils.quantize import (
     turboquant_quantize_packed_full,
@@ -209,7 +210,8 @@ class WxA16Linear(nn.Module):
         # 打印详细时间（仅第一次，避免刷屏）
         if not hasattr(self, '_log_printed'):
             self._log_printed = True
-            print(f"  [WxA16Linear {self.bit_width}bit] forward total: {t_end - t_start:.4f}s, dequant: {t_dequant_end - t_dequant_start:.4f}s, gemm: {t_gemm_end - t_gemm_start:.4f}s")
+            print(f"  [WxA16Linear {self.bit_width}bit] forward total: {t_end - t_start:.4f}s, dequant: {t_dequant_end - t_dequant_start:.4f}s, gemm: {t_gemm_end - t_gemm_start:.4f}s", flush=True)
+            print(f"  [WxA16Linear {self.bit_width}bit] input shape: {x.shape}, output shape: {out.shape}, W_approx shape: {W_approx.shape}, norms shape: {self.norms.shape}", flush=True)
 
         return out.to(x_dtype)
 

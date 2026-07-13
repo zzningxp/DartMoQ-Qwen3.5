@@ -510,6 +510,7 @@ def quant_layer_mix_precision(layer, layer_idx, quant_attn, n_experts, slice_exp
                 attn_hidden_states, ffn_hidden_states, attention_mask, position_ids, position_embeddings,
                 qscheme, use_hybrid_moe, quantmode, seed=42):
     print(f"Quantize layer {layer_idx}")
+    tick_start = time.time()
     nsample = attn_hidden_states.shape[0]
     assert attn_hidden_states.shape[0] == ffn_hidden_states.shape[0], f"attn_hidden_states.shape: {attn_hidden_states.shape}, ffn_hidden_states.shape: {ffn_hidden_states.shape}"
 
@@ -759,6 +760,7 @@ def quant_layer_mix_precision(layer, layer_idx, quant_attn, n_experts, slice_exp
     torch.cuda.empty_cache()
     gc.collect()
 
+    print(f"  [DEBUG] quant_layer_mix_precision total time: {time.time() - tick_start:.4f}s")
 
 @torch.no_grad()
 def quant_layer_mix_precision_wxa16(layer, layer_idx, quant_attn, n_experts, slice_expert_num,
@@ -773,12 +775,20 @@ def quant_layer_mix_precision_wxa16(layer, layer_idx, quant_attn, n_experts, sli
     """
     print(f"Quantize layer {layer_idx} (WxA16 mode)")
 
+    # ========== 阶段 0: 量化前存储空间统计 ==========
+    tick_stats = time.time()
+    from wxa16_memory_stats import print_memory_stats_layer_before
+    before_stats = print_memory_stats_layer_before(layer, layer_idx)
+    print(f"  [DEBUG] print_memory_stats_layer_before time: {time.time() - tick_stats:.4f}s")
+
     # ========== 阶段 1: 正常 fake quant（保持现有逻辑不变） ==========
+    tick_fakequant = time.time()
     quant_layer_mix_precision(
         layer, layer_idx, quant_attn, n_experts, slice_expert_num,
         attn_hidden_states, ffn_hidden_states, attention_mask, position_ids, position_embeddings,
         qscheme, use_hybrid_moe, quantmode, seed=seed,
     )
+    print(f"  [DEBUG] quant_layer_mix_precision time: {time.time() - tick_fakequant:.4f}s")
 
     gc.collect()
     torch.cuda.empty_cache()
@@ -794,6 +804,7 @@ def quant_layer_mix_precision_wxa16(layer, layer_idx, quant_attn, n_experts, sli
     attn_filters = ['q_proj', 'k_proj', 'v_proj', 'o_proj', 'kv_a_proj_with_mqa', 'kv_b_proj']
 
     # 收集需要量化的层
+    tick_collect = time.time()
     all_modules = []
 
     # Attention 层 (W8A16)
@@ -826,19 +837,25 @@ def quant_layer_mix_precision_wxa16(layer, layer_idx, quant_attn, n_experts, sli
     # MoE experts (已经是 BitPartitionedGroupMoE，不需要在这里处理)
     # MoE 的 WxA16 转换在 construct_moe 中调用 WxA16BitPartitionedGroupMoE 完成
 
+    print(f"  [DEBUG] Collect {len(all_modules)} modules to convert: {time.time() - tick_collect:.4f}s")
+
     # 对收集的层进行 WxA16 转换
-    for parent, name, linear, bit in all_modules:
+    tick_convert_modules = time.time()
+    for i, (parent, name, linear, bit) in enumerate(all_modules):
+        tick_module = time.time()
         if bit == 0:
             # 0-bit 直接置零，保持 nn.Linear
             with torch.no_grad():
                 linear.weight.zero_()
                 if linear.bias is not None:
                     linear.bias.zero_()
+            print(f"    [{i+1}/{len(all_modules)}] {name}: 0-bit zeroed: {time.time() - tick_module:.4f}s")
             continue
 
-        print(f"    Converting {name}: {bit} bit")
+        print(f"    [{i+1}/{len(all_modules)}] Converting {name}: {bit} bit")
 
         # 转换为 WxA16Linear
+        tick_quantize = time.time()
         wxa16_linear = wxa16_quantize_linear(
             linear,
             bit_width=bit,
@@ -847,13 +864,19 @@ def quant_layer_mix_precision_wxa16(layer, layer_idx, quant_attn, n_experts, sli
             rotation="qr",
             keep_on_gpu=True,
         )
+        print(f"      wxa16_quantize_linear time: {time.time() - tick_quantize:.4f}s")
 
         # 原地替换
+        tick_replace = time.time()
         setattr(parent, name, wxa16_linear)
+        print(f"      setattr time: {time.time() - tick_replace:.4f}s")
 
         # 显式删除原始 fp16 权重
         del linear
         gc.collect()
+        print(f"    Done {name}: {time.time() - tick_module:.4f}s")
+
+    print(f"  [DEBUG] All modules converted: {time.time() - tick_convert_modules:.4f}s")
 
     tick_convert_end = time.time()
     print(f"  Done WxA16 conversion: {tick_convert_end - tick_convert_start:.4f}s")

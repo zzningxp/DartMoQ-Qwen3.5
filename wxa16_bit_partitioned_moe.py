@@ -31,10 +31,60 @@ class WxA16Weights(nn.Module):
         self.hidden_size = hidden_size
 
         # 实际的量化参数会在 later 填充
-        self.gate_up_packed = None
-        self.down_packed = None
+        self._gate_up_packed = None
+        self._down_packed = None
         self.gate_up_metadata = None
         self.down_metadata = None
+
+    @property
+    def gate_up_packed(self):
+        """从 registered buffers 重建 gate_up_packed 字典"""
+        if self._gate_up_packed is None:
+            # 从所有 gate_up_* 开头的 buffer 重建字典
+            self._gate_up_packed = {}
+            for name, param in self.named_buffers():
+                if name.startswith('gate_up_'):
+                    key = name[len('gate_up_'):]
+                    self._gate_up_packed[key] = param
+        return self._gate_up_packed
+
+    @gate_up_packed.setter
+    def gate_up_packed(self, value):
+        self._gate_up_packed = value
+
+    @property
+    def down_packed(self):
+        """从 registered buffers 重建 down_packed 字典"""
+        if self._down_packed is None:
+            # 从所有 down_* 开头的 buffer 重建字典
+            self._down_packed = {}
+            for name, param in self.named_buffers():
+                if name.startswith('down_'):
+                    key = name[len('down_'):]
+                    self._down_packed[key] = param
+        return self._down_packed
+
+    @down_packed.setter
+    def down_packed(self, value):
+        self._down_packed = value
+
+    def set_packed_data(self, gate_up_packed, down_packed):
+        """
+        设置 packed 数据并注册为 buffer，以便 state_dict 保存。
+        """
+        # Register gate_up packed data
+        if gate_up_packed is not None:
+            for key, value in gate_up_packed.items():
+                if isinstance(value, torch.Tensor):
+                    self.register_buffer(f"gate_up_{key}", value)
+            self._gate_up_packed = gate_up_packed
+
+        # Register down packed data
+        if down_packed is not None:
+            for key, value in down_packed.items():
+                if isinstance(value, torch.Tensor):
+                    self.register_buffer(f"down_{key}", value)
+            self._down_packed = down_packed
 
 
 class WxA16BitPartitionedGroupMoE(nn.Module):
@@ -252,18 +302,20 @@ class WxA16BitPartitionedGroupMoE(nn.Module):
 
                 # ========== WxA16: 反量化 + 推理 ==========
                 t_dequant_start = time.time()
-                # 需要用 packed 数据重建出该 expert 切片的权重
-                # 这里用简化方式：完整反量化然后切片
-                from turboquant_utils.quantize import turboquant_dequantize_packed
+                # 使用切片反量化，只反量化需要的部分（性能优化 768x）
+                from turboquant_utils.quantize import turboquant_dequantize_packed_rows, turboquant_dequantize_packed_cols
 
-                gate_up_full = turboquant_dequantize_packed(wxa16_weights.gate_up_packed, device=x.device)
-                down_full = turboquant_dequantize_packed(wxa16_weights.down_packed, device=x.device)
-
-                # 切片该 expert 的部分
-                e_gate_up = gate_up_full[2*start : 2*end]  # (2*actual_I_b, H)
-                e_down = down_full[:, start:end]           # (H, actual_I_b)
-
-                del gate_up_full, down_full
+                # 只反量化需要的行和列
+                e_gate_up = turboquant_dequantize_packed_rows(
+                    wxa16_weights.gate_up_packed,
+                    2*start, 2*end,
+                    device=x.device
+                )
+                e_down = turboquant_dequantize_packed_cols(
+                    wxa16_weights.down_packed,
+                    start, end,
+                    device=x.device
+                )
                 t_dequant_end = time.time()
                 time_dequant_total += t_dequant_end - t_dequant_start
 
@@ -300,6 +352,11 @@ class WxA16BitPartitionedGroupMoE(nn.Module):
         del flat_expert_indices, flat_expert_weights, flat_token_indices
         del idxs, sorted_experts, sorted_weights, sorted_tokens, tokens_per_expert
 
+        # 及时清理显存
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         t_compute_end = time.time()
         t4 = t_compute_end
 
@@ -309,9 +366,9 @@ class WxA16BitPartitionedGroupMoE(nn.Module):
         # 打印详细时间（仅第一次）
         if not hasattr(self, '_log_printed'):
             self._log_printed = True
-            print(f"  [WxA16BitPartitionedGroupMoE] forward total: {t5 - t0:.4f}s")
-            print(f"    init: {t1 - t0:.4f}s, shared: {t_shared_end - t_shared_start:.4f}s, router: {t_router_end - t_router_start:.4f}s")
-            print(f"    compute: {t_compute_end - t_compute_start:.4f}s (dequant: {time_dequant_total:.4f}s, gemm: {time_gemm_total:.4f}s)")
-            print(f"    reshape: {t5 - t4:.4f}s, active_experts: {active_experts_count}, active_bits: {active_bits_count}")
+            print(f"  [WxA16BitPartitionedGroupMoE] forward total: {t5 - t0:.4f}s", flush=True)
+            print(f"    init: {t1 - t0:.4f}s, shared: {t_shared_end - t_shared_start:.4f}s, router: {t_router_end - t_router_start:.4f}s", flush=True)
+            print(f"    compute: {t_compute_end - t_compute_start:.4f}s (dequant: {time_dequant_total:.4f}s, gemm: {time_gemm_total:.4f}s)", flush=True)
+            print(f"    reshape: {t5 - t4:.4f}s, active_experts: {active_experts_count}, active_bits: {active_bits_count}", flush=True)
 
         return result

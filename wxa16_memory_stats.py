@@ -107,31 +107,54 @@ def get_layer_memory_stats(layer, layer_idx: int) -> Dict:
     }
 
     # Attention 层统计
+    attn_layer = None
+    attn_type = None
     if hasattr(layer, 'self_attn'):
-        attn = layer.self_attn
+        attn_layer = layer.self_attn
+        attn_type = 'full'
     elif hasattr(layer, 'linear_attn'):
-        attn = layer.linear_attn
-    else:
-        attn = None
+        attn_layer = layer.linear_attn
+        attn_type = 'linear'
 
-    if attn is not None:
-        attn_names = ['q_proj', 'k_proj', 'v_proj', 'o_proj', 'kv_a_proj_with_mqa', 'kv_b_proj']
-        for name in attn_names:
-            if hasattr(attn, name):
-                module = getattr(attn, name)
-                prefix = f'attn.{name}'
-                if hasattr(module, 'get_memory_usage'):
-                    # WxA16Linear
-                    mem = get_wxa16_memory_stats(module, prefix)
-                    stats['attention'][f'{name}_total'] += mem['total_bytes']
-                    stats['attention'][f'{name}_orig'] += mem['orig_fp16_bytes']
-                    stats['attention'][f'{name}_bit'] = mem['bit_width']
-                elif isinstance(module, nn.Linear):
-                    # nn.Linear (fp16)
-                    mem = get_linear_memory_stats(module, prefix)
-                    stats['attention'][f'{name}_total'] += mem['total_bytes']
-                    stats['attention'][f'{name}_orig'] += mem['total_bytes']
-                    stats['attention'][f'{name}_bit'] = 16
+    if attn_layer is not None:
+        if attn_type == 'full':
+            # 标准注意力层
+            attn_names = ['q_proj', 'k_proj', 'v_proj', 'o_proj']
+            for name in attn_names:
+                if hasattr(attn_layer, name):
+                    module = getattr(attn_layer, name)
+                    prefix = f'attn.{name}'
+                    if hasattr(module, 'get_memory_usage'):
+                        # WxA16Linear
+                        mem = get_wxa16_memory_stats(module, prefix)
+                        stats['attention'][f'{name}_total'] += mem['total_bytes']
+                        stats['attention'][f'{name}_orig'] += mem['orig_fp16_bytes']
+                        stats['attention'][f'{name}_bit'] = mem['bit_width']
+                    elif isinstance(module, nn.Linear):
+                        # nn.Linear (fp16)
+                        mem = get_linear_memory_stats(module, prefix)
+                        stats['attention'][f'{name}_total'] += mem['total_bytes']
+                        stats['attention'][f'{name}_orig'] += mem['total_bytes']
+                        stats['attention'][f'{name}_bit'] = 16
+        elif attn_type == 'linear':
+            # 线性注意力层
+            attn_names = ['in_proj_qkv', 'in_proj_z', 'in_proj_b', 'in_proj_a', 'out_proj']
+            for name in attn_names:
+                if hasattr(attn_layer, name):
+                    module = getattr(attn_layer, name)
+                    prefix = f'attn.{name}'
+                    if hasattr(module, 'get_memory_usage'):
+                        # WxA16Linear
+                        mem = get_wxa16_memory_stats(module, prefix)
+                        stats['attention'][f'{name}_total'] += mem['total_bytes']
+                        stats['attention'][f'{name}_orig'] += mem['orig_fp16_bytes']
+                        stats['attention'][f'{name}_bit'] = mem['bit_width']
+                    elif isinstance(module, nn.Linear):
+                        # nn.Linear (fp16)
+                        mem = get_linear_memory_stats(module, prefix)
+                        stats['attention'][f'{name}_total'] += mem['total_bytes']
+                        stats['attention'][f'{name}_orig'] += mem['total_bytes']
+                        stats['attention'][f'{name}_bit'] = 16
 
     # Shared expert 统计
     if hasattr(layer.mlp, 'shared_expert') and layer.mlp.shared_expert is not None:
@@ -179,29 +202,56 @@ def print_memory_stats_layer_before(layer, layer_idx: int):
     [Layer X] Shared:     gate: XXX MB, up: XXX MB, down: XXX MB, total: XXX MB
     [Layer X] Router:     1bit: XXX MB, 2bit: XXX MB, 4bit: XXX MB, 8bit: XXX MB (但量化前都是 16bit)
     """
-    print(f"\n{'='*80}")
-    print(f"[Layer {layer_idx}] Quantization PREPARE - Memory Stats (fp16 baseline)")
-    print(f"{'='*80}")
+    print(f"\n{'='*80}", flush=True)
+    print(f"[Layer {layer_idx}] Quantization PREPARE - Memory Stats (fp16 baseline)", flush=True)
+    print(f"{'='*80}", flush=True)
 
     # Attention 统计
     attn_total = 0
+    attn_layer = None
+    attn_type = None
+
+    # 调试：打印 layer 的所有属性
+    print(f"[DEBUG] Layer {layer_idx} attributes: {dir(layer)}", flush=True)
+
     if hasattr(layer, 'self_attn'):
-        attn = layer.self_attn
+        attn_layer = layer.self_attn
+        attn_type = 'full'
+        print(f"[DEBUG] Found self_attn, attributes: {dir(attn_layer)}", flush=True)
     elif hasattr(layer, 'linear_attn'):
-        attn = layer.linear_attn
+        attn_layer = layer.linear_attn
+        attn_type = 'linear'
+        print(f"[DEBUG] Found linear_attn, attributes: {dir(attn_layer)}", flush=True)
     else:
-        attn = None
+        # 尝试其他可能的属性名
+        print(f"[DEBUG] No self_attn/linear_attn, checking all attrs...", flush=True)
+        for attr in dir(layer):
+            if 'attn' in attr.lower() or 'attention' in attr.lower():
+                print(f"[DEBUG] Found possible attention attr: {attr}", flush=True)
 
-    if attn is not None:
-        attn_names = ['q_proj', 'k_proj', 'v_proj', 'o_proj']
-        for name in attn_names:
-            if hasattr(attn, name):
-                module = getattr(attn, name)
-                if isinstance(module, nn.Linear):
-                    mem = get_linear_memory_stats(module)
-                    attn_total += mem['total_bytes']
+    if attn_layer is not None:
+        if attn_type == 'full':
+            # 标准注意力层
+            attn_names = ['q_proj', 'k_proj', 'v_proj', 'o_proj']
+            for name in attn_names:
+                if hasattr(attn_layer, name):
+                    module = getattr(attn_layer, name)
+                    if isinstance(module, nn.Linear):
+                        mem = get_linear_memory_stats(module)
+                        attn_total += mem['total_bytes']
+                        print(f"[DEBUG] Added {name}: {mem['total_bytes']} bytes", flush=True)
+        elif attn_type == 'linear':
+            # 线性注意力层
+            attn_names = ['in_proj_qkv', 'in_proj_z', 'in_proj_b', 'in_proj_a', 'out_proj']
+            for name in attn_names:
+                if hasattr(attn_layer, name):
+                    module = getattr(attn_layer, name)
+                    if isinstance(module, nn.Linear):
+                        mem = get_linear_memory_stats(module)
+                        attn_total += mem['total_bytes']
+                        print(f"[DEBUG] Added {name}: {mem['total_bytes']} bytes", flush=True)
 
-    print(f"[Layer {layer_idx}] {'Attention':<12} {format_bytes(attn_total):>12} (16-bit fp16)")
+    print(f"[Layer {layer_idx}] {'Attention':<12} {format_bytes(attn_total):>12} (16-bit fp16, {attn_type if attn_type else 'unknown'})", flush=True)
 
     # Shared expert 统计
     shared_gate = 0
@@ -217,20 +267,53 @@ def print_memory_stats_layer_before(layer, layer_idx: int):
             shared_down = get_linear_memory_stats(shared.down_proj)['total_bytes']
 
     shared_total = shared_gate + shared_up + shared_down
-    print(f"[Layer {layer_idx}] {'Shared':<12} gate:{format_bytes(shared_gate):>10}, up:{format_bytes(shared_up):>10}, down:{format_bytes(shared_down):>10}, total:{format_bytes(shared_total):>10} (16-bit fp16)")
+    print(f"[Layer {layer_idx}] {'Shared':<12} gate:{format_bytes(shared_gate):>10}, up:{format_bytes(shared_up):>10}, down:{format_bytes(shared_down):>10}, total:{format_bytes(shared_total):>10} (16-bit fp16)", flush=True)
 
     # Router expert 统计 - 从原始结构计算 (量化前)
     router_total = 0
     router_gate = 0
     router_up = 0
     router_down = 0
+    num_experts = 0
+
+    # 调试：打印 layer.mlp 的结构
+    print(f"[DEBUG] Layer {layer_idx} mlp attributes: {dir(layer.mlp)}", flush=True)
+    if hasattr(layer.mlp, 'experts'):
+        experts = layer.mlp.experts
+        print(f"[DEBUG] experts type: {type(experts)}, has gate_up_proj: {hasattr(experts, 'gate_up_proj')}", flush=True)
+        if hasattr(experts, 'gate_up_proj'):
+            print(f"[DEBUG] gate_up_proj shape: {experts.gate_up_proj.shape}", flush=True)
 
     # 检查原始 MoE 结构
     if hasattr(layer.mlp, 'experts'):
         experts = layer.mlp.experts
-        # TraditionalMoEWrapper / DartMoQHybridWrapper
-        if hasattr(experts, '__len__'):
+
+        # 检查是否是 grouped_gemm 格式 (gate_up_proj 和 down_proj 是大的 tensor)
+        if hasattr(experts, 'gate_up_proj') and hasattr(experts, 'down_proj'):
+            # Grouped GEMM 格式
+            gate_up_proj = experts.gate_up_proj
+            down_proj = experts.down_proj
+            num_experts = gate_up_proj.shape[0]
+            intermediate_size = gate_up_proj.shape[1] // 2
+            hidden_size = gate_up_proj.shape[2]
+
+            # 直接计算字节数: num_experts * (gate + up + down)
+            # gate 和 up 每个都是 intermediate_size * hidden_size
+            # down 是 hidden_size * intermediate_size
+            # fp16 = 2 bytes
+            per_expert_gate_bytes = intermediate_size * hidden_size * 2
+            per_expert_up_bytes = intermediate_size * hidden_size * 2
+            per_expert_down_bytes = hidden_size * intermediate_size * 2
+
+            router_gate = num_experts * per_expert_gate_bytes
+            router_up = num_experts * per_expert_up_bytes
+            router_down = num_experts * per_expert_down_bytes
+            print(f"[DEBUG] Grouped GEMM format: {num_experts} experts, gate bytes: {router_gate}", flush=True)
+
+        elif hasattr(experts, '__len__'):
+            # TraditionalMoEWrapper / DartMoQHybridWrapper
             num_experts = len(experts)
+            print(f"[DEBUG] Traditional format: {num_experts} experts", flush=True)
             if num_experts > 0:
                 # 看第一个 expert 的结构
                 first_exp = experts[0]
@@ -266,12 +349,13 @@ def print_memory_stats_layer_before(layer, layer_idx: int):
                                         router_down += bytes_val
 
     router_total = router_gate + router_up + router_down
-    print(f"[Layer {layer_idx}] {'Router':<12} gate:{format_bytes(router_gate):>10}, up:{format_bytes(router_up):>10}, down:{format_bytes(router_down):>10}, total:{format_bytes(router_total):>10} (16-bit fp16 baseline)")
+    router_label = f"({num_experts} experts)" if num_experts > 0 else "baseline"
+    print(f"[Layer {layer_idx}] {'Router':<12} gate:{format_bytes(router_gate):>10}, up:{format_bytes(router_up):>10}, down:{format_bytes(router_down):>10}, total:{format_bytes(router_total):>10} (16-bit fp16 {router_label})", flush=True)
 
     # 总计
     layer_total = attn_total + shared_total + router_total
-    print(f"[Layer {layer_idx}] {'TOTAL':<12} {format_bytes(layer_total):>12}")
-    print(f"{'='*80}\n")
+    print(f"[Layer {layer_idx}] {'TOTAL':<12} {format_bytes(layer_total):>12}", flush=True)
+    print(f"{'='*80}\n", flush=True)
 
     return {
         'layer_idx': layer_idx,
@@ -284,6 +368,7 @@ def print_memory_stats_layer_before(layer, layer_idx: int):
         'router_up': router_up,
         'router_down': router_down,
         'router_total': router_total,
+        'num_experts': num_experts,
         'total': layer_total,
     }
 
@@ -297,9 +382,9 @@ def print_memory_stats_layer_after(layer, layer_idx: int, before_stats: Dict, qs
     [Layer X] Shared:     gate: XXX MB (X-bit), up: XXX MB (X-bit), down: XXX MB (X-bit), total: XXX MB -> X.Xx compression
     [Layer X] Router:     1bit: XXX MB, 2bit: XXX MB, 4bit: XXX MB, 8bit: XXX MB, total: XXX MB -> X.Xx compression
     """
-    print(f"\n{'='*80}")
-    print(f"[Layer {layer_idx}] WxA16 Quantization DONE - Memory Stats")
-    print(f"{'='*80}")
+    print(f"\n{'='*80}", flush=True)
+    print(f"[Layer {layer_idx}] WxA16 Quantization DONE - Memory Stats", flush=True)
+    print(f"{'='*80}", flush=True)
 
     # Attention 统计
     attn_total = 0
@@ -308,26 +393,41 @@ def print_memory_stats_layer_after(layer, layer_idx: int, before_stats: Dict, qs
     if qscheme and 'attn' in qscheme:
         attn_bit = qscheme['attn'][0] if isinstance(qscheme['attn'], (list, tuple)) else qscheme['attn']
 
+    attn_layer = None
+    attn_type = None
     if hasattr(layer, 'self_attn'):
-        attn = layer.self_attn
+        attn_layer = layer.self_attn
+        attn_type = 'full'
     elif hasattr(layer, 'linear_attn'):
-        attn = layer.linear_attn
-    else:
-        attn = None
+        attn_layer = layer.linear_attn
+        attn_type = 'linear'
 
-    if attn is not None:
-        attn_names = ['q_proj', 'k_proj', 'v_proj', 'o_proj']
-        for name in attn_names:
-            if hasattr(attn, name):
-                module = getattr(attn, name)
-                if hasattr(module, 'get_memory_usage'):
-                    mem = module.get_memory_usage()
-                    attn_total += mem['total_bytes']
-                elif isinstance(module, nn.Linear):
-                    attn_total += get_linear_memory_stats(module)['total_bytes']
+    if attn_layer is not None:
+        if attn_type == 'full':
+            # 标准注意力层
+            attn_names = ['q_proj', 'k_proj', 'v_proj', 'o_proj']
+            for name in attn_names:
+                if hasattr(attn_layer, name):
+                    module = getattr(attn_layer, name)
+                    if hasattr(module, 'get_memory_usage'):
+                        mem = module.get_memory_usage()
+                        attn_total += mem['total_bytes']
+                    elif isinstance(module, nn.Linear):
+                        attn_total += get_linear_memory_stats(module)['total_bytes']
+        elif attn_type == 'linear':
+            # 线性注意力层
+            attn_names = ['in_proj_qkv', 'in_proj_z', 'in_proj_b', 'in_proj_a', 'out_proj']
+            for name in attn_names:
+                if hasattr(attn_layer, name):
+                    module = getattr(attn_layer, name)
+                    if hasattr(module, 'get_memory_usage'):
+                        mem = module.get_memory_usage()
+                        attn_total += mem['total_bytes']
+                    elif isinstance(module, nn.Linear):
+                        attn_total += get_linear_memory_stats(module)['total_bytes']
 
     attn_compression = attn_orig / attn_total if attn_total > 0 else 1.0
-    print(f"[Layer {layer_idx}] {'Attention':<12} {format_bytes(attn_total):>12} ({attn_bit}-bit) -> {attn_compression:.2f}x compression")
+    print(f"[Layer {layer_idx}] {'Attention':<12} {format_bytes(attn_total):>12} ({attn_bit}-bit, {attn_type if attn_type else 'unknown'}) -> {attn_compression:.2f}x compression", flush=True)
 
     # Shared expert 统计
     shared_gate = 0
@@ -370,7 +470,7 @@ def print_memory_stats_layer_after(layer, layer_idx: int, before_stats: Dict, qs
     shared_total_orig = before_stats['shared_total']
     shared_compression = shared_total_orig / shared_total if shared_total > 0 else 1.0
 
-    print(f"[Layer {layer_idx}] {'Shared':<12} gate:{format_bytes(shared_gate):>10}({shared_gate_bit}-bit), up:{format_bytes(shared_up):>10}({shared_up_bit}-bit), down:{format_bytes(shared_down):>10}({shared_down_bit}-bit), total:{format_bytes(shared_total):>10} -> {shared_compression:.2f}x compression")
+    print(f"[Layer {layer_idx}] {'Shared':<12} gate:{format_bytes(shared_gate):>10}({shared_gate_bit}-bit), up:{format_bytes(shared_up):>10}({shared_up_bit}-bit), down:{format_bytes(shared_down):>10}({shared_down_bit}-bit), total:{format_bytes(shared_total):>10} -> {shared_compression:.2f}x compression", flush=True)
 
     # Router expert 统计 - 从 WxA16BitPartitionedGroupMoE 结构计算
     router_total = 0
@@ -413,15 +513,15 @@ def print_memory_stats_layer_after(layer, layer_idx: int, before_stats: Dict, qs
         router_bit_strs.append(f"{bit}bit:{format_bytes(router_by_bit[bit]):>10}")
     router_bit_str = ", ".join(router_bit_strs)
 
-    print(f"[Layer {layer_idx}] {'Router':<12} {router_bit_str}, total:{format_bytes(router_total):>10} -> {router_compression:.2f}x compression")
+    print(f"[Layer {layer_idx}] {'Router':<12} {router_bit_str}, total:{format_bytes(router_total):>10} -> {router_compression:.2f}x compression", flush=True)
 
     # 总计
     layer_total = attn_total + shared_total + router_total
     layer_total_orig = before_stats['total']
     layer_compression = layer_total_orig / layer_total if layer_total > 0 else 1.0
 
-    print(f"[Layer {layer_idx}] {'TOTAL':<12} {format_bytes(layer_total):>12} (orig {format_bytes(layer_total_orig):>12}) -> {layer_compression:.2f}x compression")
-    print(f"{'='*80}\n")
+    print(f"[Layer {layer_idx}] {'TOTAL':<12} {format_bytes(layer_total):>12} (orig {format_bytes(layer_total_orig):>12}) -> {layer_compression:.2f}x compression", flush=True)
+    print(f"{'='*80}\n", flush=True)
 
     return {
         'layer_idx': layer_idx,

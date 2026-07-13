@@ -260,9 +260,9 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
             torch.cuda.empty_cache()
 
     # 打印全局时间统计
-    print(f"\n  [Eval Global Stats]")
-    print(f"    Total move time: {total_time_move:.2f}s")
-    print(f"    Total forward time: {total_time_forward:.2f}s")
+    print(f"\n  [Eval Global Stats]", flush=True)
+    print(f"    Total move time: {total_time_move:.2f}s", flush=True)
+    print(f"    Total forward time: {total_time_forward:.2f}s", flush=True)
 
     # Final norm and lm_head - process in batches of 4
     print("Processing final norm and lm_head...")

@@ -515,3 +515,216 @@ def turboquant_dequantize_packed(packed_data: dict, device: Optional[torch.devic
         W_approx[:, g_start:g_end] = W_g_approx * norms_g
 
     return W_approx.to(orig_dtype)
+
+
+@torch.no_grad()
+def turboquant_dequantize_packed_rows(
+    packed_data: dict,
+    row_start: int,
+    row_end: int,
+    device: Optional[torch.device] = None,
+) -> torch.Tensor:
+    """只反量化指定行范围 [row_start:row_end, :]
+
+    用于高效切片 gate_up 权重。
+
+    Args:
+        packed_data: `turboquant_quantize_packed_full()` 的返回值
+        row_start: 起始行（包含）
+        row_end: 结束行（不包含）
+        device: 目标设备
+
+    Returns:
+        W_approx_slice: 反量化后的权重切片，形状为 (row_end-row_start, N)
+    """
+    # 提取数据
+    indices_packed = packed_data["indices_packed"]
+    codebook = packed_data["codebook"]
+    norms = packed_data["norms"]
+    seed = packed_data["seed"]
+    group_size = packed_data["group_size"]
+    shape = packed_data["shape"]
+    bit_width = packed_data["bit_width"]
+    rotation = packed_data.get("rotation", "qr")
+    orig_dtype_str = packed_data.get("orig_dtype", "torch.float16")
+
+    # 解析原始 dtype
+    orig_dtype = getattr(torch, orig_dtype_str.split(".")[-1])
+
+    # 确定设备
+    if device is None:
+        device = indices_packed.device
+    else:
+        indices_packed = indices_packed.to(device)
+        norms = norms.to(device)
+    codebook = codebook.to(device)
+
+    M, N = shape
+
+    # 边界检查
+    row_start = max(0, row_start)
+    row_end = min(M, row_end)
+    if row_start >= row_end:
+        return torch.zeros((0, N), dtype=orig_dtype, device=device)
+
+    # 只切片需要的行！
+    indices_packed_slice = indices_packed[row_start:row_end]  # (row_end-row_start, packed_N)
+
+    # 解包索引（只解包切片的行）
+    full_indices_slice = unpack_nbit(indices_packed_slice, bit_width, N)  # (row_end-row_start, N)
+
+    # 切片 norms
+    if norms.dim() == 1:
+        norms_slice = norms[row_start:row_end].unsqueeze(1)  # (row_end-row_start, 1)
+    else:
+        norms_slice = norms[row_start:row_end]  # (row_end-row_start, n_groups)
+
+    # 反量化
+    num_rows = row_end - row_start
+    W_approx = torch.zeros((num_rows, N), dtype=torch.float32, device=device)
+
+    # 按分组反量化
+    group_idx = 0
+    for g_start in range(0, N, group_size):
+        g_end = min(g_start + group_size, N)
+        g_dim = g_end - g_start
+
+        # 提取当前分组的索引和范数
+        indices_g = full_indices_slice[:, g_start:g_end]
+        norms_g = norms_slice[:, group_idx].unsqueeze(1)
+        group_idx += 1
+
+        # 从码本还原
+        Y_quant_scaled = codebook[indices_g]
+
+        # 逆缩放
+        scale = math.sqrt(g_dim)
+        Y_unscaled = Y_quant_scaled / scale
+
+        # 逆旋转
+        if rotation == "none":
+            W_g_approx = Y_unscaled
+        elif rotation == "hadamard":
+            W_g_approx = hadamard_rotate_inverse(Y_unscaled, seed=seed + g_start)
+        else:  # qr
+            Pi = generate_rotation_matrix(g_dim, seed=seed + g_start).to(device)
+            W_g_approx = Y_unscaled @ Pi
+
+        # 恢复原始尺度
+        W_approx[:, g_start:g_end] = W_g_approx * norms_g
+
+    return W_approx.to(orig_dtype)
+
+
+@torch.no_grad()
+def turboquant_dequantize_packed_cols(
+    packed_data: dict,
+    col_start: int,
+    col_end: int,
+    device: Optional[torch.device] = None,
+) -> torch.Tensor:
+    """只反量化指定列范围 [:, col_start:col_end]
+
+    用于高效切片 down 权重。
+
+    Args:
+        packed_data: `turboquant_quantize_packed_full()` 的返回值
+        col_start: 起始列（包含）
+        col_end: 结束列（不包含）
+        device: 目标设备
+
+    Returns:
+        W_approx_slice: 反量化后的权重切片，形状为 (M, col_end-col_start)
+    """
+    # 提取数据
+    indices_packed = packed_data["indices_packed"]
+    codebook = packed_data["codebook"]
+    norms = packed_data["norms"]
+    seed = packed_data["seed"]
+    group_size = packed_data["group_size"]
+    shape = packed_data["shape"]
+    bit_width = packed_data["bit_width"]
+    rotation = packed_data.get("rotation", "qr")
+    orig_dtype_str = packed_data.get("orig_dtype", "torch.float16")
+
+    # 解析原始 dtype
+    orig_dtype = getattr(torch, orig_dtype_str.split(".")[-1])
+
+    # 确定设备
+    if device is None:
+        device = indices_packed.device
+    else:
+        indices_packed = indices_packed.to(device)
+        norms = norms.to(device)
+    codebook = codebook.to(device)
+
+    M, N = shape
+
+    # 边界检查
+    col_start = max(0, col_start)
+    col_end = min(N, col_end)
+    if col_start >= col_end:
+        return torch.zeros((M, 0), dtype=orig_dtype, device=device)
+
+    # 确定哪些 groups 包含我们需要的列
+    g_start_first = (col_start // group_size) * group_size
+    g_end_last = ((col_end + group_size - 1) // group_size) * group_size
+    g_end_last = min(g_end_last, N)
+
+    # 完整解包，但之后只处理相关 groups
+    full_indices = unpack_nbit(indices_packed, bit_width, N)
+
+    # 确保 norms 是二维的
+    if norms.dim() == 1:
+        norms = norms.unsqueeze(1)
+
+    # 反量化
+    num_cols = col_end - col_start
+    W_approx = torch.zeros((M, num_cols), dtype=torch.float32, device=device)
+
+    # 只处理相关的 groups
+    group_idx = g_start_first // group_size
+    output_col_offset = 0
+
+    for g_start in range(g_start_first, g_end_last, group_size):
+        g_end = min(g_start + group_size, N)
+        g_dim = g_end - g_start
+
+        # 计算当前 group 和目标列范围的交集
+        out_g_start = max(0, g_start - col_start)
+        out_g_end = min(g_end - col_start, num_cols)
+
+        if out_g_start >= out_g_end:
+            group_idx += 1
+            continue
+
+        # 提取当前分组的索引和范数
+        indices_g = full_indices[:, g_start:g_end]
+        norms_g = norms[:, group_idx].unsqueeze(1)
+        group_idx += 1
+
+        # 从码本还原（完整 group）
+        Y_quant_scaled = codebook[indices_g]
+
+        # 逆缩放
+        scale = math.sqrt(g_dim)
+        Y_unscaled = Y_quant_scaled / scale
+
+        # 逆旋转
+        if rotation == "none":
+            W_g_approx = Y_unscaled
+        elif rotation == "hadamard":
+            W_g_approx = hadamard_rotate_inverse(Y_unscaled, seed=seed + g_start)
+        else:  # qr
+            Pi = generate_rotation_matrix(g_dim, seed=seed + g_start).to(device)
+            W_g_approx = Y_unscaled @ Pi
+
+        # 恢复原始尺度
+        W_g_approx_scaled = W_g_approx * norms_g
+
+        # 只保留需要的列切片
+        in_g_start = max(0, col_start - g_start)
+        in_g_end = min(col_end - g_start, g_dim)
+        W_approx[:, out_g_start:out_g_end] = W_g_approx_scaled[:, in_g_start:in_g_end]
+
+    return W_approx.to(orig_dtype)
