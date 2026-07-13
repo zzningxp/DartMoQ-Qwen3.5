@@ -1347,7 +1347,7 @@ def test_global_dp_utils():
     n_experts = 8
     slice_expert_num = 8
 
-    bits = [0, 1, 2, 3, 4]
+    bits = [0, 1, 2, 4]
 
     # Generate random expert activation rates - some high, some low
     expert_activation_rates = np.array([0.25, 0.2, 0.15, 0.1, 0.1, 0.08, 0.07, 0.05])

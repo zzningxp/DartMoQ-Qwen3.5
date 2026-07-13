@@ -95,7 +95,7 @@ def reconstruct_moe_from_existing(model, layer, layer_idx, inps,
             outlier_bits = {probe_bit}
         else:
             # Always include 0bit
-            outlier_bits = {0, 1, 2, 3, 4}
+            outlier_bits = {0, 1, 2, 4}
         outlier_label = args.rank_mode if turboquant_outlier_mode else quantmode
         print(f"simulate {outlier_label} outlier_bits {outlier_bits}")
 
@@ -198,7 +198,7 @@ def reconstruct_moe_from_existing(model, layer, layer_idx, inps,
             expert_energy_list.append(energy.detach().cpu().float().numpy())
 
         # Always include 0bit
-        energy_bits = [0, 1, 2, 3, 4]
+        energy_bits = [0, 1, 2, 4]
         dpscheme_list, all_rates_arr = enum_optimal_m_scheme_energy_global_fast(
             expert_energy_list,
             expert_activation_rates,
