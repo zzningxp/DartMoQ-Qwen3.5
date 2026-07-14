@@ -542,6 +542,8 @@ EXPORT_HEADERS = {
 def _format_value(field: str, value) -> str:
     if field == "error":
         return ""
+    if field == "git_hash":  # git_hash 看起来像科学计数法，不做数值格式化
+        return str(value).replace("\t", " ")
     text = str(value)
     if NUMERIC_RE.fullmatch(text):
         try:

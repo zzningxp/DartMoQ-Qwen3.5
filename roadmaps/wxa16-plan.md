@@ -46,6 +46,9 @@
 
         方案A：在 WxA16BitPartitionedGroupMoE.from_build_block 阶段，就把所有需要的旋转矩阵预生成好，存起来
         方案B：实现一个简单的 LRU 缓存
+
+            nice，测试通过。wiki 150 batch 推理一层速度从 30s 提高到 26s，c4 batch 推理一层速度从 47s 提高到 41s。
+
         🟡 优化点2：Python 循环开销
         当前问题：
 

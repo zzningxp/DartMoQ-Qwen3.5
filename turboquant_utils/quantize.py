@@ -524,9 +524,11 @@ def turboquant_dequantize_packed_rows(
     row_end: int,
     device: Optional[torch.device] = None,
 ) -> torch.Tensor:
-    """只反量化指定行范围 [row_start:row_end, :]
+    """只反量化指定行范围 [row_start:row_end, :]（优化2版本）
 
-    用于高效切片 gate_up 权重。
+    优化2：减少 Python 循环开销！
+    - 预先获取所有旋转矩阵（一次性）
+    - 向量化更多操作
 
     Args:
         packed_data: `turboquant_quantize_packed_full()` 的返回值
@@ -583,23 +585,40 @@ def turboquant_dequantize_packed_rows(
     num_rows = row_end - row_start
     W_approx = torch.zeros((num_rows, N), dtype=torch.float32, device=device)
 
-    # 按分组反量化
-    group_idx = 0
-    for g_start in range(0, N, group_size):
-        g_end = min(g_start + group_size, N)
-        g_dim = g_end - g_start
+    # 优化2：预先计算 group 边界和旋转矩阵
+    n_groups = (N + group_size - 1) // group_size
+    g_starts = [g for g in range(0, N, group_size)]
+    g_ends = [min(g + group_size, N) for g in g_starts]
+    g_dims = [g - g_start for g_start, g in zip(g_starts, g_ends)]
+
+    # 预先获取所有需要的旋转矩阵（减少 Python 循环内的开销）
+    Pis = []
+    scales = []
+    for i in range(n_groups):
+        g_dim = g_dims[i]
+        scale = math.sqrt(g_dim)
+        scales.append(scale)
+        if rotation == "qr":
+            Pi = generate_rotation_matrix(g_dim, seed + g_starts[i], device=device)
+            Pis.append(Pi)
+        else:
+            Pis.append(None)
+
+    # 优化后的循环：减少循环内的操作
+    for group_idx in range(n_groups):
+        g_start = g_starts[group_idx]
+        g_end = g_ends[group_idx]
+        g_dim = g_dims[group_idx]
 
         # 提取当前分组的索引和范数
-        indices_g = full_indices_slice[:, g_start:g_end]
-        norms_g = norms_slice[:, group_idx].unsqueeze(1)
-        group_idx += 1
+        indices_g = full_indices_slice[:, g_start:g_end]  # (num_rows, g_dim)
+        norms_g = norms_slice[:, group_idx].unsqueeze(1)  # (num_rows, 1)
 
         # 从码本还原
         Y_quant_scaled = codebook[indices_g]
 
         # 逆缩放
-        scale = math.sqrt(g_dim)
-        Y_unscaled = Y_quant_scaled / scale
+        Y_unscaled = Y_quant_scaled / scales[group_idx]
 
         # 逆旋转
         if rotation == "none":
@@ -607,8 +626,7 @@ def turboquant_dequantize_packed_rows(
         elif rotation == "hadamard":
             W_g_approx = hadamard_rotate_inverse(Y_unscaled, seed=seed + g_start)
         else:  # qr
-            Pi = generate_rotation_matrix(g_dim, seed=seed + g_start, device=device)
-            W_g_approx = Y_unscaled @ Pi
+            W_g_approx = Y_unscaled @ Pis[group_idx]
 
         # 恢复原始尺度
         W_approx[:, g_start:g_end] = W_g_approx * norms_g
@@ -623,9 +641,9 @@ def turboquant_dequantize_packed_cols(
     col_end: int,
     device: Optional[torch.device] = None,
 ) -> torch.Tensor:
-    """只反量化指定列范围 [:, col_start:col_end]
+    """只反量化指定列范围 [:, col_start:col_end]（优化2版本）
 
-    用于高效切片 down 权重。
+    优化2：减少 Python 循环开销！
 
     Args:
         packed_data: `turboquant_quantize_packed_full()` 的返回值
@@ -682,9 +700,16 @@ def turboquant_dequantize_packed_cols(
     num_cols = col_end - col_start
     W_approx = torch.zeros((M, num_cols), dtype=torch.float32, device=device)
 
-    # 只处理相关的 groups
-    group_idx = g_start_first // group_size
-    output_col_offset = 0
+    # 优化2：预先计算需要处理的 group 信息
+    g_starts = []
+    g_ends = []
+    g_dims = []
+    out_g_starts = []
+    out_g_ends = []
+    in_g_starts = []
+    in_g_ends = []
+    Pis = []
+    scales = []
 
     for g_start in range(g_start_first, g_end_last, group_size):
         g_end = min(g_start + group_size, N)
@@ -695,20 +720,46 @@ def turboquant_dequantize_packed_cols(
         out_g_end = min(g_end - col_start, num_cols)
 
         if out_g_start >= out_g_end:
-            group_idx += 1
             continue
+
+        g_starts.append(g_start)
+        g_ends.append(g_end)
+        g_dims.append(g_dim)
+        out_g_starts.append(out_g_start)
+        out_g_ends.append(out_g_end)
+        in_g_starts.append(max(0, col_start - g_start))
+        in_g_ends.append(min(col_end - g_start, g_dim))
+
+        # 预先获取旋转矩阵
+        scale = math.sqrt(g_dim)
+        scales.append(scale)
+        if rotation == "qr":
+            Pi = generate_rotation_matrix(g_dim, seed + g_start, device=device)
+            Pis.append(Pi)
+        else:
+            Pis.append(None)
+
+    # 优化后的循环
+    for i in range(len(g_starts)):
+        g_start = g_starts[i]
+        g_end = g_ends[i]
+        g_dim = g_dims[i]
+        out_g_start = out_g_starts[i]
+        out_g_end = out_g_ends[i]
+        in_g_start = in_g_starts[i]
+        in_g_end = in_g_ends[i]
+
+        group_idx = g_start // group_size
 
         # 提取当前分组的索引和范数
         indices_g = full_indices[:, g_start:g_end]
         norms_g = norms[:, group_idx].unsqueeze(1)
-        group_idx += 1
 
         # 从码本还原（完整 group）
         Y_quant_scaled = codebook[indices_g]
 
         # 逆缩放
-        scale = math.sqrt(g_dim)
-        Y_unscaled = Y_quant_scaled / scale
+        Y_unscaled = Y_quant_scaled / scales[i]
 
         # 逆旋转
         if rotation == "none":
@@ -716,15 +767,12 @@ def turboquant_dequantize_packed_cols(
         elif rotation == "hadamard":
             W_g_approx = hadamard_rotate_inverse(Y_unscaled, seed=seed + g_start)
         else:  # qr
-            Pi = generate_rotation_matrix(g_dim, seed=seed + g_start, device=device)
-            W_g_approx = Y_unscaled @ Pi
+            W_g_approx = Y_unscaled @ Pis[i]
 
         # 恢复原始尺度
         W_g_approx_scaled = W_g_approx * norms_g
 
         # 只保留需要的列切片
-        in_g_start = max(0, col_start - g_start)
-        in_g_end = min(col_end - g_start, g_dim)
         W_approx[:, out_g_start:out_g_end] = W_g_approx_scaled[:, in_g_start:in_g_end]
 
     return W_approx.to(orig_dtype)
