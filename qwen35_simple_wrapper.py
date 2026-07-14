@@ -123,11 +123,11 @@ def construct_moe(model, moe_model_flag, layer, layer_idx, inp,
                     attn_kwargs = {
                         'hidden_states': batch_hidden
                     }
-                    if 'attention_mask' in forward_signature.parameters and attention_mask is not None:
+                    if 'attention_mask' in forward_signature.parameters:
                         attn_kwargs['attention_mask'] = attention_mask
-                    if 'position_ids' in forward_signature.parameters and position_ids is not None:
+                    if 'position_ids' in forward_signature.parameters:
                         attn_kwargs['position_ids'] = position_ids
-                    if 'position_embeddings' in forward_signature.parameters and position_embeddings is not None:
+                    if 'position_embeddings' in forward_signature.parameters:
                         attn_kwargs['position_embeddings'] = position_embeddings
                     attn_out_batch = layer.self_attn(**attn_kwargs)[0]
                 elif hasattr(layer, 'linear_attn'):
@@ -136,11 +136,11 @@ def construct_moe(model, moe_model_flag, layer, layer_idx, inp,
                     attn_kwargs = {
                         'hidden_states': batch_hidden
                     }
-                    if 'attention_mask' in forward_signature.parameters and attention_mask is not None:
+                    if 'attention_mask' in forward_signature.parameters:
                         attn_kwargs['attention_mask'] = attention_mask
-                    if 'position_ids' in forward_signature.parameters and position_ids is not None:
+                    if 'position_ids' in forward_signature.parameters:
                         attn_kwargs['position_ids'] = position_ids
-                    if 'position_embeddings' in forward_signature.parameters and position_embeddings is not None:
+                    if 'position_embeddings' in forward_signature.parameters:
                         attn_kwargs['position_embeddings'] = position_embeddings
                     attn_out_batch = layer.linear_attn(**attn_kwargs)[0]
         else:
@@ -151,11 +151,11 @@ def construct_moe(model, moe_model_flag, layer, layer_idx, inp,
                     attn_kwargs = {
                         'hidden_states': batch_hidden
                     }
-                    if 'attention_mask' in forward_signature.parameters and attention_mask is not None:
+                    if 'attention_mask' in forward_signature.parameters:
                         attn_kwargs['attention_mask'] = attention_mask
-                    if 'position_ids' in forward_signature.parameters and position_ids is not None:
+                    if 'position_ids' in forward_signature.parameters:
                         attn_kwargs['position_ids'] = position_ids
-                    if 'position_embeddings' in forward_signature.parameters and position_embeddings is not None:
+                    if 'position_embeddings' in forward_signature.parameters:
                         attn_kwargs['position_embeddings'] = position_embeddings
                     attn_out_batch = layer.self_attn(**attn_kwargs)[0]
                 elif hasattr(layer, 'linear_attn'):
@@ -164,11 +164,11 @@ def construct_moe(model, moe_model_flag, layer, layer_idx, inp,
                     attn_kwargs = {
                         'hidden_states': batch_hidden
                     }
-                    if 'attention_mask' in forward_signature.parameters and attention_mask is not None:
+                    if 'attention_mask' in forward_signature.parameters:
                         attn_kwargs['attention_mask'] = attention_mask
-                    if 'position_ids' in forward_signature.parameters and position_ids is not None:
+                    if 'position_ids' in forward_signature.parameters:
                         attn_kwargs['position_ids'] = position_ids
-                    if 'position_embeddings' in forward_signature.parameters and position_embeddings is not None:
+                    if 'position_embeddings' in forward_signature.parameters:
                         attn_kwargs['position_embeddings'] = position_embeddings
                     attn_out_batch = layer.linear_attn(**attn_kwargs)[0]
 
