@@ -19,8 +19,19 @@
 from __future__ import annotations
 
 import math
+from functools import lru_cache
+from typing import Tuple
 
 import torch
+
+# ---------------------------------------------------------------------------
+# 旋转矩阵缓存（LRU缓存）
+# 缓存键: (d, seed)，缓存值: rotation_matrix
+# 注意：由于 torch.Tensor 不能直接作为 lru_cache 的键值，我们用 CPU 的 ndarray 存储
+# ---------------------------------------------------------------------------
+
+_ROTATION_CACHE: dict[Tuple[int, int], torch.Tensor] = {}
+_MAX_CACHE_SIZE = 128  # 最多缓存128个旋转矩阵，足够用了
 
 
 # ---------------------------------------------------------------------------
@@ -29,7 +40,7 @@ import torch
 # ---------------------------------------------------------------------------
 
 
-def generate_rotation_matrix(d: int, seed: int = 42) -> torch.Tensor:
+def generate_rotation_matrix(d: int, seed: int = 42, device: Optional[torch.device] = None) -> torch.Tensor:
     """通过QR分解生成Haar分布的随机正交矩阵。
 
     Haar分布的正交矩阵具有以下特性：
@@ -45,10 +56,22 @@ def generate_rotation_matrix(d: int, seed: int = 42) -> torch.Tensor:
     Args:
         d: 矩阵维度
         seed: 随机种子，保证结果可复现
+        device: 目标设备（用于缓存查找）
 
     Returns:
         Q: d×d 的正交矩阵，数据类型为 float32
     """
+    global _ROTATION_CACHE
+
+    # 检查缓存
+    cache_key = (d, seed)
+    if cache_key in _ROTATION_CACHE:
+        cached_q = _ROTATION_CACHE[cache_key]
+        # 如果需要的话，移到目标设备
+        if device is not None and cached_q.device != device:
+            cached_q = cached_q.to(device)
+        return cached_q
+
     # 创建指定种子的随机数生成器
     gen = torch.Generator().manual_seed(seed)
     # 生成标准高斯随机矩阵
@@ -59,7 +82,26 @@ def generate_rotation_matrix(d: int, seed: int = 42) -> torch.Tensor:
     # 通过乘以R对角线元素的符号，确保Q服从Haar分布
     diag_sign = torch.sign(torch.diag(R))
     Q = Q * diag_sign.unsqueeze(0)
+
+    # 缓存结果（先存 CPU 上，节省显存）
+    if len(_ROTATION_CACHE) >= _MAX_CACHE_SIZE:
+        # 简单的LRU：移除最早的项
+        first_key = next(iter(_ROTATION_CACHE.keys()))
+        del _ROTATION_CACHE[first_key]
+
+    _ROTATION_CACHE[cache_key] = Q.cpu()
+
+    # 如果需要的话，移到目标设备
+    if device is not None:
+        Q = Q.to(device)
+
     return Q
+
+
+def clear_rotation_cache() -> None:
+    """清空旋转矩阵缓存，释放内存"""
+    global _ROTATION_CACHE
+    _ROTATION_CACHE.clear()
 
 
 # ---------------------------------------------------------------------------

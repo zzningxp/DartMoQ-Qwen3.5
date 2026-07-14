@@ -508,7 +508,7 @@ def turboquant_dequantize_packed(packed_data: dict, device: Optional[torch.devic
         elif rotation == "hadamard":
             W_g_approx = hadamard_rotate_inverse(Y_unscaled, seed=seed + g_start)
         else:  # qr
-            Pi = generate_rotation_matrix(g_dim, seed=seed + g_start).to(device)
+            Pi = generate_rotation_matrix(g_dim, seed=seed + g_start, device=device)
             W_g_approx = Y_unscaled @ Pi
 
         # 恢复原始尺度
@@ -607,7 +607,7 @@ def turboquant_dequantize_packed_rows(
         elif rotation == "hadamard":
             W_g_approx = hadamard_rotate_inverse(Y_unscaled, seed=seed + g_start)
         else:  # qr
-            Pi = generate_rotation_matrix(g_dim, seed=seed + g_start).to(device)
+            Pi = generate_rotation_matrix(g_dim, seed=seed + g_start, device=device)
             W_g_approx = Y_unscaled @ Pi
 
         # 恢复原始尺度
@@ -716,7 +716,7 @@ def turboquant_dequantize_packed_cols(
         elif rotation == "hadamard":
             W_g_approx = hadamard_rotate_inverse(Y_unscaled, seed=seed + g_start)
         else:  # qr
-            Pi = generate_rotation_matrix(g_dim, seed=seed + g_start).to(device)
+            Pi = generate_rotation_matrix(g_dim, seed=seed + g_start, device=device)
             W_g_approx = Y_unscaled @ Pi
 
         # 恢复原始尺度
