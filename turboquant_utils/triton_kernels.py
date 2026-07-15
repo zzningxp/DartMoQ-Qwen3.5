@@ -38,28 +38,6 @@ import triton.language as tl
 from .rotation import generate_rotation_matrix
 
 
-# ---------------------------------------------------------------------------
-# Autotune configurations — searched per unique (B, N, K) shape
-# ---------------------------------------------------------------------------
-
-_AUTOTUNE_CONFIGS = [
-    # Small batch (inference with B=1..4)
-    triton.Config({"BLOCK_B": 1,  "BLOCK_N": 32,  "BLOCK_K": 32},  num_warps=2, num_stages=2),
-    triton.Config({"BLOCK_B": 1,  "BLOCK_N": 64,  "BLOCK_K": 64},  num_warps=4, num_stages=3),
-    triton.Config({"BLOCK_B": 4,  "BLOCK_N": 32,  "BLOCK_K": 64},  num_warps=4, num_stages=2),
-    triton.Config({"BLOCK_B": 4,  "BLOCK_N": 64,  "BLOCK_K": 64},  num_warps=4, num_stages=3),
-    # Medium batch
-    triton.Config({"BLOCK_B": 16, "BLOCK_N": 32,  "BLOCK_K": 64},  num_warps=4, num_stages=2),
-    triton.Config({"BLOCK_B": 16, "BLOCK_N": 64,  "BLOCK_K": 64},  num_warps=4, num_stages=3),
-    triton.Config({"BLOCK_B": 16, "BLOCK_N": 64,  "BLOCK_K": 128}, num_warps=8, num_stages=3),
-    # Large batch (tensor-core friendly ≥16 on all dims)
-    triton.Config({"BLOCK_B": 32, "BLOCK_N": 32,  "BLOCK_K": 64},  num_warps=4, num_stages=2),
-    triton.Config({"BLOCK_B": 32, "BLOCK_N": 64,  "BLOCK_K": 64},  num_warps=8, num_stages=3),
-    triton.Config({"BLOCK_B": 32, "BLOCK_N": 64,  "BLOCK_K": 128}, num_warps=8, num_stages=3),
-]
-
-
-@triton.autotune(configs=_AUTOTUNE_CONFIGS, key=["B", "N", "K", "BIT_WIDTH"])
 @triton.jit
 def _turboquant_fused_matmul_kernel_nbit(
     # Input
@@ -75,9 +53,9 @@ def _turboquant_fused_matmul_kernel_nbit(
     PACKED_K,         # packed dimension for indices
     N_LEVELS: tl.constexpr,
     BIT_WIDTH: tl.constexpr,
-    BLOCK_B: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
+    BLOCK_B: tl.constexpr = 16,
+    BLOCK_N: tl.constexpr = 64,
+    BLOCK_K: tl.constexpr = 64,
 ):
     """Fused dequant-matmul: output[b,n] = norms_scaled[n] * Σ_k x[b,k] * codebook[idx[n,k]]
 
@@ -190,10 +168,10 @@ def triton_fused_matmul(
 
     output = torch.empty(B, N, dtype=torch.float32, device=x_rot.device)
 
-    # Grid is a lambda so autotune can adapt it per config
-    grid = lambda META: (
-        triton.cdiv(B, META["BLOCK_B"]),
-        triton.cdiv(N, META["BLOCK_N"]),
+    # Fixed grid for the fixed config
+    grid = (
+        triton.cdiv(B, 16),
+        triton.cdiv(N, 64),
     )
 
     _turboquant_fused_matmul_kernel_nbit[grid](
@@ -210,7 +188,6 @@ def triton_fused_matmul(
 # Backward compatibility: original 4-bit only kernel (preserved for compatibility)
 # ---------------------------------------------------------------------------
 
-@triton.autotune(configs=_AUTOTUNE_CONFIGS, key=["B", "N", "K"])
 @triton.jit
 def _turboquant_fused_matmul_kernel(
     # Input
@@ -225,9 +202,9 @@ def _turboquant_fused_matmul_kernel(
     B, N, K,
     PACKED_K,         # K // 2 (stride for packed index rows)
     N_LEVELS: tl.constexpr,
-    BLOCK_B: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
+    BLOCK_B: tl.constexpr = 16,
+    BLOCK_N: tl.constexpr = 64,
+    BLOCK_K: tl.constexpr = 64,
 ):
     """Original 4-bit only kernel (preserved for backward compatibility)."""
     pid_b = tl.program_id(0)
@@ -283,22 +260,6 @@ def _turboquant_fused_matmul_kernel(
 # Dual-pass fused kernel: both residual passes in one launch (nbit version)
 # ---------------------------------------------------------------------------
 
-_DUAL_AUTOTUNE_CONFIGS = [
-    # Small batch (inference with B=1..4) — tighter tiles for dual-pass register pressure
-    triton.Config({"BLOCK_B": 1,  "BLOCK_N": 32,  "BLOCK_K": 32},  num_warps=2, num_stages=2),
-    triton.Config({"BLOCK_B": 1,  "BLOCK_N": 64,  "BLOCK_K": 64},  num_warps=4, num_stages=2),
-    triton.Config({"BLOCK_B": 4,  "BLOCK_N": 32,  "BLOCK_K": 64},  num_warps=4, num_stages=2),
-    triton.Config({"BLOCK_B": 4,  "BLOCK_N": 64,  "BLOCK_K": 64},  num_warps=4, num_stages=2),
-    # Medium batch
-    triton.Config({"BLOCK_B": 16, "BLOCK_N": 32,  "BLOCK_K": 64},  num_warps=4, num_stages=2),
-    triton.Config({"BLOCK_B": 16, "BLOCK_N": 64,  "BLOCK_K": 64},  num_warps=4, num_stages=2),
-    # Large batch
-    triton.Config({"BLOCK_B": 32, "BLOCK_N": 32,  "BLOCK_K": 64},  num_warps=4, num_stages=2),
-    triton.Config({"BLOCK_B": 32, "BLOCK_N": 64,  "BLOCK_K": 64},  num_warps=8, num_stages=2),
-]
-
-
-@triton.autotune(configs=_DUAL_AUTOTUNE_CONFIGS, key=["B", "N", "K", "BIT_WIDTH"])
 @triton.jit
 def _turboquant_fused_dual_matmul_kernel_nbit(
     # Pass 1
@@ -319,9 +280,9 @@ def _turboquant_fused_dual_matmul_kernel_nbit(
     N_LEVELS: tl.constexpr,
     BIT_WIDTH: tl.constexpr,
     SAME_INPUT: tl.constexpr,  # 1 if input1==input2 (shared rotation), 0 otherwise
-    BLOCK_B: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
+    BLOCK_B: tl.constexpr = 16,
+    BLOCK_N: tl.constexpr = 64,
+    BLOCK_K: tl.constexpr = 64,
 ):
     """Dual-pass fused dequant-matmul (nbit version): output = acc1*norms1 + acc2*norms2.
 
@@ -442,9 +403,9 @@ def triton_fused_dual_matmul(
 
     output = torch.empty(B, N, dtype=torch.float32, device=x_rot1.device)
 
-    grid = lambda META: (
-        triton.cdiv(B, META["BLOCK_B"]),
-        triton.cdiv(N, META["BLOCK_N"]),
+    grid = (
+        triton.cdiv(B, 16),
+        triton.cdiv(N, 64),
     )
 
     _turboquant_fused_dual_matmul_kernel_nbit[grid](
@@ -464,7 +425,6 @@ def triton_fused_dual_matmul(
 # Backward compatibility: original 4-bit dual kernel
 # ---------------------------------------------------------------------------
 
-@triton.autotune(configs=_DUAL_AUTOTUNE_CONFIGS, key=["B", "N", "K"])
 @triton.jit
 def _turboquant_fused_dual_matmul_kernel(
     # Pass 1
@@ -484,9 +444,9 @@ def _turboquant_fused_dual_matmul_kernel(
     PACKED_K,
     N_LEVELS: tl.constexpr,
     SAME_INPUT: tl.constexpr,  # 1 if input1==input2 (shared rotation), 0 otherwise
-    BLOCK_B: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
+    BLOCK_B: tl.constexpr = 16,
+    BLOCK_N: tl.constexpr = 64,
+    BLOCK_K: tl.constexpr = 64,
 ):
     """Original 4-bit dual kernel (preserved for backward compatibility)."""
     pid_b = tl.program_id(0)
@@ -741,7 +701,7 @@ def triton_fused_matmul_grouped_slice_in_features(
     # 对切片内的每个分组分别处理
     group_idx_in_slice = 0
     for g_start_in_slice in range(0, slice_in_features, group_size):
-        gt_start = time.time()
+        # gt_start = time.time()
 
         g_end_in_slice = min(g_start_in_slice + group_size, slice_in_features)
         g_dim = g_end_in_slice - g_start_in_slice
@@ -775,7 +735,7 @@ def triton_fused_matmul_grouped_slice_in_features(
 
         group_idx_in_slice += 1
 
-        gt_end = time.time()
-        print(f"    [DEBUG] group_idx_in_slice: {group_idx_in_slice}, x_g: {x_g.shape}, indices_packed_g: {indices_packed_g.shape}, codebook: {codebook.shape}, norms_g: {norms_g.shape}, g_dim: {g_dim}, time: {gt_end - gt_start:.4f}s", flush=True)
+        # gt_end = time.time()
+        # print(f"    [DEBUG] group_idx_in_slice: {group_idx_in_slice}, x_g: {x_g.shape}, indices_packed_g: {indices_packed_g.shape}, codebook: {codebook.shape}, norms_g: {norms_g.shape}, g_dim: {g_dim}, time: {gt_end - gt_start:.4f}s", flush=True)
 
     return output

@@ -349,7 +349,7 @@ class WxA16BitPartitionedGroupMoE(nn.Module):
 
         for expert_idx in range(self.num_experts):
             # print(f"  [DEBUG] expert_idx: {expert_idx}", flush=True)
-            t0 = time.time()
+            # t0 = time.time()
             end_idx = tokens_per_expert[expert_idx]
             start_idx = 0 if expert_idx == 0 else tokens_per_expert[expert_idx - 1]
 
@@ -422,7 +422,7 @@ class WxA16BitPartitionedGroupMoE(nn.Module):
                 expert_out += down_out
                 t_triton_end = time.time()
                 time_triton_total += t_triton_end - t_triton_start
-                print(f"    [DEBUG] bit: {bit}, time: {t_triton_end - t_triton_start:.4f}s", flush=True)
+                # print(f"    [DEBUG] bit: {bit}, time: {t_triton_end - t_triton_start:.4f}s", flush=True)
                 # ==========================================
 
             # 累加回最终结果
@@ -435,8 +435,8 @@ class WxA16BitPartitionedGroupMoE(nn.Module):
             )
 
             del expert_out, expert_tokens, expert_weights, exp_token_idx
-            t1 = time.time()
-            print(f"    [DEBUG] expert_idx: {expert_idx}, time: {t1 - t0:.4f}s", flush=True)
+            # t1 = time.time()
+            # print(f"    [DEBUG] expert_idx: {expert_idx}, time: {t1 - t0:.4f}s", flush=True)
 
         # Cleanup
         del flat_expert_indices, flat_expert_weights, flat_token_indices
