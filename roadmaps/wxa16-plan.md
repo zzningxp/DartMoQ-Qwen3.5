@@ -12,21 +12,8 @@
 具体前向推理的时候，也要在可以插入日志的地方进行日志输出，记得加 flush=True 参数。主要是在比较费时的位置，来确定是在什么时候跑到什么地方了。
 
 
-然后就遇到最困难的地方了，如果我们在前向时候用最简单的反量化+计算设计的话，会非常慢，这是因为其实当前主流的量化前向推理方法，都是将反量化算子和后续的 gemm 融为一体统计进行大矩阵并行计算的。哪怕不进行融合算子，也会通过等价公式将反量化过程变成一个并行算子进行，这里还没有完全设计好，我觉得你可以进行一定的发挥。
 
 59e56412e：已经处理好前面的基本逻辑，下一步就开始优化反量化+计算设计的加速了。
-阶段1：先不要搞太复杂，先优化 "反量化" 函数本身
-先看看当前 turboquant_dequantize_packed_rows 和 turboquant_dequantize_packed_cols 有没有可以优化的微观层面：
-
-有没有不必要的 tensor 创建/拷贝？
-有没有可以原地操作的？
-有没有可以用 view 而不是 copy 的？
-阶段2：然后再做部分融合
-比如把"码本查找 + 逆缩放 + 逆旋转"这几步融合成一个 kernel，避免中间结果。
-
-阶段3：最后再做完全融合
-把反量化和 GEMM 完全融合在一起。
-
 
 阶段 1 已经做完了，现在基于这个状态点，来做融合工作，
     首先明确，我们的目标是引入 Triton 融合 kernel 来替代"先反量化再做 GEMM"的两步走方案，理论上应该更快。conda 环境是 dart312，你后续可以自己测试。
@@ -69,4 +56,40 @@
     我认为可能存在的问题，测试程序的 w1、w2 分别对应 up/gate 和 down 专家的参数矩阵，你可以照猫画虎套进去。因为我们是混合精度方法呢，一个专家下面应该是有 3 套方案分别有三组矩阵，这时候就不要再拆分他们了。然后测试程序里面的码本、缩放和 packed 方法，最好不要动，如果不合适，可能需要改量化过程中的 packed 和量化过程。。让前续方法来适配调好的 kernel 。如果没有冲突那最好了。
     注意，你可能会遇到 down proj 因为 in_features 维度的切片需要更复杂的处理的问题，这里我按 down 的方式完成了 test_triton_mixed_precision.py 中的 w2 的测试
     还需要在项目中增加丰富的日志，方便调试和分析。
-    如果有其他问题请提出来先讨论再动手。    
+    eff97a3，DONE. 
+
+| git      | model            | sli | qsch              | rank                     | qmode      | qlayers | wiki   | c4     | status | time   | t_quant | t_ppl  | t_wiki | t_c4   | err |
+|----------|------------------|-----|-------------------|--------------------------|------------|---------|--------|--------|--------|--------|--------|---------|--------|--------|--------|
+| fc2eec0  | Qwen3.5-35B-A3B  | 4   | global-a8s8m2bpw  | turboquant_innerproduct  | turboquant | [0]     | 6.594  | 9.6828 | ok     | 489.53 | 223.26  | 266.27 | 117.56 | 148.71 |     |
+| eff97a3  | Qwen3.5-35B-A3B  | 4   | global-a8s8m2bpw  | turboquant_innerproduct  | turboquant | [0]     | 6.5933 | 9.6822 | ok     | 423.61 | 212.73  | 210.88 | 91.62  | 119.26 |     |  
+
+
+  [Layer 0] time: 9.24s (move: 0.02s, forward: 9.20s), mlp_type=WxA16BitPartitionedGroupMoE | Memory: CUDA 0: 4.30GB/6.70GB | CUDA 1: 0.00GB/0.00GB | CPU: 8.44GB
+  [Layer 1] time: 1.86s (move: 0.41s, forward: 1.07s), mlp_type=Qwen3_5MoeSparseMoeBlock | Memory: CUDA 0: 4.30GB/30.59GB | CUDA 1: 0.00GB/0.00GB | CPU: 11.01GB
+
+  [Layer 0] time: 8.57s (move: 0.02s, forward: 8.52s), mlp_type=WxA16BitPartitionedGroupMoE | Memory: CUDA 0: 5.16GB/7.62GB | CUDA 1: 0.00GB/0.00GB | CPU: 15.98GB
+  [Layer 1] time: 7.87s (move: 0.02s, forward: 7.83s), mlp_type=WxA16BitPartitionedGroupMoE | Memory: CUDA 0: 5.16GB/7.58GB | CUDA 1: 0.00GB/0.00GB | CPU: 15.98GB
+  [Layer 2] time: 7.73s (move: 0.05s, forward: 7.65s), mlp_type=WxA16BitPartitionedGroupMoE | Memory: CUDA 0: 5.16GB/7.56GB | CUDA 1: 0.00GB/0.00GB | CPU: 15.98GB
+  [Layer 3] time: 10.63s (move: 0.02s, forward: 10.59s), mlp_type=WxA16BitPartitionedGroupMoE | Memory: CUDA 0: 5.16GB/7.58GB | CUDA 1: 0.00GB/0.00GB | CPU: 15.98GB
+  [Layer 4] time: 8.40s (move: 0.05s, forward: 8.33s), mlp_type=WxA16BitPartitionedGroupMoE | Memory: CUDA 0: 5.16GB/7.57GB | CUDA 1: 0.00GB/0.00GB | CPU: 15.98GB
+  [Layer 5] time: 1.67s (move: 0.15s, forward: 1.14s), mlp_type=Qwen3_5MoeSparseMoeBlock | Memory: CUDA 0: 5.16GB/29.48GB | CUDA 1: 0.00GB/0.00GB | CPU: 18.56GB
+  [Layer 6] time: 1.78s (move: 0.15s, forward: 1.12s), mlp_type=Qwen3_5MoeSparseMoeBlock | Memory: CUDA 0: 5.16GB/29.48GB | CUDA 1: 0.00GB/0.00GB | CPU: 21.62GB
+
+
+不过这里 9.2s 还是挺慢的。。
+并且现在精度还有下降！
+
+python turboquant_utils/test_triton_mixed_precision.py
+  Baseline:                  0.14 ms
+  场景1 - 全4bit:
+    反量化+GEMM:            37.13 ms
+    Triton 分别切片:         2.94 ms
+    Triton 新函数:           2.96 ms
+  场景2 - 混合4:2:1bit:
+    反量化+GEMM:             3.12 ms
+    Triton Fused:            2.97 ms
+这里来看，triton 这个本来就慢。所以这里可以先从这个测试程序入手进行 case 优化。
+
+
+
+另外就是可以考虑要保存量化后的参数了。
