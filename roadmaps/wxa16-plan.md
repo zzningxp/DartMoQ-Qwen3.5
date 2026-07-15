@@ -27,39 +27,17 @@
 阶段3：最后再做完全融合
 把反量化和 GEMM 完全融合在一起。
 
-阶段1：微观优化点分析
 
-        🔴 优化点1：旋转矩阵重复生成（最大的问题！）
-        当前问题：
+阶段 1 已经做完了，现在基于这个状态点，来做融合工作，
+    首先明确，我们的目标是引入 Triton 融合 kernel 来替代"先反量化再做 GEMM"的两步走方案，理论上应该更快。conda 环境是 dart312，你自己测试到结果一步。
 
+    我们的基本思路是复用 triton_kernels.py 中的 kernel 实现。
+    但是现在我不清楚这里的 kernel 实现细节，需要先写个测试程序来测试，放在 turboquant utils 里面。
 
-        在反量化循环里，每次都重新生成！
-        for g_start in range(0, N, group_size):
-            ...
-            Pi = generate_rotation_matrix(g_dim, seed=seed + g_start).to(device)
-            W_g_approx = Y_unscaled @ Pi
-        而旋转矩阵 Pi 只和 g_dim 和 seed 有关，完全可以缓存！
-
-        而且我们有768次反量化调用（256 experts × 3 bits），每次都要生成 N/group_size 个旋转矩阵... 这太浪费了！
-
-        优化方案：
-
-        方案A：在 WxA16BitPartitionedGroupMoE.from_build_block 阶段，就把所有需要的旋转矩阵预生成好，存起来
-        方案B：实现一个简单的 LRU 缓存
-
-            nice，测试通过。wiki 150 batch 推理一层速度从 30s 提高到 26s，c4 batch 推理一层速度从 47s 提高到 41s。
-
-        🟡 优化点2：Python 循环开销
-        当前问题：
-
-
-        for g_start in range(0, N, group_size):  # Python 循环
-            ...
-        如果 group_size 小（比如 128），这个循环次数会很多。
-
-        优化思路：看看能不能用 torch 的向量化操作，或者把一些步骤移出循环。
-
-        🟢 优化点3：小的优化点
-        dtype 转换：当前先 float32，最后再转 orig_dtype。能不能直接用 orig_dtype？
-        码本查找：codebook[indices_g] 这个操作本身很快，但看看能不能和后续的操作融合
-        不必要的 tensor 创建：W_approx = torch.zeros(...) 能不能直接原地写入？
+    1）目前 里面只有 4bit 的实现，我们就测这个，你全程不要改动 triton_kernels.py 中的 kernel 实现。
+    2）写一个矩阵乘法测试程序，输入 w1 是 1024 * 512 的 fp16 矩阵，量化为 q1 是 4bit 的矩阵，1024 * 512 ，128 group 一组的 turboquant packed 形式，带缩放因子和码本，输入 x 是 16 * 1024 的 fp16 矩阵。输出就是 16 * 512 的 fp16 矩阵。
+    3）将上一个测试结果的输出，作为下一个输入 x，输入 q2 是另一个 4 bit 的矩阵（q2 是由同尺寸的 w2 量化获得的），尺寸都是 512 * 1024，输出就是 16 * 1024 的 fp16 矩阵。这里的两个 w1 和 w2 是两个形状转置的矩阵，但是都是按行量化成 q1 和 q2 的，都是 128 group。
+    4）以上矩阵尺寸要可配置测试更多情况。这里主要是要测试速度，尤其是要测试出来他确实是一次发生并行执行的。有三个测试方法：i）原本的 w1 ，w2， 和原本 x 他们正常流程做矩阵乘，ii）反量化，然后 fp16 运算的，iii）triton kernel 实现。速度要更快。
+    
+    现在面临的问题：triton_fused_matmul kernel 不支持分组量化（group_size=128），当 group_size=128 时，我们需要对每个分组分别调用 triton_fused_matmul，然后把结果累加。
+    目前已经实现好了一个正确的 triton_fused_matmul_grouped 函数，串行调用分组量化的情况。

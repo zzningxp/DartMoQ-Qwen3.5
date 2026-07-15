@@ -31,6 +31,8 @@ import torch
 import triton
 import triton.language as tl
 
+from .rotation import generate_rotation_matrix
+
 
 # ---------------------------------------------------------------------------
 # Autotune configurations — searched per unique (B, N, K) shape
@@ -341,5 +343,66 @@ def triton_fused_dual_matmul(
         N_LEVELS=codebook1.shape[0],
         SAME_INPUT=1 if same_input else 0,
     )
+
+    return output
+
+
+def triton_fused_matmul_grouped(
+    x, indices_packed, codebook, norms, seed, group_size, in_features
+):
+    """支持分组量化的 triton fused matmul
+
+    将 in_features 按 group_size 分组，对每个分组：
+    1. 旋转输入
+    2. 调用 triton_fused_matmul
+    3. 累加结果
+
+    Args:
+        x: (batch_size, in_features) 输入
+        indices_packed: (out_features, in_features//2) 打包的量化索引
+        codebook: (n_levels,) 码本
+        norms: (out_features,) 或 (out_features, n_groups) 范数
+        seed: 随机种子（用于生成旋转矩阵）
+        group_size: 分组大小
+        in_features: 输入特征维度
+
+    Returns:
+        output: (batch_size, out_features) 结果
+    """
+    batch_size = x.shape[0]
+    out_features = indices_packed.shape[0]
+
+    # 确保 norms 是二维的
+    if norms.dim() == 1:
+        norms = norms.unsqueeze(1)
+
+    output = torch.zeros(batch_size, out_features, dtype=torch.float32, device=x.device)
+
+    # 对每个分组分别处理
+    group_idx = 0
+    for g_start in range(0, in_features, group_size):
+        g_end = min(g_start + group_size, in_features)
+        g_dim = g_end - g_start
+
+        # 1. 旋转这个分组对应的输入
+        Pi = generate_rotation_matrix(g_dim, seed + g_start, device=x.device)
+        x_g = x[:, g_start:g_end].float()
+        x_rot_g = x_g @ Pi.T
+
+        # 2. 切片这个分组对应的 packed indices，然后 clone 确保内存连续
+        packed_start = g_start // 2
+        packed_end = g_end // 2
+        indices_packed_g = indices_packed[:, packed_start:packed_end].clone()
+
+        # 3. 取出这个分组对应的 norms
+        norms_g = norms[:, group_idx]
+
+        # 4. 调用 triton fused kernel
+        out_g = triton_fused_matmul(x_rot_g, indices_packed_g, codebook, norms_g, g_dim)
+
+        # 5. 累加到输出
+        output += out_g
+
+        group_idx += 1
 
     return output
