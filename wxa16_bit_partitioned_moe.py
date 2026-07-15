@@ -12,6 +12,10 @@ import gc
 
 from wxa16_linear import WxA16Linear
 from turboquant_utils.quantize import turboquant_quantize_packed_full
+from turboquant_utils.triton_kernels import (
+    triton_fused_matmul_grouped_slice_rows,
+    triton_fused_matmul_grouped_slice_in_features
+)
 
 
 class WxA16Weights(nn.Module):
@@ -33,12 +37,25 @@ class WxA16Weights(nn.Module):
         # 实际的量化参数会在 later 填充
         self._gate_up_packed = None
         self._down_packed = None
-        self.gate_up_metadata = None
-        self.down_metadata = None
+
+        # 保存元数据（非 tensor 值）
+        self._gate_up_seed = None
+        self._gate_up_group_size = None
+        self._gate_up_shape = None
+        self._gate_up_bit_width = None
+        self._gate_up_rotation = None
+        self._gate_up_orig_dtype = None
+
+        self._down_seed = None
+        self._down_group_size = None
+        self._down_shape = None
+        self._down_bit_width = None
+        self._down_rotation = None
+        self._down_orig_dtype = None
 
     @property
     def gate_up_packed(self):
-        """从 registered buffers 重建 gate_up_packed 字典"""
+        """获取 gate_up_packed 字典，同时恢复元数据"""
         if self._gate_up_packed is None:
             # 从所有 gate_up_* 开头的 buffer 重建字典
             self._gate_up_packed = {}
@@ -46,6 +63,19 @@ class WxA16Weights(nn.Module):
                 if name.startswith('gate_up_'):
                     key = name[len('gate_up_'):]
                     self._gate_up_packed[key] = param
+            # 恢复元数据
+            if self._gate_up_seed is not None:
+                self._gate_up_packed['seed'] = self._gate_up_seed
+            if self._gate_up_group_size is not None:
+                self._gate_up_packed['group_size'] = self._gate_up_group_size
+            if self._gate_up_shape is not None:
+                self._gate_up_packed['shape'] = self._gate_up_shape
+            if self._gate_up_bit_width is not None:
+                self._gate_up_packed['bit_width'] = self._gate_up_bit_width
+            if self._gate_up_rotation is not None:
+                self._gate_up_packed['rotation'] = self._gate_up_rotation
+            if self._gate_up_orig_dtype is not None:
+                self._gate_up_packed['orig_dtype'] = self._gate_up_orig_dtype
         return self._gate_up_packed
 
     @gate_up_packed.setter
@@ -54,7 +84,7 @@ class WxA16Weights(nn.Module):
 
     @property
     def down_packed(self):
-        """从 registered buffers 重建 down_packed 字典"""
+        """获取 down_packed 字典，同时恢复元数据"""
         if self._down_packed is None:
             # 从所有 down_* 开头的 buffer 重建字典
             self._down_packed = {}
@@ -62,6 +92,19 @@ class WxA16Weights(nn.Module):
                 if name.startswith('down_'):
                     key = name[len('down_'):]
                     self._down_packed[key] = param
+            # 恢复元数据
+            if self._down_seed is not None:
+                self._down_packed['seed'] = self._down_seed
+            if self._down_group_size is not None:
+                self._down_packed['group_size'] = self._down_group_size
+            if self._down_shape is not None:
+                self._down_packed['shape'] = self._down_shape
+            if self._down_bit_width is not None:
+                self._down_packed['bit_width'] = self._down_bit_width
+            if self._down_rotation is not None:
+                self._down_packed['rotation'] = self._down_rotation
+            if self._down_orig_dtype is not None:
+                self._down_packed['orig_dtype'] = self._down_orig_dtype
         return self._down_packed
 
     @down_packed.setter
@@ -78,6 +121,13 @@ class WxA16Weights(nn.Module):
                 if isinstance(value, torch.Tensor):
                     self.register_buffer(f"gate_up_{key}", value)
             self._gate_up_packed = gate_up_packed
+            # 保存元数据
+            self._gate_up_seed = gate_up_packed.get('seed')
+            self._gate_up_group_size = gate_up_packed.get('group_size')
+            self._gate_up_shape = gate_up_packed.get('shape')
+            self._gate_up_bit_width = gate_up_packed.get('bit_width')
+            self._gate_up_rotation = gate_up_packed.get('rotation')
+            self._gate_up_orig_dtype = gate_up_packed.get('orig_dtype')
 
         # Register down packed data
         if down_packed is not None:
@@ -85,6 +135,13 @@ class WxA16Weights(nn.Module):
                 if isinstance(value, torch.Tensor):
                     self.register_buffer(f"down_{key}", value)
             self._down_packed = down_packed
+            # 保存元数据
+            self._down_seed = down_packed.get('seed')
+            self._down_group_size = down_packed.get('group_size')
+            self._down_shape = down_packed.get('shape')
+            self._down_bit_width = down_packed.get('bit_width')
+            self._down_rotation = down_packed.get('rotation')
+            self._down_orig_dtype = down_packed.get('orig_dtype')
 
 
 class WxA16BitPartitionedGroupMoE(nn.Module):
@@ -286,10 +343,13 @@ class WxA16BitPartitionedGroupMoE(nn.Module):
         # 统计各阶段时间
         time_dequant_total = 0.0
         time_gemm_total = 0.0
+        time_triton_total = 0.0
         active_experts_count = 0
         active_bits_count = 0
 
         for expert_idx in range(self.num_experts):
+            # print(f"  [DEBUG] expert_idx: {expert_idx}", flush=True)
+            t0 = time.time()
             end_idx = tokens_per_expert[expert_idx]
             start_idx = 0 if expert_idx == 0 else tokens_per_expert[expert_idx - 1]
 
@@ -307,41 +367,36 @@ class WxA16BitPartitionedGroupMoE(nn.Module):
             expert_out = torch.zeros_like(expert_tokens)
 
             for bit_str in self.bit_weights.keys():
+                t_triton_start = time.time()
                 bit = int(bit_str)
                 active_bits_count += 1
 
                 wxa16_weights = self.bit_weights[bit_str]
                 expert_offsets = self.expert_offsets[bit_str]
 
-                start = expert_offsets[expert_idx]
-                end = expert_offsets[expert_idx + 1]
+                start = int(expert_offsets[expert_idx].item())
+                end = int(expert_offsets[expert_idx + 1].item())
                 actual_inter_size = end - start
 
                 if actual_inter_size == 0:
                     continue
 
-                # ========== WxA16: 反量化 + 推理 ==========
-                t_dequant_start = time.time()
-                # 使用切片反量化，只反量化需要的部分（性能优化 768x）
-                from turboquant_utils.quantize import turboquant_dequantize_packed_rows, turboquant_dequantize_packed_cols
+                # ========== WxA16: Triton Fused + 部分反量化 ==========
 
-                # 只反量化需要的行和列
-                e_gate_up = turboquant_dequantize_packed_rows(
-                    wxa16_weights.gate_up_packed,
-                    2*start, 2*end,
-                    device=x.device
+                # 使用 Triton Fused Kernel 处理 gate_up
+                gate_up_packed = wxa16_weights.gate_up_packed
+                gate_up_out = triton_fused_matmul_grouped_slice_rows(
+                    expert_tokens,
+                    gate_up_packed["indices_packed"],
+                    gate_up_packed["codebook"].to(x.device),
+                    gate_up_packed["norms"],
+                    gate_up_packed["seed"],
+                    gate_up_packed["group_size"],
+                    gate_up_packed["shape"][1],  # in_features = hidden_size
+                    2*start, 2*end,  # row slice
+                    bit
                 )
-                e_down = turboquant_dequantize_packed_cols(
-                    wxa16_weights.down_packed,
-                    start, end,
-                    device=x.device
-                )
-                t_dequant_end = time.time()
-                time_dequant_total += t_dequant_end - t_dequant_start
 
-                # 普通推理
-                t_gemm_start = time.time()
-                gate_up_out = expert_tokens @ e_gate_up.t()
                 gate_out = gate_up_out[:, :actual_inter_size]
                 up_out = gate_up_out[:, actual_inter_size:]
                 del gate_up_out
@@ -349,13 +404,26 @@ class WxA16BitPartitionedGroupMoE(nn.Module):
                 act_out = F.silu(gate_out) * up_out
                 del gate_out, up_out
 
-                down_out = act_out @ e_down.t()
-                del act_out, e_gate_up, e_down
+                # 使用 Triton Fused Kernel 处理 down (in_features slicing)
+                down_packed = wxa16_weights.down_packed
+                down_out = triton_fused_matmul_grouped_slice_in_features(
+                    act_out,
+                    down_packed["indices_packed"],
+                    down_packed["codebook"].to(x.device),
+                    down_packed["norms"],
+                    down_packed["seed"],
+                    down_packed["group_size"],
+                    start, end,  # original_start, original_end
+                    down_packed["shape"][1],  # full_in_features
+                    bit
+                )
+                del act_out
 
                 expert_out += down_out
-                t_gemm_end = time.time()
-                time_gemm_total += t_gemm_end - t_gemm_start
-                # =========================================
+                t_triton_end = time.time()
+                time_triton_total += t_triton_end - t_triton_start
+                print(f"    [DEBUG] bit: {bit}, time: {t_triton_end - t_triton_start:.4f}s", flush=True)
+                # ==========================================
 
             # 累加回最终结果
             expert_out.mul_(expert_weights)
@@ -367,6 +435,8 @@ class WxA16BitPartitionedGroupMoE(nn.Module):
             )
 
             del expert_out, expert_tokens, expert_weights, exp_token_idx
+            t1 = time.time()
+            print(f"    [DEBUG] expert_idx: {expert_idx}, time: {t1 - t0:.4f}s", flush=True)
 
         # Cleanup
         del flat_expert_indices, flat_expert_weights, flat_token_indices
@@ -388,7 +458,7 @@ class WxA16BitPartitionedGroupMoE(nn.Module):
             self._log_printed = True
             print(f"  [WxA16BitPartitionedGroupMoE] forward total: {t5 - t0:.4f}s", flush=True)
             print(f"    init: {t1 - t0:.4f}s, shared: {t_shared_end - t_shared_start:.4f}s, router: {t_router_end - t_router_start:.4f}s", flush=True)
-            print(f"    compute: {t_compute_end - t_compute_start:.4f}s (dequant: {time_dequant_total:.4f}s, gemm: {time_gemm_total:.4f}s)", flush=True)
+            print(f"    compute: {t_compute_end - t_compute_start:.4f}s (triton: {time_triton_total:.4f}s, dequant: {time_dequant_total:.4f}s, gemm: {time_gemm_total:.4f}s)", flush=True)
             print(f"    reshape: {t5 - t4:.4f}s, active_experts: {active_experts_count}, active_bits: {active_bits_count}", flush=True)
 
         return result

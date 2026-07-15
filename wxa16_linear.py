@@ -16,6 +16,7 @@ from turboquant_utils.quantize import (
 )
 from turboquant_utils.quantize import get_codebook
 from turboquant_utils.rotation import generate_rotation_matrix, hadamard_rotate_inverse
+from turboquant_utils.triton_kernels import triton_fused_matmul_grouped
 
 
 class WxA16Linear(nn.Module):
@@ -184,7 +185,7 @@ class WxA16Linear(nn.Module):
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        前向推理：反量化 + GEMM。
+        前向推理：使用 Triton Fused Kernel。
 
         Args:
             x: (batch_size, seq_len, in_features) 或 (batch_size, in_features)
@@ -194,26 +195,45 @@ class WxA16Linear(nn.Module):
         """
         t_start = time.time()
 
-        # 反量化权重
-        t_dequant_start = time.time()
-        W_approx = self.dequantize()
-        t_dequant_end = time.time()
+        orig_shape = x.shape
+        batch_size = None
+        seq_len = None
 
-        # 普通线性层推理
-        t_gemm_start = time.time()
-        x_dtype = x.dtype
-        out = F.linear(x.to(W_approx.dtype), W_approx, self.bias.to(W_approx.dtype) if self.bias is not None else None)
-        t_gemm_end = time.time()
+        # Reshape if needed
+        if x.dim() == 3:
+            batch_size, seq_len, in_features = x.shape
+            x = x.reshape(batch_size * seq_len, in_features)
+
+        t_triton_start = time.time()
+
+        # Ensure codebook is on the correct device
+        codebook = self.codebook.to(x.device)
+
+        # Use Triton fused kernel
+        out = triton_fused_matmul_grouped(
+            x, self.packed_indices, codebook, self.norms,
+            self.seed, self.group_size, self.in_features, self.bit_width
+        )
+
+        t_triton_end = time.time()
+
+        # Add bias
+        if self.bias is not None:
+            out = out + self.bias.to(out.dtype)
+
+        # Reshape back if needed
+        if batch_size is not None and seq_len is not None:
+            out = out.reshape(batch_size, seq_len, self.out_features)
 
         t_end = time.time()
 
         # 打印详细时间（仅第一次，避免刷屏）
         if not hasattr(self, '_log_printed'):
             self._log_printed = True
-            print(f"  [WxA16Linear {self.bit_width}bit] forward total: {t_end - t_start:.4f}s, dequant: {t_dequant_end - t_dequant_start:.4f}s, gemm: {t_gemm_end - t_gemm_start:.4f}s", flush=True)
-            print(f"  [WxA16Linear {self.bit_width}bit] input shape: {x.shape}, output shape: {out.shape}, W_approx shape: {W_approx.shape}, norms shape: {self.norms.shape}", flush=True)
+            print(f"  [WxA16Linear {self.bit_width}bit] forward total: {t_end - t_start:.4f}s, triton: {t_triton_end - t_triton_start:.4f}s", flush=True)
+            print(f"  [WxA16Linear {self.bit_width}bit] input shape: {orig_shape}, output shape: {out.shape}", flush=True)
 
-        return out.to(x_dtype)
+        return out.to(x.dtype)
 
     def extra_repr(self) -> str:
         return (f"in_features={self.in_features}, out_features={self.out_features}, "

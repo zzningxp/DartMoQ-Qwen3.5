@@ -28,6 +28,7 @@ Supports group-wise calls: pass a packed index slice with K=g_dim.
 
 from __future__ import annotations
 
+import time
 import math
 
 import torch
@@ -612,5 +613,169 @@ def triton_fused_matmul_grouped(
         output += out_g
 
         group_idx += 1
+
+    return output
+
+
+def triton_fused_matmul_grouped_slice_rows(
+    x, indices_packed, codebook, norms, seed, group_size,
+    in_features, row_start, row_end, bit_width: int = 4
+):
+    """
+    Triton fused matmul，针对 rows/out_features 维度切片的场景（MoE gate_up 投影）。
+
+    Args:
+        x: (batch_size, in_features) - 完整输入
+        indices_packed: (out_features, PACKED_K) - 完整的 packed 索引
+        codebook: (n_levels,) - 码本
+        norms: (out_features,) 或 (out_features, n_groups) - 范数
+        seed: 基础随机种子
+        group_size: 分组大小
+        in_features: 完整的输入特征维度
+        row_start: 切片在 rows/out_features 中的起始位置
+        row_end: 切片在 rows/out_features 中的结束位置
+        bit_width: 1/2/4/8 (default: 4)
+
+    Returns:
+        output: (batch_size, row_end - row_start) 结果
+    """
+    if bit_width not in {1, 2, 4, 8}:
+        raise ValueError(f"bit_width must be 1/2/4/8, got {bit_width}")
+
+    # 确保 seed 是 Python int
+    if isinstance(seed, torch.Tensor):
+        seed = int(seed.item())
+
+    batch_size = x.shape[0]
+    slice_out_features = row_end - row_start
+    ELEMENTS_PER_BYTE = 8 // bit_width
+
+    # 切片 rows/out_features 维度
+    indices_packed_slice = indices_packed[row_start:row_end]
+    norms_slice = norms[row_start:row_end] if norms.dim() == 1 else norms[row_start:row_end, :]
+
+    # 确保 norms 是二维的
+    if norms_slice.dim() == 1:
+        norms_slice = norms_slice.unsqueeze(1)
+
+    output = torch.zeros(batch_size, slice_out_features, dtype=torch.float32, device=x.device)
+
+    # 对每个分组分别处理
+    group_idx = 0
+    for g_start in range(0, in_features, group_size):
+        g_end = min(g_start + group_size, in_features)
+        g_dim = g_end - g_start
+
+        # 1. 旋转这个分组对应的输入
+        Pi = generate_rotation_matrix(g_dim, seed + g_start, device=x.device)
+        x_g = x[:, g_start:g_end].float()
+        x_rot_g = x_g @ Pi.T
+
+        # 2. 切片这个分组对应的 packed indices
+        packed_start = g_start // ELEMENTS_PER_BYTE
+        packed_end = g_end // ELEMENTS_PER_BYTE
+        if g_end % ELEMENTS_PER_BYTE != 0:
+            packed_end += 1
+        indices_packed_g = indices_packed_slice[:, packed_start:packed_end].clone()
+
+        # 3. 取出这个分组对应的 norms
+        norms_g = norms_slice[:, group_idx]
+
+        # 4. 调用 triton fused kernel
+        out_g = triton_fused_matmul(x_rot_g, indices_packed_g, codebook, norms_g, g_dim, bit_width)
+
+        # 5. 累加到输出
+        output += out_g
+
+        group_idx += 1
+
+    return output
+
+
+def triton_fused_matmul_grouped_slice_in_features(
+    x, indices_packed, codebook, norms, seed, group_size,
+    original_start, original_end, full_in_features, bit_width: int = 4
+):
+    """
+    Triton fused matmul，针对 in_features 维度切片的场景（MoE down 投影）。
+
+    关键假设：[original_start:original_end] 范围对齐到 group_size 边界！
+
+    Args:
+        x: (batch_size, original_end - original_start) - 已经切片后的输入
+        indices_packed: (out_features, PACKED_K) - 完整的 packed 索引
+        codebook: (n_levels,) - 码本
+        norms: (out_features,) 或 (out_features, n_groups) - 范数
+        seed: 基础随机种子
+        group_size: 分组大小
+        original_start: 切片在完整 in_features 中的起始位置
+        original_end: 切片在完整 in_features 中的结束位置
+        full_in_features: 完整的 in_features 维度
+        bit_width: 1/2/4/8 (default: 4)
+
+    Returns:
+        output: (batch_size, out_features) 结果
+    """
+    if bit_width not in {1, 2, 4, 8}:
+        raise ValueError(f"bit_width must be 1/2/4/8, got {bit_width}")
+
+    # 验证边界对齐
+    if original_start % group_size != 0:
+        raise ValueError(f"original_start ({original_start}) must be aligned to group_size ({group_size})")
+
+    # 确保 seed 是 Python int
+    if isinstance(seed, torch.Tensor):
+        seed = int(seed.item())
+
+    batch_size = x.shape[0]
+    out_features = indices_packed.shape[0]
+    slice_in_features = original_end - original_start
+    ELEMENTS_PER_BYTE = 8 // bit_width
+
+    # 确保 norms 是二维的
+    if norms.dim() == 1:
+        norms = norms.unsqueeze(1)
+
+    output = torch.zeros(batch_size, out_features, dtype=torch.float32, device=x.device)
+
+    # 对切片内的每个分组分别处理
+    group_idx_in_slice = 0
+    for g_start_in_slice in range(0, slice_in_features, group_size):
+        gt_start = time.time()
+
+        g_end_in_slice = min(g_start_in_slice + group_size, slice_in_features)
+        g_dim = g_end_in_slice - g_start_in_slice
+
+        # 计算在完整 in_features 中的真实位置
+        g_start_original = original_start + g_start_in_slice
+
+        # 1. 旋转这个分组对应的输入（用真实位置的 seed）
+        Pi = generate_rotation_matrix(g_dim, seed + g_start_original, device=x.device)
+        x_g = x[:, g_start_in_slice:g_end_in_slice].float()
+        x_rot_g = x_g @ Pi.T
+
+        # 2. 切片这个分组对应的 packed indices（用真实位置）
+        packed_start = g_start_original // ELEMENTS_PER_BYTE
+        packed_end = g_start_original + g_dim
+        if packed_end % ELEMENTS_PER_BYTE != 0:
+            packed_end = (packed_end // ELEMENTS_PER_BYTE) + 1
+        else:
+            packed_end = packed_end // ELEMENTS_PER_BYTE
+        indices_packed_g = indices_packed[:, packed_start:packed_end].clone()
+
+        # 3. 取出这个分组对应的 norms（用真实分组索引）
+        group_idx_original = g_start_original // group_size
+        norms_g = norms[:, group_idx_original]
+
+        # 4. 调用 triton fused kernel
+        out_g = triton_fused_matmul(x_rot_g, indices_packed_g, codebook, norms_g, g_dim, bit_width)
+
+        # 5. 累加到输出
+        output += out_g
+
+        group_idx_in_slice += 1
+
+        gt_end = time.time()
+        print(f"    [DEBUG] group_idx_in_slice: {group_idx_in_slice}, x_g: {x_g.shape}, indices_packed_g: {indices_packed_g.shape}, codebook: {codebook.shape}, norms_g: {norms_g.shape}, g_dim: {g_dim}, time: {gt_end - gt_start:.4f}s", flush=True)
 
     return output

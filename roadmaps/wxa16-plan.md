@@ -45,5 +45,28 @@
     好，/home/daodao/Develop/DartMoQ-Qwen3.5/turboquant_utils/test_triton_simple.py 中已经写好了，一个 fp16 的输入 x 矩阵（batchsize * hidden size），与 fp16 的 w1、w2 的量化版本 q1、q2 分别进行乘法的调用方法。相当于已经有一个 "码本查找 + 逆缩放 + 逆旋转" 等完整流程了。
     1）目前这里面只有 4bit 的实现，而我们的 wxa16 是要支持 1bit 2bit 4bit 8bit 的，所以需要先实现一个 nbit 来根据输入实现的。实现细节应该是，4bit 就是两个 4bit packed 成一个 8bit 然后通过位运算来进行unpack，8bit 就是直接 unpack。1bit 是 8 个 1bit packed 成一个 8bit。2bit 是 4 个 2bit packed 成一个 8bit。中间都要通过位运算来并行执行。
     2）更新 test_triton_simple.py 的方法，按 4bit 的方法支持 4 个 bit 位的测试。
-
+    7fe9fa9, DONE.
     
+我们要再更新一版 test 程序。主要目的是测试混合精度时候的 down 。
+   
+    现在还有个新问题，test_triton_simple.py 中的 w2 是简单的情况，但是我们实际项目中的 moe down 是要分组量化成不同精度的，down shape: (out_features=H, in_features=sub_set_neurons)，这里有两个问题：第一，量化分组时候的朝向是按行还是按列？第二，输入 size 问题。
+    首先，我们本来就是分组量化时，量化的分组是在神经元这一维度上的，所以不会有同一个分组量化跨越神经元分组。
+    其次，输入原来如果是 batchsize * intermedia size，现在要分组量化，输入 size 就是 batchsize * sub_set_neurons。输出 size 就是 batchsize * out_features。最后多个 out 直接数值相加，多个相同尺寸的 out 变成一个原尺寸的 out。
+    我觉得这块挺清晰的逻辑。
+    然后 test 中需要增加对应的测试项目：1）按 2:1:1 切三份的方式完成前面描述的方式，都是 4bit。2）按 2:1:1 切三份方式，使用 4bit：2bit：1bit 再测试一遍。
+    9b3f04d, DONE. test_triton_mixed_precision.py
+
+
+
+    好，我们现在完成实际量化推理工作，首先明确，我们的目标是引入 Triton 融合 kernel 来替代当前推理时"先反量化再做 GEMM"的两步走方案，速度应该会更快。conda 环境是 dart312，你后续可以自己测试。
+
+    我们的基本思路是复用 triton_kernels.py 中的 kernel 实现。
+    目前已经实现好了一个正确的 triton_fused_matmul_grouped 函数，串行调用分组量化的情况。
+    /home/daodao/Develop/DartMoQ-Qwen3.5/turboquant_utils/test_triton_simple.py 中已经写好了，一个 fp16 的输入 x 矩阵（batchsize * hidden size），与 fp16 的 w1、w2 的量化后矩阵 q1、q2 （带量化参数）分别进行乘法的调用方法，支持 1bit、2bit、4bit、8bit。相当于已经有一个 "码本查找 + 逆缩放 + 逆旋转" 等完整流程了。并已经完成了基本的小矩阵乘法验证，有轻微性能损耗暂不深究。
+    
+    好，当前就是把我们实际上进行的量化完之后进行 forward 的过程换成 kernel 方法，弄完之后现在的分步反量化再 GEMM 就可以扔掉了。
+    attention 和 shared expert 部分和也要量化成 8bit （现在的 scheme 一般都是 8bit）
+    我认为可能存在的问题，测试程序的 w1、w2 分别对应 up/gate 和 down 专家的参数矩阵，你可以照猫画虎套进去。因为我们是混合精度方法呢，一个专家下面应该是有 3 套方案分别有三组矩阵，这时候就不要再拆分他们了。然后测试程序里面的码本、缩放和 packed 方法，最好不要动，如果不合适，可能需要改量化过程中的 packed 和量化过程。。让前续方法来适配调好的 kernel 。如果没有冲突那最好了。
+    注意，你可能会遇到 down proj 因为 in_features 维度的切片需要更复杂的处理的问题，这里我按 down 的方式完成了 test_triton_mixed_precision.py 中的 w2 的测试
+    还需要在项目中增加丰富的日志，方便调试和分析。
+    如果有其他问题请提出来先讨论再动手。    
