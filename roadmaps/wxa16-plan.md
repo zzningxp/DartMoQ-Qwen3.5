@@ -93,3 +93,48 @@ python turboquant_utils/test_triton_mixed_precision.py
 
 
 另外就是可以考虑要保存量化后的参数了。
+
+
+## 加速：
+1. Kernel 调用次数太多 → 优化方案
+方案：把旋转 + 多个 group 的 fused matmul 合并到一个 kernel
+不是每个 group 调用一次 triton_fused_matmul
+而是创建一个新 kernel，内部遍历处理所有 group
+或者：先在 Python 层把所有旋转做好，然后调用一个 kernel 处理所有 group
+
+这个数学上可行吗？
+混合精度时：按 slice 分别处理（每个 slice 内统一精度，一个 kernel 处理它内部的所有 group）
+
+
+2. 每次循环都做旋转矩阵计算和旋转 → 优化方案
+方案A：预计算所有旋转矩阵 + 一次性旋转所有输入
+
+不要在循环里：
+for g in groups:
+    Pi = generate_rotation_matrix(...)
+    x_rot_g = x_g @ Pi.T
+
+而是：
+x_rot_all = torch.zeros_like(x)
+for g in groups:
+    Pi = generate_rotation_matrix(...)
+    x_rot_all[:, g_start:g_end] = x[:, g_start:g_end] @ Pi.T
+然后把 x_rot_all 传给 kernel
+
+方案B（更激进）：把旋转直接做进 Triton kernel 里
+
+在 kernel 内部生成旋转矩阵（或者传进去）
+在 kernel 内部做旋转
+
+3. 每次循环都做 packed indices 的切片和 clone → 优化方案
+方案：不要切片，直接传完整 indices_packed + 偏移信息
+
+kernel 内部根据 group_idx 计算需要的位置
+不需要 clone，直接用索引访问
+
+
+4.多次 output 累加 → 优化方案
+方案：在 kernel 内部累加，或者直接一次输出
+
+把累加逻辑放到 kernel 里
+或者在 Python 层只做最后一次写入
