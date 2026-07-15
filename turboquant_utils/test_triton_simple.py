@@ -2,6 +2,7 @@
 import itertools
 """
 简单直接的 Triton 融合 kernel 测试程序。
+支持 1/2/4/8 bit 测试。
 """
 
 import argparse
@@ -27,6 +28,7 @@ def setup_seed(seed=42):
 def quantize_weight_simple(W, bit_width=4, group_size=None, seed=42):
     """
     简单的量化函数，直接返回 triton_fused_matmul 需要的所有数据。
+    支持 1/2/4/8 bit。
     """
     M, N = W.shape
     if group_size is None:
@@ -63,9 +65,9 @@ def quantize_weight_simple(W, bit_width=4, group_size=None, seed=42):
         all_indices.append(indices)
 
     full_indices = torch.cat(all_indices, dim=1)
-    norms_out = torch.stack(all_norms, dim=1) if len(all_norms) > 1 else all_norms[0]
+    norms_out = torch.stack(all_norms, dim=1) if len(all_norms) > 1 else all_indices[0]
 
-    # 打包
+    # 打包 (使用通用 nbit 打包函数)
     packed = pack_nbit(full_indices, bit_width)
 
     return {
@@ -77,8 +79,8 @@ def quantize_weight_simple(W, bit_width=4, group_size=None, seed=42):
     }
 
 
-def dequantize_weight_simple(packed_data, W_shape):
-    """简单的反量化函数"""
+def dequantize_weight_simple(packed_data, W_shape, bit_width=4):
+    """简单的反量化函数，支持 1/2/4/8 bit"""
     indices_packed = packed_data["indices_packed"]
     codebook = packed_data["codebook"]
     norms = packed_data["norms"]
@@ -88,8 +90,8 @@ def dequantize_weight_simple(packed_data, W_shape):
     M, N = W_shape
     device = indices_packed.device
 
-    # 解包索引
-    full_indices = unpack_nbit(indices_packed, 4, N)
+    # 解包索引 (使用通用 nbit 解包函数)
+    full_indices = unpack_nbit(indices_packed, bit_width, N)
 
     # 确保 norms 是二维的
     if norms.dim() == 1:
@@ -120,9 +122,9 @@ def dequantize_weight_simple(packed_data, W_shape):
 
 
 def test_w1(args):
-    """正确性测试"""
+    """正确性测试，支持 1/2/4/8 bit"""
     print("\n" + "=" * 60)
-    print("正确性测试")
+    print("正确性测试 (1/2/4/8 bit)")
     print("=" * 60)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -151,104 +153,112 @@ def test_w1(args):
     t_baseline = time.time() - t0
     print(f"  时间: {t_baseline * 1000:.2f} ms")
 
-    # 量化
-    print("\n量化权重 w1 ...")
-    packed_data = quantize_weight_simple(
-        w1, bit_width=4, group_size=group_size, seed=args.seed
-    )
+    # 测试所有 bit 宽度
+    bit_widths = [1, 2, 4, 8]
 
-    indices_packed = packed_data["indices_packed"]
-    codebook = packed_data["codebook"]
-    norms = packed_data["norms"]
-    seed_quant = packed_data["seed"]
+    for bit_width in bit_widths:
+        print(f"\n{'='*60}")
+        print(f"测试 {bit_width}-bit")
+        print(f"{'='*60}")
 
-    print(f"  indices_packed shape: {indices_packed.shape}")
-    print(f"  codebook shape: {codebook.shape}")
-    print(f"  norms shape: {norms.shape}")
+        # 量化
+        print(f"\n量化权重 w1 ({bit_width}-bit)...")
+        packed_data = quantize_weight_simple(
+            w1, bit_width=bit_width, group_size=group_size, seed=args.seed
+        )
 
-    # 方法1：先反量化再做 GEMM
-    print("\n方法1: 先反量化再做 GEMM ...")
-    t0 = time.time()
-    w1_dequant = dequantize_weight_simple(packed_data, (M, K))
-    t_dequant = time.time() - t0
+        indices_packed = packed_data["indices_packed"]
+        codebook = packed_data["codebook"]
+        norms = packed_data["norms"]
+        seed_quant = packed_data["seed"]
 
-    t0 = time.time()
-    out1 = x.float() @ w1_dequant.T
-    t_gemm = time.time() - t0
+        print(f"  indices_packed shape: {indices_packed.shape}")
+        print(f"  codebook shape: {codebook.shape}")
+        print(f"  norms shape: {norms.shape}")
 
-    print(f"  反量化时间: {t_dequant * 1000:.2f} ms")
-    print(f"  GEMM 时间: {t_gemm * 1000:.2f} ms")
-    print(f"  合计: {(t_dequant + t_gemm) * 1000:.2f} ms")
+        # 方法1：先反量化再做 GEMM
+        print(f"\n方法1: 先反量化再做 GEMM ({bit_width}-bit)...")
+        t0 = time.time()
+        w1_dequant = dequantize_weight_simple(packed_data, (M, K), bit_width=bit_width)
+        t_dequant = time.time() - t0
 
-    # 方法2：triton fused (支持分组)
-    print("\n方法2: 使用 triton_fused_matmul (分组) ...")
+        t0 = time.time()
+        out1 = x.float() @ w1_dequant.T
+        t_gemm = time.time() - t0
 
-    print("  预热 kernel ...")
-    for _ in range(3):
-        _ = triton_fused_matmul_grouped(x, indices_packed, codebook, norms, seed_quant, group_size, K)
+        print(f"  反量化时间: {t_dequant * 1000:.2f} ms")
+        print(f"  GEMM 时间: {t_gemm * 1000:.2f} ms")
+        print(f"  合计: {(t_dequant + t_gemm) * 1000:.2f} ms")
 
-    torch.cuda.synchronize()
-    t0 = time.time()
-    out2 = triton_fused_matmul_grouped(x, indices_packed, codebook, norms, seed_quant, group_size, K)
-    torch.cuda.synchronize()
-    t_fused = time.time() - t0
+        # 方法2：triton fused (支持分组)
+        print(f"\n方法2: 使用 triton_fused_matmul (分组, {bit_width}-bit)...")
 
-    print(f"  Fused kernel (分组) 时间: {t_fused * 1000:.2f} ms")
+        print("  预热 kernel ...")
+        for _ in range(3):
+            _ = triton_fused_matmul_grouped(x, indices_packed, codebook, norms, seed_quant, group_size, K, bit_width=bit_width)
 
-    # 比较结果（对比 baseline 和两种量化方法）
-    print("\n结果对比:")
-    print("  1. 先反量化再GEMM vs Baseline:")
-    out_baseline_float = out_baseline.float()
-    out1_float = out1.float()
-    abs_diff1 = torch.abs(out_baseline_float - out1_float)
-    print(f"    最大绝对误差: {abs_diff1.max().item():.6f}")
-    print(f"    平均绝对误差: {abs_diff1.mean().item():.6f}")
+        torch.cuda.synchronize()
+        t0 = time.time()
+        out2 = triton_fused_matmul_grouped(x, indices_packed, codebook, norms, seed_quant, group_size, K, bit_width=bit_width)
+        torch.cuda.synchronize()
+        t_fused = time.time() - t0
 
-    print("\n  2. Triton Fused vs Baseline:")
-    out2_float = out2.float()
-    abs_diff2 = torch.abs(out_baseline_float - out2_float)
-    print(f"    最大绝对误差: {abs_diff2.max().item():.6f}")
-    print(f"    平均绝对误差: {abs_diff2.mean().item():.6f}")
+        print(f"  Fused kernel (分组) 时间: {t_fused * 1000:.2f} ms")
 
-    print("\n  3. 先反量化再GEMM vs Triton Fused:")
-    abs_diff3 = torch.abs(out1_float - out2_float)
-    print(f"    最大绝对误差: {abs_diff3.max().item():.6f}")
-    print(f"    平均绝对误差: {abs_diff3.mean().item():.6f}")
+        # 比较结果（对比 baseline 和两种量化方法）
+        print("\n结果对比:")
+        print("  1. 先反量化再GEMM vs Baseline:")
+        out_baseline_float = out_baseline.float()
+        out1_float = out1.float()
+        abs_diff1 = torch.abs(out_baseline_float - out1_float)
+        print(f"    最大绝对误差: {abs_diff1.max().item():.6f}")
+        print(f"    平均绝对误差: {abs_diff1.mean().item():.6f}")
 
-    atol = 1e-2
-    rtol = 1e-2
-    is_close1 = torch.allclose(out1_float, out_baseline_float, atol=atol, rtol=rtol)
-    is_close2 = torch.allclose(out2_float, out_baseline_float, atol=atol, rtol=rtol)
-    is_close3 = torch.allclose(out1_float, out2_float, atol=atol, rtol=rtol)
-    print(f"\n  近似相等:")
-    print(f"    先反量化再GEMM ≈ Baseline: {is_close1}")
-    print(f"    Triton Fused ≈ Baseline: {is_close2}")
-    print(f"    先反量化再GEMM ≈ Triton Fused: {is_close3}")
+        print("\n  2. Triton Fused vs Baseline:")
+        out2_float = out2.float()
+        abs_diff2 = torch.abs(out_baseline_float - out2_float)
+        print(f"    最大绝对误差: {abs_diff2.max().item():.6f}")
+        print(f"    平均绝对误差: {abs_diff2.mean().item():.6f}")
 
-    if not is_close3:
-        print("\n  样本对比:")
-        for i in itertools.chain(range(3), range(N-3, N)):
-            for j in itertools.chain(range(3), range(M-3, M)):
-                 print(f"    baseline[{i},{j}] = {out_baseline_float[i,j]:.6f}, "
-                      f"dequant+gemm[{i},{j}] = {out1_float[i,j]:.6f}, "
-                      f"fused[{i},{j}] = {out2_float[i,j]:.6f}")
+        print("\n  3. 先反量化再GEMM vs Triton Fused:")
+        abs_diff3 = torch.abs(out1_float - out2_float)
+        print(f"    最大绝对误差: {abs_diff3.max().item():.6f}")
+        print(f"    平均绝对误差: {abs_diff3.mean().item():.6f}")
 
-    return out_baseline_float, out1_float, out2_float
+        atol = 1e-2
+        rtol = 1e-2
+        is_close1 = torch.allclose(out1_float, out_baseline_float, atol=atol, rtol=rtol)
+        is_close2 = torch.allclose(out2_float, out_baseline_float, atol=atol, rtol=rtol)
+        is_close3 = torch.allclose(out1_float, out2_float, atol=atol, rtol=rtol)
+        print(f"\n  近似相等:")
+        print(f"    先反量化再GEMM ≈ Baseline: {is_close1}")
+        print(f"    Triton Fused ≈ Baseline: {is_close2}")
+        print(f"    先反量化再GEMM ≈ Triton Fused: {is_close3}")
+
+        if not is_close3:
+            print("\n  样本对比:")
+            for i in itertools.chain(range(3), range(N-3, N)):
+                for j in itertools.chain(range(3), range(M-3, M)):
+                    print(f"    baseline[{i},{j}] = {out_baseline_float[i,j]:.6f}, "
+                          f"dequant+gemm[{i},{j}] = {out1_float[i,j]:.6f}, "
+                          f"fused[{i},{j}] = {out2_float[i,j]:.6f}")
+
+    return out_baseline
 
 
 def test_w1_w2(args):
-    """两个连续矩阵乘法的测试：w1(1024x512) -> w2(512x1024)"""
+    """两个连续矩阵乘法的测试：w1(1024x512) -> w2(512x1024)，支持 1/2/4/8 bit"""
     print("\n" + "=" * 60)
-    print("两个连续矩阵乘法测试")
+    print("两个连续矩阵乘法测试 (1/2/4/8 bit)")
     print("=" * 60)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
     # 按照需求设置尺寸
-    # w1: 1024 * 512 (out_features x in_features)
-    # w2: 512 * 1024 (out_features x in_features)
-    # x: 16 * 1024
+    # w1: 1024 x 512 (out_features x in_features)
+    # w2: 512 x 1024 (out_features x in_features)
+    # x: 16 x 1024
     M1, K1 = 1024, 512  # w1 shape
     M2, K2 = 512, 1024  # w2 shape
     batch_size = 16
@@ -275,113 +285,121 @@ def test_w1_w2(args):
     t_baseline = time.time() - t0
     print(f"  时间: {t_baseline * 1000:.2f} ms")
 
-    # 量化 w1 和 w2
-    print("\n量化权重 w1 ...")
-    packed_data_w1 = quantize_weight_simple(
-        w1, bit_width=4, group_size=group_size, seed=args.seed
-    )
-    print("量化权重 w2 ...")
-    packed_data_w2 = quantize_weight_simple(
-        w2, bit_width=4, group_size=group_size, seed=args.seed + 1000
-    )
+    # 测试所有 bit 宽度
+    bit_widths = [1, 2, 4, 8]
 
-    indices_packed_w1 = packed_data_w1["indices_packed"]
-    codebook_w1 = packed_data_w1["codebook"]
-    norms_w1 = packed_data_w1["norms"]
-    seed_w1 = packed_data_w1["seed"]
+    for bit_width in bit_widths:
+        print(f"\n{'='*60}")
+        print(f"测试 {bit_width}-bit")
+        print(f"{'='*60}")
 
-    indices_packed_w2 = packed_data_w2["indices_packed"]
-    codebook_w2 = packed_data_w2["codebook"]
-    norms_w2 = packed_data_w2["norms"]
-    seed_w2 = packed_data_w2["seed"]
+        # 量化 w1 和 w2
+        print(f"\n量化权重 w1 ({bit_width}-bit)...")
+        packed_data_w1 = quantize_weight_simple(
+            w1, bit_width=bit_width, group_size=group_size, seed=args.seed
+        )
+        print(f"量化权重 w2 ({bit_width}-bit)...")
+        packed_data_w2 = quantize_weight_simple(
+            w2, bit_width=bit_width, group_size=group_size, seed=args.seed + 1000
+        )
 
-    print(f"  w1 indices_packed shape: {indices_packed_w1.shape}")
-    print(f"  w2 indices_packed shape: {indices_packed_w2.shape}")
+        indices_packed_w1 = packed_data_w1["indices_packed"]
+        codebook_w1 = packed_data_w1["codebook"]
+        norms_w1 = packed_data_w1["norms"]
+        seed_w1 = packed_data_w1["seed"]
 
-    # 方法1：先反量化再做 GEMM
-    print("\n方法1: 先反量化再做 GEMM ...")
-    t0 = time.time()
-    w1_dequant = dequantize_weight_simple(packed_data_w1, (M1, K1))
-    w2_dequant = dequantize_weight_simple(packed_data_w2, (M2, K2))
-    t_dequant = time.time() - t0
+        indices_packed_w2 = packed_data_w2["indices_packed"]
+        codebook_w2 = packed_data_w2["codebook"]
+        norms_w2 = packed_data_w2["norms"]
+        seed_w2 = packed_data_w2["seed"]
 
-    t0 = time.time()
-    y1_dequant = x.float() @ w2_dequant.T
-    y2_dequant = y1_dequant @ w1_dequant.T
-    t_gemm = time.time() - t0
+        print(f"  w1 indices_packed shape: {indices_packed_w1.shape}")
+        print(f"  w2 indices_packed shape: {indices_packed_w2.shape}")
 
-    print(f"  反量化时间: {t_dequant * 1000:.2f} ms")
-    print(f"  GEMM 时间: {t_gemm * 1000:.2f} ms")
-    print(f"  合计: {(t_dequant + t_gemm) * 1000:.2f} ms")
+        # 方法1：先反量化再做 GEMM
+        print(f"\n方法1: 先反量化再做 GEMM ({bit_width}-bit)...")
+        t0 = time.time()
+        w1_dequant = dequantize_weight_simple(packed_data_w1, (M1, K1), bit_width=bit_width)
+        w2_dequant = dequantize_weight_simple(packed_data_w2, (M2, K2), bit_width=bit_width)
+        t_dequant = time.time() - t0
 
-    # 方法2：triton fused (支持分组)
-    print("\n方法2: 使用 triton_fused_matmul (分组) ...")
+        t0 = time.time()
+        y1_dequant = x.float() @ w2_dequant.T
+        y2_dequant = y1_dequant @ w1_dequant.T
+        t_gemm = time.time() - t0
 
-    print("  预热 kernel ...")
-    for _ in range(3):
-        _ = triton_fused_matmul_grouped(x, indices_packed_w2, codebook_w2, norms_w2, seed_w2, group_size, K2)
-        _ = triton_fused_matmul_grouped(y1_baseline.half(), indices_packed_w1, codebook_w1, norms_w1, seed_w1, group_size, K1)
+        print(f"  反量化时间: {t_dequant * 1000:.2f} ms")
+        print(f"  GEMM 时间: {t_gemm * 1000:.2f} ms")
+        print(f"  合计: {(t_dequant + t_gemm) * 1000:.2f} ms")
 
-    torch.cuda.synchronize()
-    t0 = time.time()
-    y1_fused = triton_fused_matmul_grouped(x, indices_packed_w2, codebook_w2, norms_w2, seed_w2, group_size, K2)
-    y2_fused = triton_fused_matmul_grouped(y1_fused.half(), indices_packed_w1, codebook_w1, norms_w1, seed_w1, group_size, K1)
-    torch.cuda.synchronize()
-    t_fused = time.time() - t0
+        # 方法2：triton fused (支持分组)
+        print(f"\n方法2: 使用 triton_fused_matmul (分组, {bit_width}-bit)...")
 
-    print(f"  Fused kernel (分组) 时间: {t_fused * 1000:.2f} ms")
+        print("  预热 kernel ...")
+        for _ in range(3):
+            _ = triton_fused_matmul_grouped(x, indices_packed_w2, codebook_w2, norms_w2, seed_w2, group_size, K2, bit_width=bit_width)
+            _ = triton_fused_matmul_grouped(y1_baseline.half(), indices_packed_w1, codebook_w1, norms_w1, seed_w1, group_size, K1, bit_width=bit_width)
 
-    # 比较结果
-    print("\n结果对比 (y2 最终输出 16x1024):")
-    print("  1. 先反量化再GEMM vs Baseline:")
-    y2_baseline_float = y2_baseline.float()
-    y2_dequant_float = y2_dequant.float()
-    abs_diff1 = torch.abs(y2_baseline_float - y2_dequant_float)
-    print(f"    最大绝对误差: {abs_diff1.max().item():.6f}")
-    print(f"    平均绝对误差: {abs_diff1.mean().item():.6f}")
+        torch.cuda.synchronize()
+        t0 = time.time()
+        y1_fused = triton_fused_matmul_grouped(x, indices_packed_w2, codebook_w2, norms_w2, seed_w2, group_size, K2, bit_width=bit_width)
+        y2_fused = triton_fused_matmul_grouped(y1_fused.half(), indices_packed_w1, codebook_w1, norms_w1, seed_w1, group_size, K1, bit_width=bit_width)
+        torch.cuda.synchronize()
+        t_fused = time.time() - t0
 
-    print("\n  2. Triton Fused vs Baseline:")
-    y2_fused_float = y2_fused.float()
-    abs_diff2 = torch.abs(y2_baseline_float - y2_fused_float)
-    print(f"    最大绝对误差: {abs_diff2.max().item():.6f}")
-    print(f"    平均绝对误差: {abs_diff2.mean().item():.6f}")
+        print(f"  Fused kernel (分组) 时间: {t_fused * 1000:.2f} ms")
 
-    print("\n  3. 先反量化再GEMM vs Triton Fused:")
-    abs_diff3 = torch.abs(y2_dequant_float - y2_fused_float)
-    print(f"    最大绝对误差: {abs_diff3.max().item():.6f}")
-    print(f"    平均绝对误差: {abs_diff3.mean().item():.6f}")
+        # 比较结果
+        print(f"\n结果对比 (y2 最终输出 16x1024, {bit_width}-bit):")
+        print("  1. 先反量化再GEMM vs Baseline:")
+        y2_baseline_float = y2_baseline.float()
+        y2_dequant_float = y2_dequant.float()
+        abs_diff1 = torch.abs(y2_baseline_float - y2_dequant_float)
+        print(f"    最大绝对误差: {abs_diff1.max().item():.6f}")
+        print(f"    平均绝对误差: {abs_diff1.mean().item():.6f}")
 
-    atol = 1e-2
-    rtol = 1e-2
-    is_close1 = torch.allclose(y2_dequant_float, y2_baseline_float, atol=atol, rtol=rtol)
-    is_close2 = torch.allclose(y2_fused_float, y2_baseline_float, atol=atol, rtol=rtol)
-    is_close3 = torch.allclose(y2_dequant_float, y2_fused_float, atol=atol, rtol=rtol)
-    print(f"\n  近似相等:")
-    print(f"    先反量化再GEMM ≈ Baseline: {is_close1}")
-    print(f"    Triton Fused ≈ Baseline: {is_close2}")
-    print(f"    先反量化再GEMM ≈ Triton Fused: {is_close3}")
+        print("\n  2. Triton Fused vs Baseline:")
+        y2_fused_float = y2_fused.float()
+        abs_diff2 = torch.abs(y2_baseline_float - y2_fused_float)
+        print(f"    最大绝对误差: {abs_diff2.max().item():.6f}")
+        print(f"    平均绝对误差: {abs_diff2.mean().item():.6f}")
 
-    if not is_close3:
-        print("\n  样本对比 (y2):")
-        for i in itertools.chain(range(3), range(batch_size-3, batch_size)):
-            for j in itertools.chain(range(3), range(M1-3, M1)):
-                 print(f"    baseline[{i},{j}] = {y2_baseline_float[i,j]:.6f}, "
-                      f"dequant+gemm[{i,j}] = {y2_dequant_float[i,j]:.6f}, "
-                      f"fused[{i,j}] = {y2_fused_float[i,j]:.6f}")
+        print("\n  3. 先反量化再GEMM vs Triton Fused:")
+        abs_diff3 = torch.abs(y2_dequant_float - y2_fused_float)
+        print(f"    最大绝对误差: {abs_diff3.max().item():.6f}")
+        print(f"    平均绝对误差: {abs_diff3.mean().item():.6f}")
 
-    print("\n中间结果 y1 (16x512) 对比:")
-    print("  Triton Fused y1 vs Baseline y1:")
-    y1_fused_float = y1_fused.float()
-    y1_baseline_float = y1_baseline.float()
-    abs_diff_y1 = torch.abs(y1_baseline_float - y1_fused_float)
-    print(f"    最大绝对误差: {abs_diff_y1.max().item():.6f}")
-    print(f"    平均绝对误差: {abs_diff_y1.mean().item():.6f}")
+        atol = 1e-2
+        rtol = 1e-2
+        is_close1 = torch.allclose(y2_dequant_float, y2_baseline_float, atol=atol, rtol=rtol)
+        is_close2 = torch.allclose(y2_fused_float, y2_baseline_float, atol=atol, rtol=rtol)
+        is_close3 = torch.allclose(y2_dequant_float, y2_fused_float, atol=atol, rtol=rtol)
+        print(f"\n  近似相等:")
+        print(f"    先反量化再GEMM ≈ Baseline: {is_close1}")
+        print(f"    Triton Fused ≈ Baseline: {is_close2}")
+        print(f"    先反量化再GEMM ≈ Triton Fused: {is_close3}")
 
-    return y2_baseline_float, y2_dequant_float, y2_fused_float
+        if not is_close3:
+            print(f"\n  样本对比 (y2, {bit_width}-bit):")
+            for i in itertools.chain(range(3), range(batch_size-3, batch_size)):
+                for j in itertools.chain(range(3), range(M1-3, M1)):
+                    print(f"    baseline[{i},{j}] = {y2_baseline_float[i,j]:.6f}, "
+                          f"dequant+gemm[{i},{j}] = {y2_dequant_float[i,j]:.6f}, "
+                          f"fused[{i},{j}] = {y2_fused_float[i,j]:.6f}")
+
+        print(f"\n中间结果 y1 (16x512) 对比 ({bit_width}-bit):")
+        print("  Triton Fused y1 vs Baseline y1:")
+        y1_fused_float = y1_fused.float()
+        y1_baseline_float = y1_baseline.float()
+        abs_diff_y1 = torch.abs(y1_baseline_float - y1_fused_float)
+        print(f"    最大绝对误差: {abs_diff_y1.max().item():.6f}")
+        print(f"    平均绝对误差: {abs_diff_y1.mean().item():.6f}")
+
+    return y2_baseline
 
 
 def main():
-    parser = argparse.ArgumentParser(description="测试 Triton 融合反量化+GEMM kernel")
+    parser = argparse.ArgumentParser(description="测试 Triton 融合反量化+GEMM kernel (1/2/4/8 bit)")
 
     parser.add_argument("--M", type=int, default=8192, help="w1 shape[0]")
     parser.add_argument("--K", type=int, default=1024, help="w1 shape[1]")
@@ -393,7 +411,7 @@ def main():
 
     setup_seed(args.seed)
 
-    print("\nTriton 融合反量化+GEMM 测试程序")
+    print("\nTriton 融合反量化+GEMM 测试程序 (支持 1/2/4/8 bit)")
 
     test_w1(args)
     test_w1_w2(args)
