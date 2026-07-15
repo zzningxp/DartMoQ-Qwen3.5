@@ -13,8 +13,8 @@ import gc
 from wxa16_linear import WxA16Linear
 from turboquant_utils.quantize import turboquant_quantize_packed_full
 from turboquant_utils.triton_kernels import (
-    triton_fused_matmul_grouped_slice_rows,
-    triton_fused_matmul_grouped_slice_in_features
+    triton_fused_matmul_grouped_slice_rows_optv1 as triton_fused_matmul_grouped_slice_rows,
+    triton_fused_matmul_grouped_slice_in_features_optv1 as triton_fused_matmul_grouped_slice_in_features
 )
 
 

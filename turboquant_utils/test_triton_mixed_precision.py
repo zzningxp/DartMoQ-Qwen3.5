@@ -30,90 +30,6 @@ from turboquant_utils.triton_kernels import (
     triton_fused_matmul_grouped,
     triton_fused_matmul_grouped_slice_in_features
 )
-
-# ========== 先在这里放优化版，做测试 ==========
-def triton_fused_matmul_grouped_slice_in_features_optv1(
-    x, indices_packed, codebook, norms, seed, group_size,
-    original_start, original_end, full_in_features, bit_width: int = 4
-):
-    """
-    保守优化版v1：和原版逻辑100%一致，只预计算旋转，保留clone
-    """
-    if bit_width not in {1, 2, 4, 8}:
-        raise ValueError(f"bit_width must be 1/2/4/8, got {bit_width}")
-
-    # 验证边界对齐
-    if original_start % group_size != 0:
-        raise ValueError(f"original_start ({original_start}) must be aligned to group_size ({group_size})")
-
-    # 确保 seed 是 Python int
-    if isinstance(seed, torch.Tensor):
-        seed = int(seed.item())
-
-    batch_size = x.shape[0]
-    out_features = indices_packed.shape[0]
-    slice_in_features = original_end - original_start
-    ELEMENTS_PER_BYTE = 8 // bit_width
-
-    # 确保 norms 是二维的
-    if norms.dim() == 1:
-        norms = norms.unsqueeze(1)
-
-    # ========== 优化1：预计算所有旋转后的 x ==========
-    num_groups_in_slice = (slice_in_features + group_size - 1) // group_size
-    x_rot_list = []
-    for group_idx_in_slice in range(num_groups_in_slice):
-        g_start_in_slice = group_idx_in_slice * group_size
-        g_end_in_slice = min(g_start_in_slice + group_size, slice_in_features)
-        g_dim = g_end_in_slice - g_start_in_slice
-
-        # 计算在完整 in_features 中的真实位置
-        g_start_original = original_start + g_start_in_slice
-
-        # 预计算旋转（和原版完全一样）
-        from turboquant_utils.rotation import generate_rotation_matrix
-        Pi = generate_rotation_matrix(g_dim, seed + g_start_original, device=x.device)
-        x_g = x[:, g_start_in_slice:g_end_in_slice].float()
-        x_rot_g = x_g @ Pi.T
-        x_rot_list.append(x_rot_g)
-
-    # ========== 和原版完全一样的循环，只是用预计算的 x_rot ==========
-    from turboquant_utils.triton_kernels import triton_fused_matmul
-    output = torch.zeros(batch_size, out_features, dtype=torch.float32, device=x.device)
-
-    group_idx_in_slice = 0
-    for g_start_in_slice in range(0, slice_in_features, group_size):
-        g_end_in_slice = min(g_start_in_slice + group_size, slice_in_features)
-        g_dim = g_end_in_slice - g_start_in_slice
-
-        # 计算在完整 in_features 中的真实位置
-        g_start_original = original_start + g_start_in_slice
-
-        # 用预计算的旋转结果
-        x_rot_g = x_rot_list[group_idx_in_slice]
-
-        # 和原版一样：切片 + clone
-        packed_start = g_start_original // ELEMENTS_PER_BYTE
-        packed_end = g_start_original + g_dim
-        if packed_end % ELEMENTS_PER_BYTE != 0:
-            packed_end = (packed_end // ELEMENTS_PER_BYTE) + 1
-        else:
-            packed_end = packed_end // ELEMENTS_PER_BYTE
-        indices_packed_g = indices_packed[:, packed_start:packed_end].clone()
-
-        # 和原版一样：取出 norms
-        group_idx_original = g_start_original // group_size
-        norms_g = norms[:, group_idx_original]
-
-        # 和原版一样：调用 kernel
-        out_g = triton_fused_matmul(x_rot_g, indices_packed_g, codebook, norms_g, g_dim, bit_width)
-
-        # 和原版一样：累加
-        output += out_g
-
-        group_idx_in_slice += 1
-
-    return output
 from turboquant_utils.codebook import get_codebook
 from turboquant_utils.rotation import generate_rotation_matrix
 from turboquant_utils.quantize import pack_nbit, unpack_nbit
@@ -293,9 +209,9 @@ def test_mixed_precision(args):
     print("Baseline: 原始矩阵乘法（不量化）")
     print("-" * 70)
 
-    # 预热
-    for _ in range(3):
-        _ = x @ W_down.T
+    # # 预热
+    # for _ in range(3):
+    #     _ = x @ W_down.T
 
     torch.cuda.synchronize()
     t0 = time.time()
@@ -335,23 +251,6 @@ def test_mixed_precision(args):
     # 方法2：Triton fused 分别处理每个切片
     print("\n方法2: Triton fused kernel - 分别切片 (4bit)...")
 
-    # print("  预热 kernel...")
-    # for _ in range(3):
-    #     out_triton_test = torch.zeros(B, H, dtype=torch.float32, device=device)
-    #     for i, (start, end) in enumerate(slice_boundaries):
-    #         x_slice = x[:, start:end]
-    #         slice_out = triton_fused_matmul_grouped(
-    #             x_slice,
-    #             packed_data_full_4bit["indices_packed"][:, start // 2: (end + 1) // 2].clone(),
-    #             packed_data_full_4bit["codebook"],
-    #             packed_data_full_4bit["norms"],
-    #             packed_data_full_4bit["seed"],
-    #             packed_data_full_4bit["group_size"],
-    #             end - start,
-    #             bit_width=4
-    #         )
-    #         out_triton_test += slice_out
-
     torch.cuda.synchronize()
     t0 = time.time()
 
@@ -375,10 +274,10 @@ def test_mixed_precision(args):
 
     print(f"  时间: {t_triton_separate * 1000:.2f} ms")
 
-    # 方法3：新函数 triton_fused_matmul_grouped_slice_in_features
-    print("\n方法3: Triton fused kernel - 新函数 (4bit)...")
+    # 方法4：优化版v1
+    print("\n方法4: Triton fused kernel - 优化版v1 (4bit)...")
 
-    # print("  预热 kernel...")
+    # 预热
     # for _ in range(3):
     #     out_triton_test = torch.zeros(B, H, dtype=torch.float32, device=device)
     #     for i, (start, end) in enumerate(slice_boundaries):
@@ -398,53 +297,10 @@ def test_mixed_precision(args):
     torch.cuda.synchronize()
     t0 = time.time()
 
-    out_triton_new_4bit = torch.zeros(B, H, dtype=torch.float32, device=device)
-    for i, (start, end) in enumerate(slice_boundaries):
-        x_slice = x[:, start:end]
-        slice_out = triton_fused_matmul_grouped_slice_in_features(
-            x_slice,
-            packed_data_full_4bit["indices_packed"],
-            packed_data_full_4bit["codebook"],
-            packed_data_full_4bit["norms"],
-            packed_data_full_4bit["seed"],
-            packed_data_full_4bit["group_size"],
-            start, end, K,
-            bit_width=4
-        )
-        out_triton_new_4bit += slice_out
-
-    torch.cuda.synchronize()
-    t_triton_new = time.time() - t0
-
-    print(f"  时间: {t_triton_new * 1000:.2f} ms")
-
-    # 方法4：优化版v1
-    print("\n方法4: Triton fused kernel - 优化版v1 (4bit)...")
-
-    # 预热
-    for _ in range(3):
-        out_triton_test = torch.zeros(B, H, dtype=torch.float32, device=device)
-        for i, (start, end) in enumerate(slice_boundaries):
-            x_slice = x[:, start:end]
-            slice_out = triton_fused_matmul_grouped_slice_in_features_optv1(
-                x_slice,
-                packed_data_full_4bit["indices_packed"],
-                packed_data_full_4bit["codebook"],
-                packed_data_full_4bit["norms"],
-                packed_data_full_4bit["seed"],
-                packed_data_full_4bit["group_size"],
-                start, end, K,
-                bit_width=4
-            )
-            out_triton_test += slice_out
-
-    torch.cuda.synchronize()
-    t0 = time.time()
-
     out_triton_optv1_4bit = torch.zeros(B, H, dtype=torch.float32, device=device)
     for i, (start, end) in enumerate(slice_boundaries):
         x_slice = x[:, start:end]
-        slice_out = triton_fused_matmul_grouped_slice_in_features_optv1(
+        slice_out = triton_fused_matmul_grouped_slice_in_features(
             x_slice,
             packed_data_full_4bit["indices_packed"],
             packed_data_full_4bit["codebook"],
@@ -466,14 +322,11 @@ def test_mixed_precision(args):
     out_baseline_float = out_baseline.float()
     out_dequant_float = out_dequant_4bit.float()
     out_triton_float = out_triton_4bit.float()
-    out_triton_new_float = out_triton_new_4bit.float()
     out_triton_optv1_float = out_triton_optv1_4bit.float()
 
     abs_diff_dequant = torch.abs(out_baseline_float - out_dequant_float)
     abs_diff_triton = torch.abs(out_baseline_float - out_triton_float)
-    abs_diff_triton_new = torch.abs(out_baseline_float - out_triton_new_float)
     abs_diff_triton_optv1 = torch.abs(out_baseline_float - out_triton_optv1_float)
-    abs_diff_between = torch.abs(out_triton_float - out_triton_new_float)
 
     print(f"  反量化+GEMM vs Baseline:")
     print(f"    最大绝对误差: {abs_diff_dequant.max().item():.6f}")
@@ -483,17 +336,9 @@ def test_mixed_precision(args):
     print(f"    最大绝对误差: {abs_diff_triton.max().item():.6f}")
     print(f"    平均绝对误差: {abs_diff_triton.mean().item():.6f}")
 
-    print(f"\n  Triton 新函数 vs Baseline:")
-    print(f"    最大绝对误差: {abs_diff_triton_new.max().item():.6f}")
-    print(f"    平均绝对误差: {abs_diff_triton_new.mean().item():.6f}")
-
     print(f"\n  Triton 优化版v1 vs Baseline:")
     print(f"    最大绝对误差: {abs_diff_triton_optv1.max().item():.6f}")
     print(f"    平均绝对误差: {abs_diff_triton_optv1.mean().item():.6f}")
-
-    print(f"\n  Triton 分别切片 vs Triton 新函数:")
-    print(f"    最大绝对误差: {abs_diff_between.max().item():.6f}")
-    print(f"    平均绝对误差: {abs_diff_between.mean():.6f}")
 
     # 测试场景2：混合精度 4bit:2bit:1bit
     print("\n" + "=" * 70)
@@ -534,123 +379,16 @@ def test_mixed_precision(args):
     print("\n方法2: Triton fused kernel (混合精度)...")
 
     torch.cuda.synchronize()
-    t0 = time.time()
-
-    out_triton_mixed = torch.zeros(B, H, dtype=torch.float32, device=device)
-    for i, (packed_data, x_slice) in enumerate(zip(packed_data_list_mixed, x_slices)):
-        slice_out = triton_fused_matmul_grouped(
-            x_slice,
-            packed_data["indices_packed"],
-            packed_data["codebook"],
-            packed_data["norms"],
-            packed_data["seed"],
-            packed_data["group_size"],
-            x_slice.shape[1],
-            bit_width=packed_data["bit_width"]
-        )
-        out_triton_mixed += slice_out
-
-    torch.cuda.synchronize()
-    t_triton_mixed = time.time() - t0
-
-    print(f"  时间: {t_triton_mixed * 1000:.2f} ms")
 
     # 方法3：Triton fused - 优化版v1（混合精度）
     print("\n方法3: Triton fused kernel - 优化版v1 (混合精度)...")
-
-    # 保守的优化版v1：和原版逻辑100%一致，只是把旋转预计算，clone保留
-    def triton_fused_matmul_grouped_optv1(
-        x, indices_packed, codebook, norms, seed, group_size, in_features, bit_width: int = 4
-    ):
-        """
-        保守优化版v1：和原版逻辑完全一致，只预计算旋转，保留clone
-        """
-        if bit_width not in {1, 2, 4, 8}:
-            raise ValueError(f"bit_width must be 1/2/4/8, got {bit_width}")
-
-        # 确保 seed 是 Python int
-        if isinstance(seed, torch.Tensor):
-            seed = int(seed.item())
-
-        batch_size = x.shape[0]
-        out_features = indices_packed.shape[0]
-        ELEMENTS_PER_BYTE = 8 // bit_width
-
-        # 确保 norms 是二维的
-        if norms.dim() == 1:
-            norms = norms.unsqueeze(1)
-
-        output = torch.zeros(batch_size, out_features, dtype=torch.float32, device=x.device)
-
-        # 预计算所有旋转后的 x
-        num_groups = (in_features + group_size - 1) // group_size
-        x_rot_list = []
-        for group_idx in range(num_groups):
-            g_start = group_idx * group_size
-            g_end = min(g_start + group_size, in_features)
-            g_dim = g_end - g_start
-
-            # 和原版一样的旋转计算
-            from turboquant_utils.rotation import generate_rotation_matrix
-            Pi = generate_rotation_matrix(g_dim, seed + g_start, device=x.device)
-            x_g = x[:, g_start:g_end].float()
-            x_rot_g = x_g @ Pi.T
-            x_rot_list.append(x_rot_g)
-
-        # 和原版完全一样的循环，只是用预计算的 x_rot
-        from turboquant_utils.triton_kernels import triton_fused_matmul
-        group_idx = 0
-        for g_start in range(0, in_features, group_size):
-            g_end = min(g_start + group_size, in_features)
-            g_dim = g_end - g_start
-
-            # 用预计算的旋转结果
-            x_rot_g = x_rot_list[group_idx]
-
-            # 和原版一样：切片 + clone
-            packed_start = g_start // ELEMENTS_PER_BYTE
-            packed_end = g_start + g_dim
-            if packed_end % ELEMENTS_PER_BYTE != 0:
-                packed_end = (packed_end // ELEMENTS_PER_BYTE) + 1
-            else:
-                packed_end = packed_end // ELEMENTS_PER_BYTE
-            indices_packed_g = indices_packed[:, packed_start:packed_end].clone()
-
-            # 和原版一样：取出 norms
-            norms_g = norms[:, group_idx]
-
-            # 和原版一样：调用 kernel
-            out_g = triton_fused_matmul(x_rot_g, indices_packed_g, codebook, norms_g, g_dim, bit_width)
-
-            # 和原版一样：累加
-            output += out_g
-
-            group_idx += 1
-
-        return output
-
-    # 预热
-    for _ in range(3):
-        out_triton_test = torch.zeros(B, H, dtype=torch.float32, device=device)
-        for i, (packed_data, x_slice) in enumerate(zip(packed_data_list_mixed, x_slices)):
-            slice_out = triton_fused_matmul_grouped_optv1(
-                x_slice,
-                packed_data["indices_packed"],
-                packed_data["codebook"],
-                packed_data["norms"],
-                packed_data["seed"],
-                packed_data["group_size"],
-                x_slice.shape[1],
-                bit_width=packed_data["bit_width"]
-            )
-            out_triton_test += slice_out
 
     torch.cuda.synchronize()
     t0 = time.time()
 
     out_triton_mixed_optv1 = torch.zeros(B, H, dtype=torch.float32, device=device)
     for i, (packed_data, x_slice) in enumerate(zip(packed_data_list_mixed, x_slices)):
-        slice_out = triton_fused_matmul_grouped_optv1(
+        slice_out = triton_fused_matmul_grouped(
             x_slice,
             packed_data["indices_packed"],
             packed_data["codebook"],
@@ -670,22 +408,15 @@ def test_mixed_precision(args):
     # 验证结果
     print("\n结果对比 (场景2 - 混合精度):")
     out_dequant_mixed_float = out_dequant_mixed.float()
-    out_triton_mixed_float = out_triton_mixed.float()
     out_triton_mixed_optv1_float = out_triton_mixed_optv1.float()
 
     abs_diff_dequant_mixed = torch.abs(out_baseline_float - out_dequant_mixed_float)
-    abs_diff_triton_mixed = torch.abs(out_baseline_float - out_triton_mixed_float)
     abs_diff_triton_mixed_optv1 = torch.abs(out_baseline_float - out_triton_mixed_optv1_float)
-    abs_diff_between_mixed = torch.abs(out_dequant_mixed_float - out_triton_mixed_float)
-    abs_diff_versions = torch.abs(out_triton_mixed_float - out_triton_mixed_optv1_float)
+    abs_diff_between_mixed = torch.abs(out_dequant_mixed_float - out_triton_mixed_optv1_float)
 
     print(f"  反量化+GEMM vs Baseline:")
     print(f"    最大绝对误差: {abs_diff_dequant_mixed.max().item():.6f}")
     print(f"    平均绝对误差: {abs_diff_dequant_mixed.mean().item():.6f}")
-
-    print(f"\n  Triton Fused vs Baseline:")
-    print(f"    最大绝对误差: {abs_diff_triton_mixed.max().item():.6f}")
-    print(f"    平均绝对误差: {abs_diff_triton_mixed.mean().item():.6f}")
 
     print(f"\n  Triton Fused 优化版v1 vs Baseline:")
     print(f"    最大绝对误差: {abs_diff_triton_mixed_optv1.max().item():.6f}")
@@ -695,10 +426,6 @@ def test_mixed_precision(args):
     print(f"    最大绝对误差: {abs_diff_between_mixed.max().item():.6f}")
     print(f"    平均绝对误差: {abs_diff_between_mixed.mean():.6f}")
 
-    print(f"\n  Triton Fused vs Triton 优化版v1:")
-    print(f"    最大绝对误差: {abs_diff_versions.max().item():.6f}")
-    print(f"    平均绝对误差: {abs_diff_versions.mean():.6f}")
-
     print("\n" + "=" * 70)
     print("性能汇总")
     print("=" * 70)
@@ -706,11 +433,9 @@ def test_mixed_precision(args):
     print(f"  场景1 - 全4bit:")
     print(f"    反量化+GEMM:         {t_dequant * 1000:8.2f} ms")
     print(f"    Triton 分别切片:     {t_triton_separate * 1000:8.2f} ms")
-    print(f"    Triton 新函数:       {t_triton_new * 1000:8.2f} ms")
-    print(f"    Triton 优化版v1:     {t_triton_optv1 * 1000:8.2f} ms")
+    print(f"    Triton Fused:     {t_triton_optv1 * 1000:8.2f} ms")
     print(f"  场景2 - 混合4:2:1bit:")
     print(f"    反量化+GEMM:         {t_dequant_mixed * 1000:8.2f} ms")
-    print(f"    Triton Fused:        {t_triton_mixed * 1000:8.2f} ms")
     print(f"    Triton 优化版v1:     {t_triton_mixed_optv1 * 1000:8.2f} ms")
 
 
