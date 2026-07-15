@@ -28,6 +28,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from turboquant_utils.triton_kernels import (
     triton_fused_matmul_grouped,
+    triton_fused_matmul_grouped_slice_rows,
     triton_fused_matmul_grouped_slice_in_features
 )
 from turboquant_utils.codebook import get_codebook
