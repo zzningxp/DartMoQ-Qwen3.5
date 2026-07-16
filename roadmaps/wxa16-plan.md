@@ -78,7 +78,17 @@
 
 不过这里 9.2s 还是挺慢的。。
 并且现在精度还有下降！
+积累到 40 层的话 ppl 已经压不住了，，
 
+| git      | model            | sli | qsch              | rank                     | qmode      | qlayers | wiki    | c4      | status | time    | t_quant  | t_ppl   | t_wiki | t_c4   | err |
+|----------|------------------|-----|-------------------|--------------------------|------------|---------|---------|---------|---------|--------|---------|----------|---------|--------|--------|
+| aac6342  | Qwen3.5-35B-A3B  | 4   | global-a8s8m2bpw  | turboquant_innerproduct  | turboquant | all     | 7.6864  | 11.2656 | ok      | 8654.59 | 8253.99  | 400.6   | 154.49 | 246.11 |     |
+| efb4122  | Qwen3.5-35B-A3B  | 4   | global-a8s8m2bpw  | turboquant_innerproduct  | turboquant | all     | 11.2955 | 15.7725 | ok      | 8456.37 | 7493.08  | 963.29  | 358.03 | 605.26 |     |  
+
+  反量化+GEMM vs Triton Fused:
+    最大绝对误差: 0.149887
+    平均绝对误差: 0.026660
+    
 python turboquant_utils/test_triton_mixed_precision.py
   Baseline:                  0.14 ms
   场景1 - 全4bit:

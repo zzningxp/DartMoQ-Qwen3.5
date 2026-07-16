@@ -104,7 +104,7 @@ def _turboquant_fused_matmul_kernel_nbit(
         acc += tl.dot(
             inp_tile.to(tl.float32),
             tl.trans(w_quant.to(tl.float32)),
-            allow_tf32=True,
+            allow_tf32=False,
         )
 
     norm_vals = tl.load(norms_ptr + rn, mask=mask_n, other=1.0)
@@ -206,7 +206,7 @@ def _turboquant_fused_dual_matmul_kernel_nbit(
         idx1 = idx1.to(tl.int32)
         w1 = tl.load(codebook1_ptr + idx1, mask=w_mask, other=0.0)
 
-        acc1 += tl.dot(inp1.to(tl.float32), tl.trans(w1.to(tl.float32)), allow_tf32=True)
+        acc1 += tl.dot(inp1.to(tl.float32), tl.trans(w1.to(tl.float32)), allow_tf32=False)
 
         if SAME_INPUT:
             inp2 = inp1
@@ -219,7 +219,7 @@ def _turboquant_fused_dual_matmul_kernel_nbit(
         idx2 = idx2.to(tl.int32)
         w2 = tl.load(codebook2_ptr + idx2, mask=w_mask, other=0.0)
 
-        acc2 += tl.dot(inp2.to(tl.float32), tl.trans(w2.to(tl.float32)), allow_tf32=True)
+        acc2 += tl.dot(inp2.to(tl.float32), tl.trans(w2.to(tl.float32)), allow_tf32=False)
 
     n1 = tl.load(norms1_ptr + rn, mask=mask_n, other=1.0)
     n2 = tl.load(norms2_ptr + rn, mask=mask_n, other=1.0)
@@ -316,11 +316,10 @@ def triton_fused_matmul_grouped(
         x_rot_g = x_rot_list[group_idx]
 
         packed_start = g_start // ELEMENTS_PER_BYTE
-        packed_end = g_start + g_dim
-        if packed_end % ELEMENTS_PER_BYTE != 0:
-            packed_end = (packed_end // ELEMENTS_PER_BYTE) + 1
-        else:
-            packed_end = packed_end // ELEMENTS_PER_BYTE
+        g_end = g_start + g_dim  # in_features 结束位置
+        packed_end = g_end // ELEMENTS_PER_BYTE
+        if g_end % ELEMENTS_PER_BYTE != 0:
+            packed_end += 1
         indices_packed_g = indices_packed[:, packed_start:packed_end].clone()
 
         norms_g = norms[:, group_idx]
@@ -441,11 +440,10 @@ def triton_fused_matmul_grouped_slice_in_features(
         x_rot_g = x_rot_list[group_idx_in_slice]
 
         packed_start = g_start_original // ELEMENTS_PER_BYTE
-        packed_end = g_start_original + g_dim
-        if packed_end % ELEMENTS_PER_BYTE != 0:
-            packed_end = (packed_end // ELEMENTS_PER_BYTE) + 1
-        else:
-            packed_end = packed_end // ELEMENTS_PER_BYTE
+        g_end_original = g_start_original + g_dim  # in_features 结束位置
+        packed_end = g_end_original // ELEMENTS_PER_BYTE
+        if g_end_original % ELEMENTS_PER_BYTE != 0:
+            packed_end += 1
         indices_packed_g = indices_packed[:, packed_start:packed_end].clone()
 
         group_idx_original = g_start_original // group_size

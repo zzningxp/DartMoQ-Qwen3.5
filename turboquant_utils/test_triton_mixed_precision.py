@@ -36,9 +36,120 @@ from turboquant_utils.rotation import generate_rotation_matrix
 from turboquant_utils.quantize import pack_nbit, unpack_nbit
 
 
+def manual_fused_matmul_grouped(x, packed_data, in_features, bit_width):
+    """
+    手动版本：和 triton_fused_matmul_grouped 完全一样的数学步骤，
+    但用 PyTorch 操作，方便 debug
+    """
+    indices_packed = packed_data["indices_packed"]
+    codebook = packed_data["codebook"]
+    norms = packed_data["norms"]
+    seed = packed_data["seed"]
+    group_size = packed_data["group_size"]
+
+    batch_size = x.shape[0]
+    out_features = indices_packed.shape[0]
+    ELEMENTS_PER_BYTE = 8 // bit_width
+
+    if norms.dim() == 1:
+        norms = norms.unsqueeze(1)
+
+    # 先 unpack indices
+    full_indices = unpack_nbit(indices_packed, bit_width, in_features)
+
+    output = torch.zeros(batch_size, out_features, dtype=torch.float32, device=x.device)
+
+    num_groups = (in_features + group_size - 1) // group_size
+    for group_idx in range(num_groups):
+        g_start = group_idx * group_size
+        g_end = min(g_start + group_size, in_features)
+        g_dim = g_end - g_start
+
+        # 旋转 x
+        Pi = generate_rotation_matrix(g_dim, seed + g_start, device=x.device)
+        x_g = x[:, g_start:g_end].float()
+        x_rot = x_g @ Pi.T
+
+        # 取出这个 group 的 indices，还原 weight
+        indices_g = full_indices[:, g_start:g_end]
+        w_quant_scaled = codebook[indices_g]  # 这是乘了 scale 的
+        scale = math.sqrt(g_dim)
+        w_quant = w_quant_scaled / scale
+
+        # 逆旋转
+        w_g = w_quant @ Pi
+
+        # 乘 norms
+        norms_g = norms[:, group_idx].unsqueeze(1)
+        w_g_scaled = w_g * norms_g
+
+        # 矩阵乘法
+        out_g = x_g @ w_g_scaled.T
+
+        output += out_g
+
+    return output
+
+
+def manual_fused_matmul_grouped_math_order(x, packed_data, in_features, bit_width):
+    """
+    手动版本：完全按照 Triton 的数学顺序计算：(x_rot @ w_quant.T) * (norms / scale)
+    """
+    indices_packed = packed_data["indices_packed"]
+    codebook = packed_data["codebook"]
+    norms = packed_data["norms"]
+    seed = packed_data["seed"]
+    group_size = packed_data["group_size"]
+
+    batch_size = x.shape[0]
+    out_features = indices_packed.shape[0]
+    ELEMENTS_PER_BYTE = 8 // bit_width
+
+    if norms.dim() == 1:
+        norms = norms.unsqueeze(1)
+
+    # 先 unpack indices
+    full_indices = unpack_nbit(indices_packed, bit_width, in_features)
+
+    output = torch.zeros(batch_size, out_features, dtype=torch.float32, device=x.device)
+
+    num_groups = (in_features + group_size - 1) // group_size
+    for group_idx in range(num_groups):
+        g_start = group_idx * group_size
+        g_end = min(g_start + group_size, in_features)
+        g_dim = g_end - g_start
+
+        # 旋转 x (和 Triton 一样)
+        Pi = generate_rotation_matrix(g_dim, seed + g_start, device=x.device)
+        x_g = x[:, g_start:g_end].float()
+        x_rot = x_g @ Pi.T
+
+        # 取出这个 group 的 indices，得到量化后的 weight (没有逆旋转，没有除以 scale)
+        indices_g = full_indices[:, g_start:g_end]
+        w_quant_scaled = codebook[indices_g]  # 这是 Y_scaled = Y * sqrt(g_dim)
+
+        # 矩阵乘法：x_rot @ w_quant_scaled.T (和 Triton 一样)
+        out_g = x_rot @ w_quant_scaled.T
+
+        # 计算 scale 因子
+        scale = math.sqrt(g_dim)
+        norms_g = norms[:, group_idx]
+        norms_scaled = norms_g / scale
+
+        # 应用 norms_scaled
+        out_g = out_g * norms_scaled[None, :]
+
+        output += out_g
+
+    return output
+
+
 def setup_seed(seed=42):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+    # 显式设置 TF32，确保 PyTorch 和 Triton 行为一致
+    torch.backends.cuda.matmul.allow_tf32 = True  # PyTorch也用TF32，匹配Triton
+    torch.backends.cudnn.allow_tf32 = True
 
 
 def quantize_weight_simple(W, bit_width=4, group_size=None, seed=42):
@@ -411,9 +522,30 @@ def test_mixed_precision(args):
     out_dequant_mixed_float = out_dequant_mixed.float()
     out_triton_mixed_optv1_float = out_triton_mixed_optv1.float()
 
+    # 手动 debug 版本
+    print("\n  运行手动 Debug 版本...")
+    out_manual_dequant_order = torch.zeros(B, H, dtype=torch.float32, device=device)
+    out_manual_triton_order = torch.zeros(B, H, dtype=torch.float32, device=device)
+    for i, (packed_data, x_slice) in enumerate(zip(packed_data_list_mixed, x_slices)):
+        # 手动版本1：和反量化完全一样的顺序
+        slice_out1 = manual_fused_matmul_grouped(
+            x_slice, packed_data, x_slice.shape[1], packed_data["bit_width"]
+        )
+        out_manual_dequant_order += slice_out1
+
+        # 手动版本2：和 Triton 完全一样的数学顺序
+        slice_out2 = manual_fused_matmul_grouped_math_order(
+            x_slice, packed_data, x_slice.shape[1], packed_data["bit_width"]
+        )
+        out_manual_triton_order += slice_out2
+
     abs_diff_dequant_mixed = torch.abs(out_baseline_float - out_dequant_mixed_float)
     abs_diff_triton_mixed_optv1 = torch.abs(out_baseline_float - out_triton_mixed_optv1_float)
     abs_diff_between_mixed = torch.abs(out_dequant_mixed_float - out_triton_mixed_optv1_float)
+
+    abs_diff_manual_dequant_vs_triton = torch.abs(out_manual_dequant_order - out_manual_triton_order)
+    abs_diff_manual_triton_vs_real_triton = torch.abs(out_manual_triton_order - out_triton_mixed_optv1_float)
+    abs_diff_manual_dequant_vs_real_dequant = torch.abs(out_manual_dequant_order - out_dequant_mixed_float)
 
     print(f"  反量化+GEMM vs Baseline:")
     print(f"    最大绝对误差: {abs_diff_dequant_mixed.max().item():.6f}")
@@ -426,6 +558,11 @@ def test_mixed_precision(args):
     print(f"\n  反量化+GEMM vs Triton Fused:")
     print(f"    最大绝对误差: {abs_diff_between_mixed.max().item():.6f}")
     print(f"    平均绝对误差: {abs_diff_between_mixed.mean():.6f}")
+
+    print(f"\n  Debug 对比:")
+    print(f"    手动(反量化顺序) vs 手动(Triton顺序): 最大误差 = {abs_diff_manual_dequant_vs_triton.max().item():.12f}")
+    print(f"    手动(Triton顺序) vs 真实Triton:     最大误差 = {abs_diff_manual_triton_vs_real_triton.max().item():.12f}")
+    print(f"    手动(反量化顺序) vs 真实反量化:     最大误差 = {abs_diff_manual_dequant_vs_real_dequant.max().item():.12f}")
 
     print("\n" + "=" * 70)
     print("性能汇总")
