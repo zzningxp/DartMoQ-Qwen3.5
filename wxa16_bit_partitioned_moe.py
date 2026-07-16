@@ -189,7 +189,7 @@ class WxA16BitPartitionedGroupMoE(nn.Module):
         从 MoEBuildBlock 重构为 WxA16BitPartitionedGroupMoE。
 
         Args:
-            build_block: MoEBuildBlock (包含 DartMoQHybridWrapper)
+            build_block: MoEBuildBlock (包含 DartMoQHybridWrapper，权重为原始 fp16)
             layer_metadata: 量化过程中的元数据
             group_size: TurboQuant 分组大小
 
@@ -199,7 +199,7 @@ class WxA16BitPartitionedGroupMoE(nn.Module):
         tick_start = time.time()
         from bit_partitioned_moe import BitPartitionedGroupMoE
 
-        # 先从 build_block 构建普通的 BitPartitionedGroupMoE（提取 fp16 权重）
+        # 先从 build_block 构建普通的 BitPartitionedGroupMoE（提取原始 fp16 权重）
         tick_fp16moe = time.time()
         fp16_moe = BitPartitionedGroupMoE.from_build_block(build_block, layer_metadata)
         print(f"  [DEBUG] BitPartitionedGroupMoE.from_build_block: {time.time() - tick_fp16moe:.4f}s")

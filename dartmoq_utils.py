@@ -508,7 +508,7 @@ def analyze_turboquant_outlier_activation_aware(
 @torch.no_grad()
 def quant_layer_mix_precision(layer, layer_idx, quant_attn, n_experts, slice_expert_num,
                 attn_hidden_states, ffn_hidden_states, attention_mask, position_ids, position_embeddings,
-                qscheme, use_hybrid_moe, quantmode, seed=42):
+                qscheme, use_hybrid_moe, quantmode, seed=42, update_weight=True):
     print(f"Quantize layer {layer_idx}")
     tick_start = time.time()
     nsample = attn_hidden_states.shape[0]
@@ -709,7 +709,8 @@ def quant_layer_mix_precision(layer, layer_idx, quant_attn, n_experts, slice_exp
                 with torch.cuda.stream(ss):
                     ss.wait_event(forward_event)
                     if gptq[name].quantizer.bits == 0:
-                        gptq[name].layer.weight = nn.Parameter(torch.zeros_like(gptq[name].layer.weight))
+                        if update_weight:
+                            gptq[name].layer.weight = nn.Parameter(torch.zeros_like(gptq[name].layer.weight))
                         loss[name] = torch.zeros(1)
                     else:
                         if quantmode == 'turboquant':
@@ -719,6 +720,7 @@ def quant_layer_mix_precision(layer, layer_idx, quant_attn, n_experts, slice_exp
                                 group_size=groupsize,
                                 seed=seed+layer_idx,
                                 rotation="qr",
+                                update=update_weight,
                             )
                         else:
                             loss[name] = gptq[name].fasterquant(
@@ -770,8 +772,8 @@ def quant_layer_mix_precision_wxa16(layer, layer_idx, quant_attn, n_experts, sli
     WxA16 版本：进行真实量化，将 nn.Linear 替换为 WxA16Linear，删除原始 fp16 权重。
 
     注意：
-      - 这个函数先用原来的 fake quant 流程（需要 GPTQ/TurboQuant 分析）
-      - 然后再将已经 fake quant 好的 fp16 转换为 WxA16 packed 格式
+      - 这个函数先运行原来的 fake quant 流程，但不修改权重（只计算损失/分析）
+      - 然后直接对原始权重进行 WxA16 packed 量化（避免双重量化）
     """
     print(f"Quantize layer {layer_idx} (WxA16 mode)")
 
@@ -781,19 +783,19 @@ def quant_layer_mix_precision_wxa16(layer, layer_idx, quant_attn, n_experts, sli
     before_stats = print_memory_stats_layer_before(layer, layer_idx)
     print(f"  [DEBUG] print_memory_stats_layer_before time: {time.time() - tick_stats:.4f}s")
 
-    # ========== 阶段 1: 正常 fake quant（保持现有逻辑不变） ==========
+    # ========== 阶段 1: 运行 fake quant 分析，但不修改权重 ==========
     tick_fakequant = time.time()
     quant_layer_mix_precision(
         layer, layer_idx, quant_attn, n_experts, slice_expert_num,
         attn_hidden_states, ffn_hidden_states, attention_mask, position_ids, position_embeddings,
-        qscheme, use_hybrid_moe, quantmode, seed=seed,
+        qscheme, use_hybrid_moe, quantmode, seed=seed, update_weight=False,
     )
     print(f"  [DEBUG] quant_layer_mix_precision time: {time.time() - tick_fakequant:.4f}s")
 
     gc.collect()
     torch.cuda.empty_cache()
 
-    # ========== 阶段 2: 将 fake quant 后的 fp16 转换为 WxA16 ==========
+    # ========== 阶段 2: 将原始 fp16 权重直接转换为 WxA16 packed 格式 ==========
     print(f"  Converting to WxA16 packed format...")
     tick_convert_start = time.time()
 

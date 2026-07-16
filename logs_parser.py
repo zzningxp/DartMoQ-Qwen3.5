@@ -21,7 +21,7 @@ from typing import Iterable
 
 FIELDNAMES = [
     "git_hash", "model_name", "slices", "quant_scheme", "rank_mode",
-    "moe_struct", "quantmode", "disable_0bit_prune", "standby_layer_cpu", "quant_layers", "bpw", "ppl_wikitext2", "ppl_c4",
+    "moe_struct", "quantmode", "disable_0bit_prune", "standby_layer_cpu", "quant_layers", "wxa16_real_quant", "bpw", "ppl_wikitext2", "ppl_c4",
     "status", "runtime_ppl", "runtime_quant", "runtime_ppl_eval", "runtime_ppl_wikitext2", "runtime_ppl_c4", "error",
 ]
 
@@ -35,6 +35,7 @@ NEW_RANK_MODE_RE = re.compile(r"^Rank mode:\s+(?P<rank_mode>\S+)")
 NEW_SLICES_RE = re.compile(r"^Slices per expert:\s+(?P<slices>\S+)")
 NEW_QUANTMODE_RE = re.compile(r"^Quant mode:\s+(?P<quantmode>\S+)")
 NEW_STANDBY_CPU_RE = re.compile(r"^CPU standby:\s+(?P<standby_layer_cpu>\S+)")
+NEW_WXA16_REAL_QUANT_RE = re.compile(r"^WxA16 real quantization:\s+(?P<wxa16_real_quant>\S+)")
 NEW_QUANT_LAYERS_RE = re.compile(r"^Quantizing layers:\s+(?P<quant_layers>.+)")
 NEW_START_TIME_RE = re.compile(r"^Current time:\s*(?P<value>.+)")
 NEW_FINISH_TIME_RE = re.compile(r"^Finish time:\s*(?P<value>.+)")
@@ -87,6 +88,7 @@ class RunRecord:
     disable_0bit_prune: str = ""
     standby_layer_cpu: str = ""
     quant_layers: str = ""
+    wxa16_real_quant: str = ""
     git_hash: str = ""
     bpw: str = ""
     ppl_wikitext2: str = ""
@@ -351,6 +353,11 @@ def parse_log(path: str) -> list[RunRecord]:
                     current.standby_layer_cpu = standby_cpu_match.group("standby_layer_cpu")
                     continue
 
+                wxa16_real_quant_match = NEW_WXA16_REAL_QUANT_RE.search(line)
+                if wxa16_real_quant_match:
+                    current.wxa16_real_quant = wxa16_real_quant_match.group("wxa16_real_quant")
+                    continue
+
                 quant_layers_match = NEW_QUANT_LAYERS_RE.search(line)
                 if quant_layers_match:
                     current.quant_layers = quant_layers_match.group("quant_layers")
@@ -487,7 +494,7 @@ def write_csv(records: list[RunRecord], out) -> None:
 
 
 DISPLAY_FIELDS = [
-    "git_hash", "model_name", "slices", "quant_scheme", "rank_mode", "quantmode", "quant_layers", "bpw",
+    "git_hash", "model_name", "slices", "quant_scheme", "rank_mode", "quantmode", "quant_layers", "wxa16_real_quant", "bpw",
     "ppl_wikitext2", "ppl_c4",
     "status",
     "runtime_ppl", "runtime_quant", "runtime_ppl_eval", "runtime_ppl_wikitext2", "runtime_ppl_c4", "error",
@@ -503,6 +510,7 @@ PLAIN_HEADERS = {
     "disable_0bit_prune": "no0prune",
     "standby_layer_cpu": "stdbycpu",
     "quant_layers": "qlayers",
+    "wxa16_real_quant": "wxa16",
     "git_hash": "git",
     "bpw": "bpw",
     "ppl_wikitext2": "wiki",
@@ -526,6 +534,7 @@ EXPORT_HEADERS = {
     "disable_0bit_prune": "disable_0bit_prune",
     "standby_layer_cpu": "standby_layer_cpu",
     "quant_layers": "quant_layers",
+    "wxa16_real_quant": "wxa16_real_quant",
     "git_hash": "git_hash",
     "bpw": "bpw",
     "ppl_wikitext2": "ppl_wikitext2",
@@ -542,7 +551,8 @@ EXPORT_HEADERS = {
 def _format_value(field: str, value) -> str:
     if field == "error":
         return ""
-    if field == "git_hash":  # git_hash 看起来像科学计数法，不做数值格式化
+    # git_hash 和 wxa16_real_quant 等字段看起来像数字但不应被格式化
+    if field in ("git_hash", "wxa16_real_quant"):
         return str(value).replace("\t", " ")
     text = str(value)
     if NUMERIC_RE.fullmatch(text):
