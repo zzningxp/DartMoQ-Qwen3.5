@@ -77,7 +77,6 @@ def _turboquant_fused_matmul_kernel_nbit(
     acc = tl.zeros((BLOCK_B, BLOCK_N), dtype=tl.float32)
 
     ELEMENTS_PER_BYTE = 8 // BIT_WIDTH
-    BIT_MASK = (1 << BIT_WIDTH) - 1
 
     for k_start in range(0, K, BLOCK_K):
         rk = k_start + tl.arange(0, BLOCK_K)
@@ -87,19 +86,28 @@ def _turboquant_fused_matmul_kernel_nbit(
         inp_mask = mask_b[:, None] & mask_k[None, :]
         inp_tile = tl.load(input_ptr + inp_off, mask=inp_mask, other=0.0)
 
-        byte_col = rk // ELEMENTS_PER_BYTE
-        pos_in_byte = rk % ELEMENTS_PER_BYTE
+        if BIT_WIDTH == 8:
+            # 8-bit fast path: no unpacking needed
+            byte_off = rn[:, None] * PACKED_K + rk[None, :]
+            w_mask = mask_n[:, None] & mask_k[None, :]
+            idx = tl.load(indices_ptr + byte_off, mask=w_mask, other=0).to(tl.int32)
+            w_quant = tl.load(codebook_ptr + idx, mask=w_mask, other=0.0)
+        else:
+            # 1/2/4-bit: need bit unpacking
+            BIT_MASK = (1 << BIT_WIDTH) - 1
+            byte_col = rk // ELEMENTS_PER_BYTE
+            pos_in_byte = rk % ELEMENTS_PER_BYTE
 
-        byte_off = rn[:, None] * PACKED_K + byte_col[None, :]
-        w_mask = mask_n[:, None] & mask_k[None, :]
-        packed = tl.load(indices_ptr + byte_off, mask=w_mask, other=0).to(tl.uint8)
+            byte_off = rn[:, None] * PACKED_K + byte_col[None, :]
+            w_mask = mask_n[:, None] & mask_k[None, :]
+            packed = tl.load(indices_ptr + byte_off, mask=w_mask, other=0).to(tl.uint8)
 
-        shift = pos_in_byte * BIT_WIDTH
-        shift_broadcast = shift[None, :]
-        idx = (packed >> shift_broadcast) & BIT_MASK
-        idx = idx.to(tl.int32)
+            shift = pos_in_byte * BIT_WIDTH
+            shift_broadcast = shift[None, :]
+            idx = (packed >> shift_broadcast) & BIT_MASK
+            idx = idx.to(tl.int32)
 
-        w_quant = tl.load(codebook_ptr + idx, mask=w_mask, other=0.0)
+            w_quant = tl.load(codebook_ptr + idx, mask=w_mask, other=0.0)
 
         acc += tl.dot(
             inp_tile,
@@ -184,7 +192,6 @@ def _turboquant_fused_dual_matmul_kernel_nbit(
     acc2 = tl.zeros((BLOCK_B, BLOCK_N), dtype=tl.float32)
 
     ELEMENTS_PER_BYTE = 8 // BIT_WIDTH
-    BIT_MASK = (1 << BIT_WIDTH) - 1
 
     for k_start in range(0, K, BLOCK_K):
         rk = k_start + tl.arange(0, BLOCK_K)
@@ -192,34 +199,55 @@ def _turboquant_fused_dual_matmul_kernel_nbit(
         inp_mask = mask_b[:, None] & mask_k[None, :]
         w_mask = mask_n[:, None] & mask_k[None, :]
 
-        byte_col = rk // ELEMENTS_PER_BYTE
-        pos_in_byte = rk % ELEMENTS_PER_BYTE
-        byte_off = rn[:, None] * PACKED_K + byte_col[None, :]
-        shift = pos_in_byte * BIT_WIDTH
-        shift_broadcast = shift[None, :]
-
         inp1_off = rb[:, None] * K + rk[None, :]
         inp1 = tl.load(input1_ptr + inp1_off, mask=inp_mask, other=0.0)
 
-        packed1 = tl.load(indices1_ptr + byte_off, mask=w_mask, other=0).to(tl.uint8)
-        idx1 = (packed1 >> shift_broadcast) & BIT_MASK
-        idx1 = idx1.to(tl.int32)
-        w1 = tl.load(codebook1_ptr + idx1, mask=w_mask, other=0.0)
+        if BIT_WIDTH == 8:
+            # 8-bit fast path: no unpacking needed
+            byte_off = rn[:, None] * PACKED_K + rk[None, :]
+            idx1 = tl.load(indices1_ptr + byte_off, mask=w_mask, other=0).to(tl.int32)
+            w1 = tl.load(codebook1_ptr + idx1, mask=w_mask, other=0.0)
 
-        acc1 += tl.dot(inp1, tl.trans(w1), allow_tf32=True)
+            acc1 += tl.dot(inp1, tl.trans(w1), allow_tf32=True)
 
-        if SAME_INPUT:
-            inp2 = inp1
+            if SAME_INPUT:
+                inp2 = inp1
+            else:
+                inp2_off = rb[:, None] * K + rk[None, :]
+                inp2 = tl.load(input2_ptr + inp2_off, mask=inp_mask, other=0.0)
+
+            idx2 = tl.load(indices2_ptr + byte_off, mask=w_mask, other=0).to(tl.int32)
+            w2 = tl.load(codebook2_ptr + idx2, mask=w_mask, other=0.0)
+
+            acc2 += tl.dot(inp2, tl.trans(w2), allow_tf32=True)
         else:
-            inp2_off = rb[:, None] * K + rk[None, :]
-            inp2 = tl.load(input2_ptr + inp2_off, mask=inp_mask, other=0.0)
+            # 1/2/4-bit: need bit unpacking
+            BIT_MASK = (1 << BIT_WIDTH) - 1
+            byte_col = rk // ELEMENTS_PER_BYTE
+            pos_in_byte = rk % ELEMENTS_PER_BYTE
+            byte_off = rn[:, None] * PACKED_K + byte_col[None, :]
+            shift = pos_in_byte * BIT_WIDTH
+            shift_broadcast = shift[None, :]
 
-        packed2 = tl.load(indices2_ptr + byte_off, mask=w_mask, other=0).to(tl.uint8)
-        idx2 = (packed2 >> shift_broadcast) & BIT_MASK
-        idx2 = idx2.to(tl.int32)
-        w2 = tl.load(codebook2_ptr + idx2, mask=w_mask, other=0.0)
+            packed1 = tl.load(indices1_ptr + byte_off, mask=w_mask, other=0).to(tl.uint8)
+            idx1 = (packed1 >> shift_broadcast) & BIT_MASK
+            idx1 = idx1.to(tl.int32)
+            w1 = tl.load(codebook1_ptr + idx1, mask=w_mask, other=0.0)
 
-        acc2 += tl.dot(inp2, tl.trans(w2), allow_tf32=True)
+            acc1 += tl.dot(inp1, tl.trans(w1), allow_tf32=True)
+
+            if SAME_INPUT:
+                inp2 = inp1
+            else:
+                inp2_off = rb[:, None] * K + rk[None, :]
+                inp2 = tl.load(input2_ptr + inp2_off, mask=inp_mask, other=0.0)
+
+            packed2 = tl.load(indices2_ptr + byte_off, mask=w_mask, other=0).to(tl.uint8)
+            idx2 = (packed2 >> shift_broadcast) & BIT_MASK
+            idx2 = idx2.to(tl.int32)
+            w2 = tl.load(codebook2_ptr + idx2, mask=w_mask, other=0.0)
+
+            acc2 += tl.dot(inp2, tl.trans(w2), allow_tf32=True)
 
     n1 = tl.load(norms1_ptr + rn, mask=mask_n, other=1.0)
     n2 = tl.load(norms2_ptr + rn, mask=mask_n, other=1.0)

@@ -193,8 +193,6 @@ class WxA16Linear(nn.Module):
         Returns:
             out: (batch_size, seq_len, out_features) 或 (batch_size, out_features)
         """
-        t_start = time.time()
-
         orig_shape = x.shape
         batch_size = None
         seq_len = None
@@ -203,8 +201,6 @@ class WxA16Linear(nn.Module):
         if x.dim() == 3:
             batch_size, seq_len, in_features = x.shape
             x = x.reshape(batch_size * seq_len, in_features)
-
-        t_triton_start = time.time()
 
         # Ensure codebook is on the correct device
         codebook = self.codebook.to(x.device)
@@ -215,8 +211,6 @@ class WxA16Linear(nn.Module):
             self.seed, self.group_size, self.in_features, self.bit_width
         )
 
-        t_triton_end = time.time()
-
         # Add bias
         if self.bias is not None:
             out = out + self.bias.to(out.dtype)
@@ -224,12 +218,6 @@ class WxA16Linear(nn.Module):
         # Reshape back if needed
         if batch_size is not None and seq_len is not None:
             out = out.reshape(batch_size, seq_len, self.out_features)
-
-        t_end = time.time()
-
-        # 打印详细时间
-        print(f"  [WxA16Linear {self.bit_width}bit] forward total: {t_end - t_start:.4f}s, triton: {t_triton_end - t_triton_start:.4f}s", flush=True)
-        print(f"  [WxA16Linear {self.bit_width}bit] input shape: {orig_shape}, output shape: {out.shape}", flush=True)
 
         return out.to(x.dtype)
 

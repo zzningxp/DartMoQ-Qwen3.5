@@ -86,6 +86,45 @@ def get_wxa16_memory_stats(wxa16_linear, prefix: str = "") -> Dict:
     }
 
 
+def collect_all_linears(module, prefix="", result=None):
+    """递归收集模块中的所有 nn.Linear 和 WxA16Linear"""
+    if result is None:
+        result = []
+
+    # 检查当前模块是否是线性层
+    if hasattr(module, 'get_memory_usage'):
+        # WxA16Linear
+        result.append((prefix, module, 'wxa16'))
+    elif isinstance(module, nn.Linear):
+        # 普通 nn.Linear
+        result.append((prefix, module, 'linear'))
+    else:
+        # 递归检查子模块（但避免循环）
+        for name, child in module.named_children():
+            new_prefix = f"{prefix}.{name}" if prefix else name
+            collect_all_linears(child, new_prefix, result)
+
+    return result
+
+
+def calculate_attn_total(attn_layer, is_quantized=False):
+    """计算注意力层的总大小，通用方法"""
+    total = 0
+    linears = collect_all_linears(attn_layer, "attn")
+
+    for name, module, _ in linears:
+        if is_quantized and hasattr(module, 'get_memory_usage'):
+            mem = module.get_memory_usage()
+            total += mem['total_bytes']
+            print(f"[DEBUG] Added {name}: {mem['total_bytes']} bytes (type: WxA16{mem['bit_width']})", flush=True)
+        elif isinstance(module, nn.Linear):
+            mem = get_linear_memory_stats(module)
+            total += mem['total_bytes']
+            print(f"[DEBUG] Added {name}: {mem['total_bytes']} bytes (type: {type(module).__name__})", flush=True)
+
+    return total
+
+
 def get_layer_memory_stats(layer, layer_idx: int) -> Dict:
     """
     统计一层的所有 Linear 模块的存储空间
@@ -211,17 +250,12 @@ def print_memory_stats_layer_before(layer, layer_idx: int):
     attn_layer = None
     attn_type = None
 
-    # 调试：打印 layer 的所有属性
-    print(f"[DEBUG] Layer {layer_idx} attributes: {dir(layer)}", flush=True)
-
     if hasattr(layer, 'self_attn'):
         attn_layer = layer.self_attn
         attn_type = 'full'
-        print(f"[DEBUG] Found self_attn, attributes: {dir(attn_layer)}", flush=True)
     elif hasattr(layer, 'linear_attn'):
         attn_layer = layer.linear_attn
         attn_type = 'linear'
-        print(f"[DEBUG] Found linear_attn, attributes: {dir(attn_layer)}", flush=True)
     else:
         # 尝试其他可能的属性名
         print(f"[DEBUG] No self_attn/linear_attn, checking all attrs...", flush=True)
@@ -230,26 +264,9 @@ def print_memory_stats_layer_before(layer, layer_idx: int):
                 print(f"[DEBUG] Found possible attention attr: {attr}", flush=True)
 
     if attn_layer is not None:
-        if attn_type == 'full':
-            # 标准注意力层
-            attn_names = ['q_proj', 'k_proj', 'v_proj', 'o_proj']
-            for name in attn_names:
-                if hasattr(attn_layer, name):
-                    module = getattr(attn_layer, name)
-                    if isinstance(module, nn.Linear):
-                        mem = get_linear_memory_stats(module)
-                        attn_total += mem['total_bytes']
-                        print(f"[DEBUG] Added {name}: {mem['total_bytes']} bytes", flush=True)
-        elif attn_type == 'linear':
-            # 线性注意力层
-            attn_names = ['in_proj_qkv', 'in_proj_z', 'in_proj_b', 'in_proj_a', 'out_proj']
-            for name in attn_names:
-                if hasattr(attn_layer, name):
-                    module = getattr(attn_layer, name)
-                    if isinstance(module, nn.Linear):
-                        mem = get_linear_memory_stats(module)
-                        attn_total += mem['total_bytes']
-                        print(f"[DEBUG] Added {name}: {mem['total_bytes']} bytes", flush=True)
+        # print(f"[DEBUG] Attn layer type: {attn_type}, attributes: {[attr for attr in dir(attn_layer) if not attr.startswith('_')]}", flush=True)
+        # 使用通用方法统计
+        attn_total = calculate_attn_total(attn_layer, is_quantized=False)
 
     print(f"[Layer {layer_idx}] {'Attention':<12} {format_bytes(attn_total):>12} (16-bit fp16, {attn_type if attn_type else 'unknown'})", flush=True)
 
@@ -276,13 +293,8 @@ def print_memory_stats_layer_before(layer, layer_idx: int):
     router_down = 0
     num_experts = 0
 
-    # 调试：打印 layer.mlp 的结构
-    print(f"[DEBUG] Layer {layer_idx} mlp attributes: {dir(layer.mlp)}", flush=True)
     if hasattr(layer.mlp, 'experts'):
         experts = layer.mlp.experts
-        print(f"[DEBUG] experts type: {type(experts)}, has gate_up_proj: {hasattr(experts, 'gate_up_proj')}", flush=True)
-        if hasattr(experts, 'gate_up_proj'):
-            print(f"[DEBUG] gate_up_proj shape: {experts.gate_up_proj.shape}", flush=True)
 
     # 检查原始 MoE 结构
     if hasattr(layer.mlp, 'experts'):
@@ -292,7 +304,6 @@ def print_memory_stats_layer_before(layer, layer_idx: int):
         if hasattr(experts, 'gate_up_proj') and hasattr(experts, 'down_proj'):
             # Grouped GEMM 格式
             gate_up_proj = experts.gate_up_proj
-            down_proj = experts.down_proj
             num_experts = gate_up_proj.shape[0]
             intermediate_size = gate_up_proj.shape[1] // 2
             hidden_size = gate_up_proj.shape[2]
@@ -403,28 +414,9 @@ def print_memory_stats_layer_after(layer, layer_idx: int, before_stats: Dict, qs
         attn_type = 'linear'
 
     if attn_layer is not None:
-        if attn_type == 'full':
-            # 标准注意力层
-            attn_names = ['q_proj', 'k_proj', 'v_proj', 'o_proj']
-            for name in attn_names:
-                if hasattr(attn_layer, name):
-                    module = getattr(attn_layer, name)
-                    if hasattr(module, 'get_memory_usage'):
-                        mem = module.get_memory_usage()
-                        attn_total += mem['total_bytes']
-                    elif isinstance(module, nn.Linear):
-                        attn_total += get_linear_memory_stats(module)['total_bytes']
-        elif attn_type == 'linear':
-            # 线性注意力层
-            attn_names = ['in_proj_qkv', 'in_proj_z', 'in_proj_b', 'in_proj_a', 'out_proj']
-            for name in attn_names:
-                if hasattr(attn_layer, name):
-                    module = getattr(attn_layer, name)
-                    if hasattr(module, 'get_memory_usage'):
-                        mem = module.get_memory_usage()
-                        attn_total += mem['total_bytes']
-                    elif isinstance(module, nn.Linear):
-                        attn_total += get_linear_memory_stats(module)['total_bytes']
+        print(f"[DEBUG] Quantized - Attn layer type: {attn_type}", flush=True)
+        # 使用通用方法统计量化后的大小
+        attn_total = calculate_attn_total(attn_layer, is_quantized=True)
 
     attn_compression = attn_orig / attn_total if attn_total > 0 else 1.0
     print(f"[Layer {layer_idx}] {'Attention':<12} {format_bytes(attn_total):>12} ({attn_bit}-bit, {attn_type if attn_type else 'unknown'}) -> {attn_compression:.2f}x compression", flush=True)
