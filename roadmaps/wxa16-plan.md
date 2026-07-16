@@ -79,13 +79,13 @@
 不过这里 9.2s 还是挺慢的。。
 
 ## 精度问题：
-并且现在精度还有下降！
+<!-- 并且现在精度还有下降！
 积累到 40 层的话 ppl 已经压不住了，，
 
 | git      | model            | sli | qsch              | rank                     | qmode      | qlayers | wiki    | c4      | status | time    | t_quant  | t_ppl   | t_wiki | t_c4   | err |
 |----------|------------------|-----|-------------------|--------------------------|------------|---------|---------|---------|---------|--------|---------|----------|---------|--------|--------|
 | aac6342  | Qwen3.5-35B-A3B  | 4   | global-a8s8m2bpw  | turboquant_innerproduct  | turboquant | all     | 7.6864  | 11.2656 | ok      | 8654.59 | 8253.99  | 400.6   | 154.49 | 246.11 |     |
-| efb4122  | Qwen3.5-35B-A3B  | 4   | global-a8s8m2bpw  | turboquant_innerproduct  | turboquant | all     | 11.2955 | 15.7725 | ok      | 8456.37 | 7493.08  | 963.29  | 358.03 | 605.26 |     |  
+| efb4122  | Qwen3.5-35B-A3B  | 4   | global-a8s8m2bpw  | turboquant_innerproduct  | turboquant | all     | 11.2955 | 15.7725 | ok      | 8456.37 | 7493.08  | 963.29  | 358.03 | 605.26 |     |   -->
 
 <!-- 1. 单独 Linear (triton_fused_matmul_grouped):
   FP16:                 0.01 ms
@@ -113,7 +113,7 @@
   误差对比:
     Triton vs FP16: max=65.019997, mean=12.635082
     反量化+GEMM vs Triton: max=0.057957, mean=0.011487 -->
-
+<!-- 
 场景1: 单独 Linear
     FP16:                 0.01 ms
     反量化+GEMM:          0.71 ms
@@ -141,52 +141,40 @@
 现在可能不是反量化+gemm 和 triton 造成的了，
 上面这几个误差，其实都不影响最终结果，测了几次，w/o-triton 反量化+gemm  、triton kernel 的最终误差都差不多。
 而是这里的反量化+gemm 和之前的虚拟量化+fp16 gemm 之间的关系。。
-  现在的测试程序，对比了 没有 triton 的反量化+ gemm ，和 triton kernel的。我现在需要增加一个对比项，这个对比项是之前的模拟量化时候的方法（可以参考 git 6477b82），就是现场量化，量化完马上就反量化存回 fp16 去，存好的方法。我现在需要你在当前的测试程序中实现这个方法，起名叫 simu_quant ，和 w/o-triton 反量化+gemm  、triton kernel 比精度和速度。
+  现在的测试程序，对比了 没有 triton 的反量化+ gemm ，和 triton kernel的。我现在需要增加一个对比项，这个对比项是之前的模拟量化时候的方法（可以参考 git 6477b82），就是现场量化，量化完马上就反量化存回 fp16 去，存好的方法。我现在需要你在当前的测试程序中实现这个方法，起名叫 simu_quant ，和 w/o-triton 反量化+gemm  、triton kernel 比精度和速度。 -->
+
+精度问题已经解决，348ba88 已经搞定。
 
 ## 额外
 另外就是可以考虑要保存量化后的参数了。
 
 
 ## 加速：
-1. Kernel 调用次数太多 → 优化方案
-方案：把旋转 + 多个 group 的 fused matmul 合并到一个 kernel
-不是每个 group 调用一次 triton_fused_matmul
-而是创建一个新 kernel，内部遍历处理所有 group
-或者：先在 Python 层把所有旋转做好，然后调用一个 kernel 处理所有 group
 
-这个数学上可行吗？
-混合精度时：按 slice 分别处理（每个 slice 内统一精度，一个 kernel 处理它内部的所有 group）
+优先级排序（从易到难）：
+1. 8-bit 简化分支（最简单，收益明显）
 
+在 kernel 中用 if BIT_WIDTH == 8 的 constexpr 分支
+直接用 packed byte 作为 idx，跳过移位和掩码操作
+2. codebook 共享内存缓存（中等难度，收益明显）
 
-2. 每次循环都做旋转矩阵计算和旋转 → 优化方案
-方案A：预计算所有旋转矩阵 + 一次性旋转所有输入
+因为 codebook 很小（16/256 个元素），可以在 block 开始时加载到 shared memory
+然后在 K 循环中重复使用，减少全局内存访问
 
-不要在循环里：
-for g in groups:
-    Pi = generate_rotation_matrix(...)
-    x_rot_g = x_g @ Pi.T
+这两个优化都是安全且性能收益明显的：
 
-而是：
-x_rot_all = torch.zeros_like(x)
-for g in groups:
-    Pi = generate_rotation_matrix(...)
-    x_rot_all[:, g_start:g_end] = x[:, g_start:g_end] @ Pi.T
-然后把 x_rot_all 传给 kernel
+8-bit 简化分支：在 triton_kernels.py 中，用 if BIT_WIDTH == 8 直接跳过位运算。
 
-方案B（更激进）：把旋转直接做进 Triton kernel 里
-
-在 kernel 内部生成旋转矩阵（或者传进去）
-在 kernel 内部做旋转
-
-3. 每次循环都做 packed indices 的切片和 clone → 优化方案
-方案：不要切片，直接传完整 indices_packed + 偏移信息
-
-kernel 内部根据 group_idx 计算需要的位置
-不需要 clone，直接用索引访问
+codebook 共享内存：因为 codebook 很小（只有 16/256 个元素），可以在每个 thread block 开头加载到 shared memory，然后在 K 循环中复用。可以不用 autotune。
 
 
-4.多次 output 累加 → 优化方案
-方案：在 kernel 内部累加，或者直接一次输出
 
-把累加逻辑放到 kernel 里
-或者在 Python 层只做最后一次写入
+
+3. 双矩阵 kernel 的进一步融合（中等难度）
+
+如果两个矩阵用相同 codebook，可以共享 codebook 加载
+可以尝试用 vectorized load 来同时加载 input1 和 input2
+4. 旋转循环优化（收益不确定，需要测试）
+
+当前已经有 Pi 缓存了
+更大的优化可能是把旋转也融合到 triton kernel 里，但这个比较复杂

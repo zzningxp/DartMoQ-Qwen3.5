@@ -227,11 +227,9 @@ class WxA16Linear(nn.Module):
 
         t_end = time.time()
 
-        # 打印详细时间（仅第一次，避免刷屏）
-        if not hasattr(self, '_log_printed'):
-            self._log_printed = True
-            print(f"  [WxA16Linear {self.bit_width}bit] forward total: {t_end - t_start:.4f}s, triton: {t_triton_end - t_triton_start:.4f}s", flush=True)
-            print(f"  [WxA16Linear {self.bit_width}bit] input shape: {orig_shape}, output shape: {out.shape}", flush=True)
+        # 打印详细时间
+        print(f"  [WxA16Linear {self.bit_width}bit] forward total: {t_end - t_start:.4f}s, triton: {t_triton_end - t_triton_start:.4f}s", flush=True)
+        print(f"  [WxA16Linear {self.bit_width}bit] input shape: {orig_shape}, output shape: {out.shape}", flush=True)
 
         return out.to(x.dtype)
 

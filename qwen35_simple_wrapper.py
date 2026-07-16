@@ -510,16 +510,6 @@ def dartmoq_quant_grouped_gemm_moe(model, tokenizer, dataloader, args, test_ppl=
 
         if not quantize_this_layer:
             print(f"Skipping layer {layer_idx} and all remaining layers...", flush=True)
-            # Debug: Check the state of this layer and next layer before breaking
-            if layer_idx < len(layers):
-                mlp_type = type(layer.mlp).__name__ if hasattr(layer, 'mlp') else 'N/A'
-                has_gate_up = hasattr(layer.mlp, 'experts') and hasattr(layer.mlp.experts, 'gate_up_proj') if hasattr(layer, 'mlp') else False
-                print(f"  [DEBUG] Layer {layer_idx} before break: mlp_type={mlp_type}, has_gate_up_proj={has_gate_up}")
-            if layer_idx + 1 < len(layers):
-                next_layer = layers[layer_idx + 1]
-                mlp_type_next = type(next_layer.mlp).__name__ if hasattr(next_layer, 'mlp') else 'N/A'
-                has_gate_up_next = hasattr(next_layer.mlp, 'experts') and hasattr(next_layer.mlp.experts, 'gate_up_proj') if hasattr(next_layer, 'mlp') else False
-                print(f"  [DEBUG] Layer {layer_idx + 1} (untouched): mlp_type={mlp_type_next}, has_gate_up_proj={has_gate_up_next}")
             break
 
         tick0 = time.time()
@@ -579,14 +569,6 @@ def dartmoq_quant_grouped_gemm_moe(model, tokenizer, dataloader, args, test_ppl=
 
     print("MoE reconstruction and quantization done.")
 
-    # Debug: Print final layer states
-    print("\n=== Final Layer States Debug Info ===")
-    for layer_idx, layer in enumerate(layers):
-        if layer_idx < 10 or layer_idx % 5 == 0:  # Print first 10 and every 5th
-            mlp_type = type(layer.mlp).__name__ if hasattr(layer, 'mlp') else 'N/A'
-            has_gate_up = hasattr(layer.mlp, 'experts') and hasattr(layer.mlp.experts, 'gate_up_proj') if hasattr(layer, 'mlp') else False
-            print(f"  Layer {layer_idx}: mlp_type={mlp_type}, has_gate_up_proj={has_gate_up}")
-    print("=====================================\n")
 
     tick_quant_end = time.time()
     time_quant = tick_quant_end - tick_quant_start

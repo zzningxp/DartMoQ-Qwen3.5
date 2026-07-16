@@ -178,6 +178,8 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
         new_hidden_states = torch.empty_like(hidden_states)
 
         t_forward_start = time.time()
+        time_attn_total = 0.0
+        time_moe_total = 0.0
 
         for batch_start in range(0, nsamples, batch_size_transformer):
             batch_end = min(batch_start + batch_size_transformer, nsamples)
@@ -213,24 +215,42 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
                 else:
                     layer_kwargs['position_embeddings'] = position_embeddings.repeat(actual_batch_size, 1, 1)
 
-            # Forward pass
+            # Forward pass - split into attention and moe
             with torch.no_grad():
-                layer_outputs = layer(batch_hidden, **layer_kwargs)
+                # Attention part
+                t_attn_start = time.time()
+                residual = batch_hidden
+                hidden_states_inorm = layer.input_layernorm(batch_hidden)
 
-            # Save output
-            if isinstance(layer_outputs, tuple):
-                batch_output = layer_outputs[0]
-                # Cleanup any additional outputs in the tuple
-                for extra_output in layer_outputs[1:]:
-                    del extra_output
-            else:
-                batch_output = layer_outputs
+                if hasattr(layer, 'self_attn'):
+                    attn_out = layer.self_attn(hidden_states_inorm, **layer_kwargs)[0]
+                elif hasattr(layer, 'linear_attn'):
+                    attn_out = layer.linear_attn(hidden_states_inorm, **layer_kwargs)[0]
+                else:
+                    # Fallback to full forward if we can't split
+                    attn_out = layer(batch_hidden, **layer_kwargs)[0]
+
+                hidden_states_attn = residual + attn_out
+                t_attn_end = time.time()
+                time_attn_total += t_attn_end - t_attn_start
+
+                # MoE part
+                t_moe_start = time.time()
+                hidden_states_moe_in = layer.post_attention_layernorm(hidden_states_attn)
+                mlp_out = layer.mlp(hidden_states_moe_in)
+
+                if isinstance(mlp_out, tuple):
+                    mlp_out = mlp_out[0]
+
+                batch_output = hidden_states_attn + mlp_out
+                t_moe_end = time.time()
+                time_moe_total += t_moe_end - t_moe_start
 
             # Directly copy to new_hidden_states - everything on GPU
             new_hidden_states[batch_start:batch_end].copy_(batch_output)
 
             # Cleanup batch variables aggressively
-            del batch_hidden, layer_outputs, batch_output
+            del batch_hidden, batch_output, residual, hidden_states_inorm, attn_out, hidden_states_attn, hidden_states_moe_in, mlp_out
             del layer_kwargs
 
         t_forward_end = time.time()
@@ -251,7 +271,7 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
             mlp_type = type(layer.mlp).__name__ if hasattr(layer, 'mlp') else 'N/A'
 
             mem_str = get_memory_info_str()
-            print(f"  [Layer {layer_idx}] time: {layer_time:.2f}s (move: {time_move:.2f}s, forward: {time_forward:.2f}s), mlp_type={mlp_type} | Memory: {mem_str}", flush=True)
+            print(f"  [Layer {layer_idx}] time: {layer_time:.2f}s (move: {time_move:.2f}s, attn: {time_attn_total:.2f}s, moe: {time_moe_total:.2f}s), mlp_type={mlp_type} | Memory: {mem_str}", flush=True)
 
         del layer
         # Cleanup
