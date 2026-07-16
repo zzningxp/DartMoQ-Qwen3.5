@@ -85,7 +85,7 @@
 | aac6342  | Qwen3.5-35B-A3B  | 4   | global-a8s8m2bpw  | turboquant_innerproduct  | turboquant | all     | 7.6864  | 11.2656 | ok      | 8654.59 | 8253.99  | 400.6   | 154.49 | 246.11 |     |
 | efb4122  | Qwen3.5-35B-A3B  | 4   | global-a8s8m2bpw  | turboquant_innerproduct  | turboquant | all     | 11.2955 | 15.7725 | ok      | 8456.37 | 7493.08  | 963.29  | 358.03 | 605.26 |     |  
 
-1. 单独 Linear (triton_fused_matmul_grouped):
+<!-- 1. 单独 Linear (triton_fused_matmul_grouped):
   FP16:                 0.01 ms
   反量化+GEMM:          0.70 ms
   Triton:               0.84 ms
@@ -110,8 +110,31 @@
 
   误差对比:
     Triton vs FP16: max=65.019997, mean=12.635082
-    反量化+GEMM vs Triton: max=0.057957, mean=0.011487
+    反量化+GEMM vs Triton: max=0.057957, mean=0.011487 -->
 
+场景1: 单独 Linear
+    FP16:                 0.01 ms
+    反量化+GEMM:          0.71 ms
+    Triton:               0.83 ms
+  误差对比 (vs FP16):
+    Triton:               max=19.556366, mean=3.470817
+    反量化+GEMM vs Triton: max=0.053061, mean=0.010133
+
+场景2.1: MoE up_gate (slice_rows)
+    FP16:                 0.02 ms
+    反量化+GEMM:          1.37 ms
+    Triton:               1.62 ms
+  误差对比 (vs FP16):
+    Triton:               max=25.554825, mean=4.987385
+    反量化+GEMM vs Triton: max=0.081268, mean=0.014249
+
+场景2.2: MoE down (slice_in_features)
+    FP16:                 0.01 ms
+    反量化+GEMM:          0.70 ms
+    Triton:               0.23 ms
+  误差对比 (vs FP16):
+    Triton:               max=9.238243, mean=1.756374
+    反量化+GEMM vs Triton: max=0.026306, mean=0.005040
 
 另外就是可以考虑要保存量化后的参数了。
 
