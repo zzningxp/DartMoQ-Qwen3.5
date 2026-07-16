@@ -85,21 +85,32 @@
 | aac6342  | Qwen3.5-35B-A3B  | 4   | global-a8s8m2bpw  | turboquant_innerproduct  | turboquant | all     | 7.6864  | 11.2656 | ok      | 8654.59 | 8253.99  | 400.6   | 154.49 | 246.11 |     |
 | efb4122  | Qwen3.5-35B-A3B  | 4   | global-a8s8m2bpw  | turboquant_innerproduct  | turboquant | all     | 11.2955 | 15.7725 | ok      | 8456.37 | 7493.08  | 963.29  | 358.03 | 605.26 |     |  
 
-  反量化+GEMM vs Triton Fused:
-    最大绝对误差: 0.149887
-    平均绝对误差: 0.026660
-    
-python turboquant_utils/test_triton_mixed_precision.py
-  Baseline:                  0.14 ms
-  场景1 - 全4bit:
-    反量化+GEMM:            37.13 ms
-    Triton 分别切片:         2.94 ms
-    Triton 新函数:           2.96 ms
-  场景2 - 混合4:2:1bit:
-    反量化+GEMM:             3.12 ms
-    Triton Fused:            2.97 ms
-这里来看，triton 这个本来就慢。所以这里可以先从这个测试程序入手进行 case 优化。
+1. 单独 Linear (triton_fused_matmul_grouped):
+  FP16:                 0.01 ms
+  反量化+GEMM:          0.70 ms
+  Triton:               0.84 ms
 
+  误差对比:
+    Triton vs FP16: max=19.556366, mean=3.470817
+    反量化+GEMM vs Triton: max=0.053061, mean=0.010133
+
+2.1 MoE up_gate (triton_fused_matmul_grouped_slice_rows):
+  FP16:                 0.01 ms
+  反量化+GEMM:          1.62 ms
+  Triton:               3.40 ms
+
+  误差对比:
+    Triton vs FP16: max=104.514130, mean=18.042759
+    反量化+GEMM vs Triton: max=0.089306, mean=0.016234
+
+2.2 MoE down (triton_fused_matmul_grouped_slice_in_features):
+  FP16:                 0.01 ms
+  反量化+GEMM:          0.96 ms
+  Triton:               0.88 ms
+
+  误差对比:
+    Triton vs FP16: max=65.019997, mean=12.635082
+    反量化+GEMM vs Triton: max=0.057957, mean=0.011487
 
 
 另外就是可以考虑要保存量化后的参数了。

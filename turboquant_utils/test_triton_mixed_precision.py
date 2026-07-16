@@ -1,20 +1,11 @@
 #!/usr/bin/env python3
-import itertools
 """
-混合精度 Triton 融合 kernel 测试程序，针对 MoE down 投影的场景。
+混合精度 Triton 融合 kernel 测试程序。
 
-测试内容：
-1. Down 权重 shape: (out_features=H, in_features=sub_set_neurons)
-2. 在 in_features (K) 维度按 2:1:1 切分成三份：
-   - W1: (H, K/2)
-   - W2: (H, K/4)
-   - W3: (H, K/4)
-3. 分别量化每份切片，支持混合精度
-4. 输出直接相加得到最终结果
-
-测试场景：
-- 场景1：所有切片都是 4bit（完整量化+新函数测试）
-- 场景2：切片按 4bit:2bit:1bit 混合精度（分别量化）
+测试三个算子：
+1. triton_fused_matmul_grouped：单独的 linear 层
+2. triton_fused_matmul_grouped_slice_rows：MoE up_gate (切 rows，混精)
+3. triton_fused_matmul_grouped_slice_in_features：MoE down (切 in_features，混精)
 """
 
 import argparse
@@ -36,119 +27,11 @@ from turboquant_utils.rotation import generate_rotation_matrix
 from turboquant_utils.quantize import pack_nbit, unpack_nbit
 
 
-def manual_fused_matmul_grouped(x, packed_data, in_features, bit_width):
-    """
-    手动版本：和 triton_fused_matmul_grouped 完全一样的数学步骤，
-    但用 PyTorch 操作，方便 debug
-    """
-    indices_packed = packed_data["indices_packed"]
-    codebook = packed_data["codebook"]
-    norms = packed_data["norms"]
-    seed = packed_data["seed"]
-    group_size = packed_data["group_size"]
-
-    batch_size = x.shape[0]
-    out_features = indices_packed.shape[0]
-    ELEMENTS_PER_BYTE = 8 // bit_width
-
-    if norms.dim() == 1:
-        norms = norms.unsqueeze(1)
-
-    # 先 unpack indices
-    full_indices = unpack_nbit(indices_packed, bit_width, in_features)
-
-    output = torch.zeros(batch_size, out_features, dtype=torch.float32, device=x.device)
-
-    num_groups = (in_features + group_size - 1) // group_size
-    for group_idx in range(num_groups):
-        g_start = group_idx * group_size
-        g_end = min(g_start + group_size, in_features)
-        g_dim = g_end - g_start
-
-        # 旋转 x
-        Pi = generate_rotation_matrix(g_dim, seed + g_start, device=x.device)
-        x_g = x[:, g_start:g_end].float()
-        x_rot = x_g @ Pi.T
-
-        # 取出这个 group 的 indices，还原 weight
-        indices_g = full_indices[:, g_start:g_end]
-        w_quant_scaled = codebook[indices_g]  # 这是乘了 scale 的
-        scale = math.sqrt(g_dim)
-        w_quant = w_quant_scaled / scale
-
-        # 逆旋转
-        w_g = w_quant @ Pi
-
-        # 乘 norms
-        norms_g = norms[:, group_idx].unsqueeze(1)
-        w_g_scaled = w_g * norms_g
-
-        # 矩阵乘法
-        out_g = x_g @ w_g_scaled.T
-
-        output += out_g
-
-    return output
-
-
-def manual_fused_matmul_grouped_math_order(x, packed_data, in_features, bit_width):
-    """
-    手动版本：完全按照 Triton 的数学顺序计算：(x_rot @ w_quant.T) * (norms / scale)
-    """
-    indices_packed = packed_data["indices_packed"]
-    codebook = packed_data["codebook"]
-    norms = packed_data["norms"]
-    seed = packed_data["seed"]
-    group_size = packed_data["group_size"]
-
-    batch_size = x.shape[0]
-    out_features = indices_packed.shape[0]
-    ELEMENTS_PER_BYTE = 8 // bit_width
-
-    if norms.dim() == 1:
-        norms = norms.unsqueeze(1)
-
-    # 先 unpack indices
-    full_indices = unpack_nbit(indices_packed, bit_width, in_features)
-
-    output = torch.zeros(batch_size, out_features, dtype=torch.float32, device=x.device)
-
-    num_groups = (in_features + group_size - 1) // group_size
-    for group_idx in range(num_groups):
-        g_start = group_idx * group_size
-        g_end = min(g_start + group_size, in_features)
-        g_dim = g_end - g_start
-
-        # 旋转 x (和 Triton 一样)
-        Pi = generate_rotation_matrix(g_dim, seed + g_start, device=x.device)
-        x_g = x[:, g_start:g_end].float()
-        x_rot = x_g @ Pi.T
-
-        # 取出这个 group 的 indices，得到量化后的 weight (没有逆旋转，没有除以 scale)
-        indices_g = full_indices[:, g_start:g_end]
-        w_quant_scaled = codebook[indices_g]  # 这是 Y_scaled = Y * sqrt(g_dim)
-
-        # 矩阵乘法：x_rot @ w_quant_scaled.T (和 Triton 一样)
-        out_g = x_rot @ w_quant_scaled.T
-
-        # 计算 scale 因子
-        scale = math.sqrt(g_dim)
-        norms_g = norms[:, group_idx]
-        norms_scaled = norms_g / scale
-
-        # 应用 norms_scaled
-        out_g = out_g * norms_scaled[None, :]
-
-        output += out_g
-
-    return output
-
-
 def setup_seed(seed=42):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     # 显式设置 TF32，确保 PyTorch 和 Triton 行为一致
-    torch.backends.cuda.matmul.allow_tf32 = True  # PyTorch也用TF32，匹配Triton
+    torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
 
@@ -253,13 +136,6 @@ def dequantize_weight_simple(packed_data, W_shape):
 def get_slice_boundaries(K, proportions=None):
     """
     计算切片的边界位置
-
-    Args:
-        K: 完整的 in_features
-        proportions: 切分比例，默认 [2, 1, 1]
-
-    Returns:
-        list of (start, end) tuples
     """
     if proportions is None:
         proportions = [2, 1, 1]
@@ -278,16 +154,13 @@ def get_slice_boundaries(K, proportions=None):
     return boundaries
 
 
-def test_mixed_precision(args):
-    """
-    混合精度测试：Down 权重在 in_features 维度切分，分别量化，结果相加
-    """
+def test_linear(args):
+    """场景1：单独的 linear 层，测试 triton_fused_matmul_grouped"""
     print("\n" + "=" * 70)
-    print("混合精度 MoE Down 测试")
+    print("场景1: 单独 Linear - triton_fused_matmul_grouped")
     print("=" * 70)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
 
     H = args.out_features
     K = args.in_features
@@ -298,290 +171,365 @@ def test_mixed_precision(args):
     K = ((K + group_size - 1) // group_size) * group_size
 
     print(f"\n测试配置:")
-    print(f"  Down shape: {H} x {K} (out_features x in_features)")
+    print(f"  Linear shape: {H} x {K} (out_features x in_features)")
     print(f"  Input x shape: {B} x {K}")
     print(f"  group_size: {group_size}")
-    print(f"  切分比例: 2:1:1 (in_features维度)")
 
     # 创建随机权重和输入
-    W_down = torch.randn(H, K, dtype=torch.float16, device=device)
+    torch.manual_seed(args.seed)
+    W = torch.randn(H, K, dtype=torch.float16, device=device)
     x = torch.randn(B, K, dtype=torch.float16, device=device)
 
-    # 计算切片边界
-    slice_boundaries = get_slice_boundaries(K)
-    W_slices = [W_down[:, start:end] for start, end in slice_boundaries]
-    x_slices = [x[:, start:end] for start, end in slice_boundaries]
+    # 量化权重
+    packed_data = quantize_weight_simple(W, bit_width=4, group_size=group_size, seed=args.seed)
 
-    print(f"\n权重切片信息:")
-    for i, (start, end) in enumerate(slice_boundaries):
-        print(f"  W{i+1}: in_features [{start}:{end}], shape {W_slices[i].shape}")
+    # ===== Warmup =====
+    print("\nWarmup...")
+    for _ in range(5):
+        _ = x @ W.T
+        w_dequant = dequantize_weight_simple(packed_data, W.shape)
+        _ = x.float() @ w_dequant.T
+        _ = triton_fused_matmul_grouped(
+            x, packed_data["indices_packed"], packed_data["codebook"],
+            packed_data["norms"], packed_data["seed"],
+            packed_data["group_size"], K, bit_width=4
+        )
 
-    # Baseline: 原始矩阵乘法
-    print("\n" + "-" * 70)
-    print("Baseline: 原始矩阵乘法（不量化）")
-    print("-" * 70)
-
-    # # 预热
-    # for _ in range(3):
-    #     _ = x @ W_down.T
-
+    # 1. FP16 Baseline
     torch.cuda.synchronize()
     t0 = time.time()
-    out_baseline = x @ W_down.T
+    for _ in range(10):
+        out_fp16 = x @ W.T
     torch.cuda.synchronize()
-    t_baseline = time.time() - t0
+    t_fp16 = (time.time() - t0) / 10
 
-    print(f"  时间: {t_baseline * 1000:.2f} ms")
-    print(f"  Output shape: {out_baseline.shape}")
+    # 2. 反量化 + GEMM
+    torch.cuda.synchronize()
+    t0 = time.time()
+    for _ in range(10):
+        w_dequant = dequantize_weight_simple(packed_data, W.shape)
+        out_dequant = x.float() @ w_dequant.T
+    torch.cuda.synchronize()
+    t_dequant = (time.time() - t0) / 10
 
-    # 测试场景1：所有切片都是 4bit
+    # 3. Triton Fused
+    torch.cuda.synchronize()
+    t0 = time.time()
+    for _ in range(10):
+        out_triton = triton_fused_matmul_grouped(
+            x, packed_data["indices_packed"], packed_data["codebook"],
+            packed_data["norms"], packed_data["seed"],
+            packed_data["group_size"], K, bit_width=4
+        )
+    torch.cuda.synchronize()
+    t_triton = (time.time() - t0) / 10
+
+    # 计算误差
+    out_fp16_float = out_fp16.float()
+    out_dequant_float = out_dequant.float()
+    out_triton_float = out_triton.float()
+
+    abs_diff_dequant = torch.abs(out_fp16_float - out_dequant_float)
+    abs_diff_triton = torch.abs(out_fp16_float - out_triton_float)
+    abs_diff_between = torch.abs(out_dequant_float - out_triton_float)
+
+    return {
+        "t_fp16": t_fp16,
+        "t_dequant": t_dequant,
+        "t_triton": t_triton,
+        "err_dequant_max": abs_diff_dequant.max().item(),
+        "err_dequant_mean": abs_diff_dequant.mean().item(),
+        "err_triton_max": abs_diff_triton.max().item(),
+        "err_triton_mean": abs_diff_triton.mean().item(),
+        "err_between_max": abs_diff_between.max().item(),
+        "err_between_mean": abs_diff_between.mean().item(),
+    }
+
+
+def test_moe_up(args):
+    """场景2.1：MoE up_gate，测试 triton_fused_matmul_grouped_slice_rows"""
     print("\n" + "=" * 70)
-    print("场景1: 所有切片都是 4bit")
+    print("场景2.1: MoE up_gate - triton_fused_matmul_grouped_slice_rows")
     print("=" * 70)
 
-    # 方案A：完整量化 + 分别切片调用（原方式）
-    print("\n--- 方案A：完整量化后分别切片调用（原方式）---")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    packed_data_full_4bit = quantize_weight_simple(
-        W_down, bit_width=4, group_size=group_size, seed=args.seed
-    )
+    K = args.in_features   # up输出维度
+    D = K * 2             # up输入维度
+    B = args.batch_size
+    group_size = args.group_size
 
-    # 方法1：先反量化再做 GEMM
-    print("\n方法1: 先反量化再做 GEMM (4bit)...")
+    # 确保对齐到 group_size 边界
+    K = ((K + group_size - 1) // group_size) * group_size
+    D = ((D + group_size - 1) // group_size) * group_size
 
-    torch.cuda.synchronize()
-    t0 = time.time()
+    print(f"\n测试配置:")
+    print(f"  Up_gate shape: {K} x {D}")
+    print(f"  Input x shape: {B} x {D}")
+    print(f"  group_size: {group_size}")
 
-    w_dequant = dequantize_weight_simple(packed_data_full_4bit, W_down.shape)
-    out_dequant_4bit = x.float() @ w_dequant.T
+    # 创建随机权重和输入
+    torch.manual_seed(args.seed)
+    W_up = torch.randn(K, D, dtype=torch.float16, device=device)
+    x = torch.randn(B, D, dtype=torch.float16, device=device)
 
-    torch.cuda.synchronize()
-    t_dequant = time.time() - t0
-
-    print(f"  时间: {t_dequant * 1000:.2f} ms")
-
-    # 方法2：Triton fused 分别处理每个切片
-    print("\n方法2: Triton fused kernel - 分别切片 (4bit)...")
-
-    torch.cuda.synchronize()
-    t0 = time.time()
-
-    out_triton_4bit = torch.zeros(B, H, dtype=torch.float32, device=device)
-    for i, (start, end) in enumerate(slice_boundaries):
-        x_slice = x[:, start:end]
-        slice_out = triton_fused_matmul_grouped(
-            x_slice,
-            packed_data_full_4bit["indices_packed"][:, start // 2: (end + 1) // 2].clone(),
-            packed_data_full_4bit["codebook"],
-            packed_data_full_4bit["norms"],
-            packed_data_full_4bit["seed"],
-            packed_data_full_4bit["group_size"],
-            end - start,
-            bit_width=4
-        )
-        out_triton_4bit += slice_out
-
-    torch.cuda.synchronize()
-    t_triton_separate = time.time() - t0
-
-    print(f"  时间: {t_triton_separate * 1000:.2f} ms")
-
-    # 方法4：优化版v1
-    print("\n方法4: Triton fused kernel - 优化版v1 (4bit)...")
-
-    # 预热
-    # for _ in range(3):
-    #     out_triton_test = torch.zeros(B, H, dtype=torch.float32, device=device)
-    #     for i, (start, end) in enumerate(slice_boundaries):
-    #         x_slice = x[:, start:end]
-    #         slice_out = triton_fused_matmul_grouped_slice_in_features(
-    #             x_slice,
-    #             packed_data_full_4bit["indices_packed"],
-    #             packed_data_full_4bit["codebook"],
-    #             packed_data_full_4bit["norms"],
-    #             packed_data_full_4bit["seed"],
-    #             packed_data_full_4bit["group_size"],
-    #             start, end, K,
-    #             bit_width=4
-    #         )
-    #         out_triton_test += slice_out
-
-    torch.cuda.synchronize()
-    t0 = time.time()
-
-    out_triton_optv1_4bit = torch.zeros(B, H, dtype=torch.float32, device=device)
-    for i, (start, end) in enumerate(slice_boundaries):
-        x_slice = x[:, start:end]
-        slice_out = triton_fused_matmul_grouped_slice_in_features(
-            x_slice,
-            packed_data_full_4bit["indices_packed"],
-            packed_data_full_4bit["codebook"],
-            packed_data_full_4bit["norms"],
-            packed_data_full_4bit["seed"],
-            packed_data_full_4bit["group_size"],
-            start, end, K,
-            bit_width=4
-        )
-        out_triton_optv1_4bit += slice_out
-
-    torch.cuda.synchronize()
-    t_triton_optv1 = time.time() - t0
-
-    print(f"  时间: {t_triton_optv1 * 1000:.2f} ms")
-
-    # 验证结果
-    print("\n结果对比 (场景1 - 全4bit):")
-    out_baseline_float = out_baseline.float()
-    out_dequant_float = out_dequant_4bit.float()
-    out_triton_float = out_triton_4bit.float()
-    out_triton_optv1_float = out_triton_optv1_4bit.float()
-
-    abs_diff_dequant = torch.abs(out_baseline_float - out_dequant_float)
-    abs_diff_triton = torch.abs(out_baseline_float - out_triton_float)
-    abs_diff_triton_optv1 = torch.abs(out_baseline_float - out_triton_optv1_float)
-
-    print(f"  反量化+GEMM vs Baseline:")
-    print(f"    最大绝对误差: {abs_diff_dequant.max().item():.6f}")
-    print(f"    平均绝对误差: {abs_diff_dequant.mean().item():.6f}")
-
-    print(f"\n  Triton 分别切片 vs Baseline:")
-    print(f"    最大绝对误差: {abs_diff_triton.max().item():.6f}")
-    print(f"    平均绝对误差: {abs_diff_triton.mean().item():.6f}")
-
-    print(f"\n  Triton 优化版v1 vs Baseline:")
-    print(f"    最大绝对误差: {abs_diff_triton_optv1.max().item():.6f}")
-    print(f"    平均绝对误差: {abs_diff_triton_optv1.mean().item():.6f}")
-
-    # 测试场景2：混合精度 4bit:2bit:1bit
-    print("\n" + "=" * 70)
-    print("场景2: 混合精度 4bit:2bit:1bit")
-    print("=" * 70)
-
+    # 切片配置（混精 4:2:1）
+    slice_boundaries_up = get_slice_boundaries(D)
     bit_widths = [4, 2, 1]
+    W_up_slices = [W_up[:, start:end] for start, end in slice_boundaries_up]
+    x_slices_up = [x[:, start:end] for start, end in slice_boundaries_up]
 
-    # 分别量化每个切片，使用不同精度
-    print("\n分别量化每个切片 (4bit, 2bit, 1bit)...")
-    packed_data_list_mixed = []
-    for i, (w_slice, bw, (start, end)) in enumerate(zip(W_slices, bit_widths, slice_boundaries)):
-        print(f"  量化 W{i+1} (in_features [{start}:{end}], shape {w_slice.shape}) with {bw}bit")
-        # 使用切片的 seed 偏移，但我们只对切片内的位置进行处理
+    # 分别量化
+    packed_data_list_up = []
+    for i, (w_slice, bw, (start, end)) in enumerate(zip(W_up_slices, bit_widths, slice_boundaries_up)):
         packed_data = quantize_weight_simple(
             w_slice, bit_width=bw, group_size=group_size, seed=args.seed + start
         )
-        packed_data_list_mixed.append(packed_data)
+        packed_data_list_up.append(packed_data)
 
-    # 方法1：先反量化再做 GEMM
-    print("\n方法1: 先反量化再做 GEMM (混合精度)...")
+    # ===== Warmup =====
+    print("\nWarmup...")
+    # warmup fp16
+    for _ in range(5):
+        _ = x @ W_up.T
+    # warmup dequant
+    for _ in range(5):
+        out_up_dequant = torch.zeros(B, K, dtype=torch.float32, device=device)
+        for i, (packed_data, w_slice, x_slice) in enumerate(zip(packed_data_list_up, W_up_slices, x_slices_up)):
+            w_dequant = dequantize_weight_simple(packed_data, w_slice.shape)
+            out_slice = x_slice.float() @ w_dequant.T
+            out_up_dequant += out_slice
+    # warmup triton
+    for _ in range(5):
+        out_up_triton_rows = torch.zeros(B, K, dtype=torch.float32, device=device)
+        rows_mid = K // 2
+        for row_start, row_end in [(0, rows_mid), (rows_mid, K)]:
+            out_up_triton_part = torch.zeros(B, row_end - row_start, dtype=torch.float32, device=device)
+            for i, (packed_data, x_slice) in enumerate(zip(packed_data_list_up, x_slices_up)):
+                slice_out = triton_fused_matmul_grouped_slice_rows(
+                    x_slice, packed_data["indices_packed"], packed_data["codebook"],
+                    packed_data["norms"], packed_data["seed"], packed_data["group_size"],
+                    x_slice.shape[1], row_start, row_end, bit_width=packed_data["bit_width"]
+                )
+                out_up_triton_part += slice_out
+            out_up_triton_rows[:, row_start:row_end] = out_up_triton_part
 
+    # 1. FP16 Baseline
     torch.cuda.synchronize()
     t0 = time.time()
-
-    out_dequant_mixed = torch.zeros(B, H, dtype=torch.float32, device=device)
-    for i, (packed_data, w_slice, x_slice) in enumerate(zip(packed_data_list_mixed, W_slices, x_slices)):
-        w_dequant = dequantize_weight_simple(packed_data, w_slice.shape)
-        out_slice = x_slice.float() @ w_dequant.T
-        out_dequant_mixed += out_slice
-
+    for _ in range(10):
+        out_up_fp16 = x @ W_up.T
     torch.cuda.synchronize()
-    t_dequant_mixed = time.time() - t0
+    t_fp16 = (time.time() - t0) / 10
 
-    print(f"  时间: {t_dequant_mixed * 1000:.2f} ms")
-
-    # 方法2：Triton fused
-    print("\n方法2: Triton fused kernel (混合精度)...")
-
-    torch.cuda.synchronize()
-
-    # 方法3：Triton fused - 优化版v1（混合精度）
-    print("\n方法3: Triton fused kernel - 优化版v1 (混合精度)...")
-
+    # 2. 反量化 + GEMM
     torch.cuda.synchronize()
     t0 = time.time()
-
-    out_triton_mixed_optv1 = torch.zeros(B, H, dtype=torch.float32, device=device)
-    for i, (packed_data, x_slice) in enumerate(zip(packed_data_list_mixed, x_slices)):
-        slice_out = triton_fused_matmul_grouped(
-            x_slice,
-            packed_data["indices_packed"],
-            packed_data["codebook"],
-            packed_data["norms"],
-            packed_data["seed"],
-            packed_data["group_size"],
-            x_slice.shape[1],
-            bit_width=packed_data["bit_width"]
-        )
-        out_triton_mixed_optv1 += slice_out
-
+    for _ in range(10):
+        out_up_dequant = torch.zeros(B, K, dtype=torch.float32, device=device)
+        for i, (packed_data, w_slice, x_slice) in enumerate(zip(packed_data_list_up, W_up_slices, x_slices_up)):
+            w_dequant = dequantize_weight_simple(packed_data, w_slice.shape)
+            out_slice = x_slice.float() @ w_dequant.T
+            out_up_dequant += out_slice
     torch.cuda.synchronize()
-    t_triton_mixed_optv1 = time.time() - t0
+    t_dequant = (time.time() - t0) / 10
 
-    print(f"  时间: {t_triton_mixed_optv1 * 1000:.2f} ms")
+    # 3. Triton Fused - slice_rows
+    torch.cuda.synchronize()
+    t0 = time.time()
+    for _ in range(10):
+        out_up_triton_rows = torch.zeros(B, K, dtype=torch.float32, device=device)
+        rows_mid = K // 2
+        for row_start, row_end in [(0, rows_mid), (rows_mid, K)]:
+            out_up_triton_part = torch.zeros(B, row_end - row_start, dtype=torch.float32, device=device)
+            for i, (packed_data, x_slice) in enumerate(zip(packed_data_list_up, x_slices_up)):
+                slice_out = triton_fused_matmul_grouped_slice_rows(
+                    x_slice, packed_data["indices_packed"], packed_data["codebook"],
+                    packed_data["norms"], packed_data["seed"], packed_data["group_size"],
+                    x_slice.shape[1], row_start, row_end, bit_width=packed_data["bit_width"]
+                )
+                out_up_triton_part += slice_out
+            out_up_triton_rows[:, row_start:row_end] = out_up_triton_part
+    torch.cuda.synchronize()
+    t_triton = (time.time() - t0) / 10
 
-    # 验证结果
-    print("\n结果对比 (场景2 - 混合精度):")
-    out_dequant_mixed_float = out_dequant_mixed.float()
-    out_triton_mixed_optv1_float = out_triton_mixed_optv1.float()
+    # 计算误差
+    out_up_fp16_float = out_up_fp16.float()
+    out_up_dequant_float = out_up_dequant.float()
+    out_up_triton_rows_float = out_up_triton_rows.float()
 
-    # 手动 debug 版本
-    print("\n  运行手动 Debug 版本...")
-    out_manual_dequant_order = torch.zeros(B, H, dtype=torch.float32, device=device)
-    out_manual_triton_order = torch.zeros(B, H, dtype=torch.float32, device=device)
-    for i, (packed_data, x_slice) in enumerate(zip(packed_data_list_mixed, x_slices)):
-        # 手动版本1：和反量化完全一样的顺序
-        slice_out1 = manual_fused_matmul_grouped(
-            x_slice, packed_data, x_slice.shape[1], packed_data["bit_width"]
-        )
-        out_manual_dequant_order += slice_out1
+    abs_diff_up_dequant = torch.abs(out_up_fp16_float - out_up_dequant_float)
+    abs_diff_up_triton = torch.abs(out_up_fp16_float - out_up_triton_rows_float)
+    abs_diff_up_between = torch.abs(out_up_dequant_float - out_up_triton_rows_float)
 
-        # 手动版本2：和 Triton 完全一样的数学顺序
-        slice_out2 = manual_fused_matmul_grouped_math_order(
-            x_slice, packed_data, x_slice.shape[1], packed_data["bit_width"]
-        )
-        out_manual_triton_order += slice_out2
+    return {
+        "t_fp16": t_fp16,
+        "t_dequant": t_dequant,
+        "t_triton": t_triton,
+        "err_dequant_max": abs_diff_up_dequant.max().item(),
+        "err_dequant_mean": abs_diff_up_dequant.mean().item(),
+        "err_triton_max": abs_diff_up_triton.max().item(),
+        "err_triton_mean": abs_diff_up_triton.mean().item(),
+        "err_between_max": abs_diff_up_between.max().item(),
+        "err_between_mean": abs_diff_up_between.mean().item(),
+    }
 
-    abs_diff_dequant_mixed = torch.abs(out_baseline_float - out_dequant_mixed_float)
-    abs_diff_triton_mixed_optv1 = torch.abs(out_baseline_float - out_triton_mixed_optv1_float)
-    abs_diff_between_mixed = torch.abs(out_dequant_mixed_float - out_triton_mixed_optv1_float)
 
-    abs_diff_manual_dequant_vs_triton = torch.abs(out_manual_dequant_order - out_manual_triton_order)
-    abs_diff_manual_triton_vs_real_triton = torch.abs(out_manual_triton_order - out_triton_mixed_optv1_float)
-    abs_diff_manual_dequant_vs_real_dequant = torch.abs(out_manual_dequant_order - out_dequant_mixed_float)
-
-    print(f"  反量化+GEMM vs Baseline:")
-    print(f"    最大绝对误差: {abs_diff_dequant_mixed.max().item():.6f}")
-    print(f"    平均绝对误差: {abs_diff_dequant_mixed.mean().item():.6f}")
-
-    print(f"\n  Triton Fused 优化版v1 vs Baseline:")
-    print(f"    最大绝对误差: {abs_diff_triton_mixed_optv1.max().item():.6f}")
-    print(f"    平均绝对误差: {abs_diff_triton_mixed_optv1.mean().item():.6f}")
-
-    print(f"\n  反量化+GEMM vs Triton Fused:")
-    print(f"    最大绝对误差: {abs_diff_between_mixed.max().item():.6f}")
-    print(f"    平均绝对误差: {abs_diff_between_mixed.mean():.6f}")
-
-    print(f"\n  Debug 对比:")
-    print(f"    手动(反量化顺序) vs 手动(Triton顺序): 最大误差 = {abs_diff_manual_dequant_vs_triton.max().item():.12f}")
-    print(f"    手动(Triton顺序) vs 真实Triton:     最大误差 = {abs_diff_manual_triton_vs_real_triton.max().item():.12f}")
-    print(f"    手动(反量化顺序) vs 真实反量化:     最大误差 = {abs_diff_manual_dequant_vs_real_dequant.max().item():.12f}")
-
+def test_moe_down(args):
+    """场景2.2：MoE down，测试 triton_fused_matmul_grouped_slice_in_features"""
     print("\n" + "=" * 70)
-    print("性能汇总")
+    print("场景2.2: MoE down - triton_fused_matmul_grouped_slice_in_features")
     print("=" * 70)
-    print(f"  Baseline:              {t_baseline * 1000:8.2f} ms")
-    print(f"  场景1 - 全4bit:")
-    print(f"    反量化+GEMM:         {t_dequant * 1000:8.2f} ms")
-    print(f"    Triton 分别切片:     {t_triton_separate * 1000:8.2f} ms")
-    print(f"    Triton Fused:     {t_triton_optv1 * 1000:8.2f} ms")
-    print(f"  场景2 - 混合4:2:1bit:")
-    print(f"    反量化+GEMM:         {t_dequant_mixed * 1000:8.2f} ms")
-    print(f"    Triton 优化版v1:     {t_triton_mixed_optv1 * 1000:8.2f} ms")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    H = args.out_features  # down输出维度
+    K = args.in_features   # down输入维度
+    B = args.batch_size
+    group_size = args.group_size
+
+    # 确保对齐到 group_size 边界
+    K = ((K + group_size - 1) // group_size) * group_size
+
+    print(f"\n测试配置:")
+    print(f"  Down shape: {H} x {K}")
+    print(f"  Input x shape: {B} x {K}")
+    print(f"  group_size: {group_size}")
+
+    # 创建随机权重和输入
+    torch.manual_seed(args.seed)
+    W_down = torch.randn(H, K, dtype=torch.float16, device=device)
+    x = torch.randn(B, K, dtype=torch.float16, device=device)
+
+    # 切片配置（混精 4:2:1）
+    slice_boundaries_down = get_slice_boundaries(K)
+    bit_widths = [4, 2, 1]
+    W_down_slices = [W_down[:, start:end] for start, end in slice_boundaries_down]
+    x_slices_down = [x[:, start:end] for start, end in slice_boundaries_down]
+
+    # 分别量化
+    packed_data_list_down = []
+    for i, (w_slice, bw, (start, end)) in enumerate(zip(W_down_slices, bit_widths, slice_boundaries_down)):
+        packed_data = quantize_weight_simple(
+            w_slice, bit_width=bw, group_size=group_size, seed=args.seed + start
+        )
+        packed_data_list_down.append(packed_data)
+
+    # ===== Warmup =====
+    print("\nWarmup...")
+    # warmup fp16
+    for _ in range(5):
+        _ = x @ W_down.T
+    # warmup dequant
+    for _ in range(5):
+        out_down_dequant = torch.zeros(B, H, dtype=torch.float32, device=device)
+        for i, (packed_data, w_slice, x_slice) in enumerate(zip(packed_data_list_down, W_down_slices, x_slices_down)):
+            w_dequant = dequantize_weight_simple(packed_data, w_slice.shape)
+            out_slice = x_slice.float() @ w_dequant.T
+            out_down_dequant += out_slice
+    # warmup triton
+    for _ in range(5):
+        out_down_triton_in = torch.zeros(B, H, dtype=torch.float32, device=device)
+        for i, (packed_data, x_slice) in enumerate(zip(packed_data_list_down, x_slices_down)):
+            slice_out = triton_fused_matmul_grouped_slice_in_features(
+                x_slice, packed_data["indices_packed"], packed_data["codebook"],
+                packed_data["norms"], packed_data["seed"], packed_data["group_size"],
+                0, x_slice.shape[1], x_slice.shape[1], bit_width=packed_data["bit_width"]
+            )
+            out_down_triton_in += slice_out
+
+    # 1. FP16 Baseline
+    torch.cuda.synchronize()
+    t0 = time.time()
+    for _ in range(10):
+        out_down_fp16 = x @ W_down.T
+    torch.cuda.synchronize()
+    t_fp16 = (time.time() - t0) / 10
+
+    # 2. 反量化 + GEMM
+    torch.cuda.synchronize()
+    t0 = time.time()
+    for _ in range(10):
+        out_down_dequant = torch.zeros(B, H, dtype=torch.float32, device=device)
+        for i, (packed_data, w_slice, x_slice) in enumerate(zip(packed_data_list_down, W_down_slices, x_slices_down)):
+            w_dequant = dequantize_weight_simple(packed_data, w_slice.shape)
+            out_slice = x_slice.float() @ w_dequant.T
+            out_down_dequant += out_slice
+    torch.cuda.synchronize()
+    t_dequant = (time.time() - t0) / 10
+
+    # 3. Triton Fused - slice_in_features
+    torch.cuda.synchronize()
+    t0 = time.time()
+    for _ in range(10):
+        out_down_triton_in = torch.zeros(B, H, dtype=torch.float32, device=device)
+        for i, (packed_data, x_slice) in enumerate(zip(packed_data_list_down, x_slices_down)):
+            slice_out = triton_fused_matmul_grouped_slice_in_features(
+                x_slice, packed_data["indices_packed"], packed_data["codebook"],
+                packed_data["norms"], packed_data["seed"], packed_data["group_size"],
+                0, x_slice.shape[1], x_slice.shape[1], bit_width=packed_data["bit_width"]
+            )
+            out_down_triton_in += slice_out
+    torch.cuda.synchronize()
+    t_triton = (time.time() - t0) / 10
+
+    # 计算误差
+    out_down_fp16_float = out_down_fp16.float()
+    out_down_dequant_float = out_down_dequant.float()
+    out_down_triton_in_float = out_down_triton_in.float()
+
+    abs_diff_down_dequant = torch.abs(out_down_fp16_float - out_down_dequant_float)
+    abs_diff_down_triton = torch.abs(out_down_fp16_float - out_down_triton_in_float)
+    abs_diff_down_between = torch.abs(out_down_dequant_float - out_down_triton_in_float)
+
+    return {
+        "t_fp16": t_fp16,
+        "t_dequant": t_dequant,
+        "t_triton": t_triton,
+        "err_dequant_max": abs_diff_down_dequant.max().item(),
+        "err_dequant_mean": abs_diff_down_dequant.mean().item(),
+        "err_triton_max": abs_diff_down_triton.max().item(),
+        "err_triton_mean": abs_diff_down_triton.mean().item(),
+        "err_between_max": abs_diff_down_between.max().item(),
+        "err_between_mean": abs_diff_down_between.mean().item(),
+    }
+
+def print_summary(linear_result, moe_up_result, moe_down_result):
+    """打印最终汇总"""
+    print("\n" + "=" * 70)
+    print("最终汇总")
+    print("=" * 70)
+
+    print("\n1. 单独 Linear (triton_fused_matmul_grouped):")
+    print(f"  FP16:             {linear_result['t_fp16'] * 1000:8.2f} ms")
+    print(f"  反量化+GEMM:      {linear_result['t_dequant'] * 1000:8.2f} ms")
+    print(f"  Triton:           {linear_result['t_triton'] * 1000:8.2f} ms")
+    print(f"\n  误差对比:")
+    print(f"    Triton vs FP16: max={linear_result['err_triton_max']:.6f}, mean={linear_result['err_triton_mean']:.6f}")
+    print(f"    反量化+GEMM vs Triton: max={linear_result['err_between_max']:.6f}, mean={linear_result['err_between_mean']:.6f}")
+
+    print("\n2.1 MoE up_gate (triton_fused_matmul_grouped_slice_rows):")
+    print(f"  FP16:             {moe_up_result['t_fp16'] * 1000:8.2f} ms")
+    print(f"  反量化+GEMM:      {moe_up_result['t_dequant'] * 1000:8.2f} ms")
+    print(f"  Triton:           {moe_up_result['t_triton'] * 1000:8.2f} ms")
+    print(f"\n  误差对比:")
+    print(f"    Triton vs FP16: max={moe_up_result['err_triton_max']:.6f}, mean={moe_up_result['err_triton_mean']:.6f}")
+    print(f"    反量化+GEMM vs Triton: max={moe_up_result['err_between_max']:.6f}, mean={moe_up_result['err_between_mean']:.6f}")
+
+    print("\n2.2 MoE down (triton_fused_matmul_grouped_slice_in_features):")
+    print(f"  FP16:             {moe_down_result['t_fp16'] * 1000:8.2f} ms")
+    print(f"  反量化+GEMM:      {moe_down_result['t_dequant'] * 1000:8.2f} ms")
+    print(f"  Triton:           {moe_down_result['t_triton'] * 1000:8.2f} ms")
+    print(f"\n  误差对比:")
+    print(f"    Triton vs FP16: max={moe_down_result['err_triton_max']:.6f}, mean={moe_down_result['err_triton_mean']:.6f}")
+    print(f"    反量化+GEMM vs Triton: max={moe_down_result['err_between_max']:.6f}, mean={moe_down_result['err_between_mean']:.6f}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="混合精度 MoE Down 测试")
+    parser = argparse.ArgumentParser(description="混合精度 MoE 测试")
 
     parser.add_argument("--out_features", type=int, default=1024, help="Down 输出特征维度 H")
-    parser.add_argument("--in_features", type=int, default=2048, help="Down 输入特征维度 K")
+    parser.add_argument("--in_features", type=int, default=2048, help="Down 输入/Up 输出特征维度 K")
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size B")
     parser.add_argument("--group_size", type=int, default=128, help="分组大小")
     parser.add_argument("--seed", type=int, default=42, help="随机种子")
@@ -590,12 +538,11 @@ def main():
 
     setup_seed(args.seed)
 
-    test_mixed_precision(args)
+    linear_result = test_linear(args)
+    moe_up_result = test_moe_up(args)
+    moe_down_result = test_moe_down(args)
 
-    print("\n" + "=" * 70)
-    print("测试完成！")
-    print("=" * 70)
-
+    print_summary(linear_result, moe_up_result, moe_down_result)
 
 if __name__ == "__main__":
     main()
