@@ -102,9 +102,9 @@ def _turboquant_fused_matmul_kernel_nbit(
         w_quant = tl.load(codebook_ptr + idx, mask=w_mask, other=0.0)
 
         acc += tl.dot(
-            inp_tile.to(tl.float32),
-            tl.trans(w_quant.to(tl.float32)),
-            allow_tf32=False,
+            inp_tile,
+            tl.trans(w_quant),
+            allow_tf32=True,
         )
 
     norm_vals = tl.load(norms_ptr + rn, mask=mask_n, other=1.0)
@@ -206,7 +206,7 @@ def _turboquant_fused_dual_matmul_kernel_nbit(
         idx1 = idx1.to(tl.int32)
         w1 = tl.load(codebook1_ptr + idx1, mask=w_mask, other=0.0)
 
-        acc1 += tl.dot(inp1.to(tl.float32), tl.trans(w1.to(tl.float32)), allow_tf32=False)
+        acc1 += tl.dot(inp1, tl.trans(w1), allow_tf32=True)
 
         if SAME_INPUT:
             inp2 = inp1
@@ -219,7 +219,7 @@ def _turboquant_fused_dual_matmul_kernel_nbit(
         idx2 = idx2.to(tl.int32)
         w2 = tl.load(codebook2_ptr + idx2, mask=w_mask, other=0.0)
 
-        acc2 += tl.dot(inp2.to(tl.float32), tl.trans(w2.to(tl.float32)), allow_tf32=False)
+        acc2 += tl.dot(inp2, tl.trans(w2), allow_tf32=True)
 
     n1 = tl.load(norms1_ptr + rn, mask=mask_n, other=1.0)
     n2 = tl.load(norms2_ptr + rn, mask=mask_n, other=1.0)
