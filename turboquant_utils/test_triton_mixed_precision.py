@@ -62,7 +62,7 @@ def quantize_weight_simple(W, bit_width=4, group_size=None, seed=42):
         all_indices.append(indices)
 
     full_indices = torch.cat(all_indices, dim=1)
-    norms_out = torch.stack(all_norms, dim=1) if len(all_indices) > 1 else all_indices[0]
+    norms_out = torch.stack(all_norms, dim=1) if len(all_indices) > 1 else all_norms[0]
 
     packed = pack_nbit(full_indices, bit_width)
 
@@ -74,6 +74,47 @@ def quantize_weight_simple(W, bit_width=4, group_size=None, seed=42):
         "group_size": group_size,
         "bit_width": bit_width,
     }
+
+
+def simu_quant_weight(W, bit_width=4, group_size=None, seed=42):
+    """
+    模拟量化：现场量化，然后马上反量化存回 fp16。
+    不存储 packed 数据，直接返回反量化后的 fp16 权重。
+    """
+    M, K = W.shape
+    if group_size is None:
+        group_size = K
+
+    W = W.float()
+    centroids, boundaries = get_codebook(bit_width)
+    centroids = centroids.to(W.device)
+    boundaries = boundaries.to(W.device)
+
+    W_approx = torch.zeros_like(W)
+
+    for g_start in range(0, K, group_size):
+        g_end = min(g_start + group_size, K)
+        g_dim = g_end - g_start
+        W_g = W[:, g_start:g_end]
+
+        norms = W_g.norm(dim=1, keepdim=True).clamp(min=1e-8)
+        W_norm = W_g / norms
+
+        Pi = generate_rotation_matrix(g_dim, seed + g_start, device=W.device)
+        Y = W_norm @ Pi.T
+        scale = math.sqrt(g_dim)
+        Y_scaled = Y * scale
+
+        indices = torch.searchsorted(boundaries, Y_scaled.reshape(-1))
+        indices = indices.clamp(0, len(centroids) - 1).reshape(M, g_dim)
+
+        # 马上反量化
+        Y_quant_scaled = centroids[indices]
+        Y_unscaled = Y_quant_scaled / scale
+        W_g_approx = Y_unscaled @ Pi
+        W_approx[:, g_start:g_end] = W_g_approx * norms
+
+    return W_approx.to(torch.float16)
 
 
 def dequantize_weight_simple(packed_data, W_shape):
@@ -133,6 +174,7 @@ def get_slice_boundaries(K, proportions=None):
 
 
 def test_linear(args):
+    bit_width = 8
     print("\n" + "=" * 70)
     print("场景1: 单独 Linear - triton_fused_matmul_grouped")
     print("=" * 70)
@@ -154,17 +196,19 @@ def test_linear(args):
     W = torch.randn(H, K, dtype=torch.float16, device=device)
     x = torch.randn(B, K, dtype=torch.float16, device=device)
 
-    packed_data = quantize_weight_simple(W, bit_width=4, group_size=group_size, seed=args.seed)
+    packed_data = quantize_weight_simple(W, bit_width=bit_width, group_size=group_size, seed=args.seed)
+    W_simu = simu_quant_weight(W, bit_width=bit_width, group_size=group_size, seed=args.seed)
 
     print("\nWarmup...")
     for _ in range(5):
         _ = x @ W.T
+        _ = x @ W_simu.T
         w_dequant = dequantize_weight_simple(packed_data, W.shape)
         _ = x.float() @ w_dequant.T
         _ = triton_fused_matmul_grouped(
             x, packed_data["indices_packed"], packed_data["codebook"],
             packed_data["norms"], packed_data["seed"],
-            packed_data["group_size"], K, bit_width=4
+            packed_data["group_size"], K, bit_width=bit_width
         )
 
     torch.cuda.synchronize()
@@ -173,6 +217,13 @@ def test_linear(args):
         out_fp16 = x @ W.T
     torch.cuda.synchronize()
     t_fp16 = (time.time() - t0) / 10
+
+    torch.cuda.synchronize()
+    t0 = time.time()
+    for _ in range(10):
+        out_simu = x @ W_simu.T
+    torch.cuda.synchronize()
+    t_simu = (time.time() - t0) / 10
 
     torch.cuda.synchronize()
     t0 = time.time()
@@ -188,41 +239,43 @@ def test_linear(args):
         out_triton = triton_fused_matmul_grouped(
             x, packed_data["indices_packed"], packed_data["codebook"],
             packed_data["norms"], packed_data["seed"],
-            packed_data["group_size"], K, bit_width=4
+            packed_data["group_size"], K, bit_width=bit_width
         )
     torch.cuda.synchronize()
     t_triton = (time.time() - t0) / 10
 
     out_fp16_float = out_fp16.float()
+    out_simu_float = out_simu.float()
     out_dequant_float = out_dequant.float()
     out_triton_float = out_triton.float()
 
-    abs_diff_dequant = torch.abs(out_fp16_float - out_dequant_float)
-    abs_diff_triton = torch.abs(out_fp16_float - out_triton_float)
-    abs_diff_between = torch.abs(out_dequant_float - out_triton_float)
+    abs_diff_simu_fp16 = torch.abs(out_fp16_float - out_simu_float)
+    abs_diff_dequant_simu = torch.abs(out_dequant_float - out_simu_float)
+    abs_diff_dequant_triton = torch.abs(out_dequant_float - out_triton_float)
 
     print("\n" + "=" * 70)
     print("场景1汇总")
     print("=" * 70)
     print(f"FP16:              {t_fp16 * 1000:8.2f} ms")
+    print(f"SimuQuant:         {t_simu * 1000:8.2f} ms")
     print(f"反量化+GEMM:       {t_dequant * 1000:8.2f} ms")
     print(f"Triton:            {t_triton * 1000:8.2f} ms")
-    print(f"\n误差对比 (vs FP16):")
-    print(f"反量化+GEMM:       max={abs_diff_dequant.max():.6f}, mean={abs_diff_dequant.mean():.6f}")
-    print(f"Triton:            max={abs_diff_triton.max():.6f}, mean={abs_diff_triton.mean():.6f}")
-    print(f"\n反量化+GEMM vs Triton:")
-    print(f"                    max={abs_diff_between.max():.6f}, mean={abs_diff_between.mean():.6f}")
+    print(f"\n误差对比:")
+    print(f"SimuQuant vs FP16:  max={abs_diff_simu_fp16.max():.6f}, mean={abs_diff_simu_fp16.mean():.6f}")
+    print(f"反量化+GEMM vs SimuQuant: max={abs_diff_dequant_simu.max():.6f}, mean={abs_diff_dequant_simu.mean():.6f}")
+    print(f"反量化+GEMM vs Triton: max={abs_diff_dequant_triton.max():.6f}, mean={abs_diff_dequant_triton.mean():.6f}")
 
     return {
         "t_fp16": t_fp16,
+        "t_simu": t_simu,
         "t_dequant": t_dequant,
         "t_triton": t_triton,
-        "err_dequant_max": abs_diff_dequant.max().item(),
-        "err_dequant_mean": abs_diff_dequant.mean().item(),
-        "err_triton_max": abs_diff_triton.max().item(),
-        "err_triton_mean": abs_diff_triton.mean().item(),
-        "err_between_max": abs_diff_between.max().item(),
-        "err_between_mean": abs_diff_between.mean().item(),
+        "err_simu_fp16_max": abs_diff_simu_fp16.max().item(),
+        "err_simu_fp16_mean": abs_diff_simu_fp16.mean().item(),
+        "err_dequant_simu_max": abs_diff_dequant_simu.max().item(),
+        "err_dequant_simu_mean": abs_diff_dequant_simu.mean().item(),
+        "err_dequant_triton_max": abs_diff_dequant_triton.max().item(),
+        "err_dequant_triton_mean": abs_diff_dequant_triton.mean().item(),
     }
 
 
@@ -250,6 +303,7 @@ def test_moe_up_gate(args):
     x = torch.randn(B, D, dtype=torch.float16, device=device)
 
     packed_data = quantize_weight_simple(W_gate_up, bit_width=4, group_size=group_size, seed=args.seed)
+    W_gate_up_simu = simu_quant_weight(W_gate_up, bit_width=4, group_size=group_size, seed=args.seed)
 
     start = K // 4
     end = K // 2
@@ -258,6 +312,7 @@ def test_moe_up_gate(args):
     print("\nWarmup...")
     for _ in range(5):
         _ = x @ W_gate_up.T
+        _ = x @ W_gate_up_simu.T
         w_dequant = dequantize_weight_simple(packed_data, W_gate_up.shape)
         _ = x.float() @ w_dequant.T
         _ = triton_fused_matmul_grouped_slice_rows(
@@ -272,6 +327,13 @@ def test_moe_up_gate(args):
         out_fp16 = x @ W_gate_up.T[:, 2*start:2*end]
     torch.cuda.synchronize()
     t_fp16 = (time.time() - t0) / 10
+
+    torch.cuda.synchronize()
+    t0 = time.time()
+    for _ in range(10):
+        out_simu = x @ W_gate_up_simu.T[:, 2*start:2*end]
+    torch.cuda.synchronize()
+    t_simu = (time.time() - t0) / 10
 
     torch.cuda.synchronize()
     t0 = time.time()
@@ -293,35 +355,37 @@ def test_moe_up_gate(args):
     t_triton = (time.time() - t0) / 10
 
     out_fp16_float = out_fp16.float()
+    out_simu_float = out_simu.float()
     out_dequant_float = out_dequant.float()
     out_triton_float = out_triton.float()
 
-    abs_diff_dequant = torch.abs(out_fp16_float - out_dequant_float)
-    abs_diff_triton = torch.abs(out_fp16_float - out_triton_float)
-    abs_diff_between = torch.abs(out_dequant_float - out_triton_float)
+    abs_diff_simu_fp16 = torch.abs(out_fp16_float - out_simu_float)
+    abs_diff_dequant_simu = torch.abs(out_dequant_float - out_simu_float)
+    abs_diff_dequant_triton = torch.abs(out_dequant_float - out_triton_float)
 
     print("\n" + "=" * 70)
     print("场景2.1汇总")
     print("=" * 70)
     print(f"FP16:              {t_fp16 * 1000:8.2f} ms")
+    print(f"SimuQuant:         {t_simu * 1000:8.2f} ms")
     print(f"反量化+GEMM:       {t_dequant * 1000:8.2f} ms")
     print(f"Triton:            {t_triton * 1000:8.2f} ms")
-    print(f"\n误差对比 (vs FP16):")
-    print(f"反量化+GEMM:       max={abs_diff_dequant.max():.6f}, mean={abs_diff_dequant.mean():.6f}")
-    print(f"Triton:            max={abs_diff_triton.max():.6f}, mean={abs_diff_triton.mean():.6f}")
-    print(f"\n反量化+GEMM vs Triton:")
-    print(f"                    max={abs_diff_between.max():.6f}, mean={abs_diff_between.mean():.6f}")
+    print(f"\n误差对比:")
+    print(f"SimuQuant vs FP16:  max={abs_diff_simu_fp16.max():.6f}, mean={abs_diff_simu_fp16.mean():.6f}")
+    print(f"反量化+GEMM vs SimuQuant: max={abs_diff_dequant_simu.max():.6f}, mean={abs_diff_dequant_simu.mean():.6f}")
+    print(f"反量化+GEMM vs Triton: max={abs_diff_dequant_triton.max():.6f}, mean={abs_diff_dequant_triton.mean():.6f}")
 
     return {
         "t_fp16": t_fp16,
+        "t_simu": t_simu,
         "t_dequant": t_dequant,
         "t_triton": t_triton,
-        "err_dequant_max": abs_diff_dequant.max().item(),
-        "err_dequant_mean": abs_diff_dequant.mean().item(),
-        "err_triton_max": abs_diff_triton.max().item(),
-        "err_triton_mean": abs_diff_triton.mean().item(),
-        "err_between_max": abs_diff_between.max().item(),
-        "err_between_mean": abs_diff_between.mean().item(),
+        "err_simu_fp16_max": abs_diff_simu_fp16.max().item(),
+        "err_simu_fp16_mean": abs_diff_simu_fp16.mean().item(),
+        "err_dequant_simu_max": abs_diff_dequant_simu.max().item(),
+        "err_dequant_simu_mean": abs_diff_dequant_simu.mean().item(),
+        "err_dequant_triton_max": abs_diff_dequant_triton.max().item(),
+        "err_dequant_triton_mean": abs_diff_dequant_triton.mean().item(),
     }
 
 
@@ -349,6 +413,7 @@ def test_moe_down(args):
     x = torch.randn(B, K, dtype=torch.float16, device=device)
 
     packed_data = quantize_weight_simple(W_down, bit_width=4, group_size=group_size, seed=args.seed)
+    W_down_simu = simu_quant_weight(W_down, bit_width=4, group_size=group_size, seed=args.seed)
 
     start = K // 4
     end = K // 2
@@ -357,6 +422,7 @@ def test_moe_down(args):
     print("\nWarmup...")
     for _ in range(5):
         _ = x[:, start:end] @ W_down[:, start:end].T
+        _ = x[:, start:end] @ W_down_simu[:, start:end].T
         w_dequant = dequantize_weight_simple(packed_data, W_down.shape)
         _ = x[:, start:end].float() @ w_dequant[:, start:end].T
         _ = triton_fused_matmul_grouped_slice_in_features(
@@ -371,6 +437,13 @@ def test_moe_down(args):
         out_fp16 = x[:, start:end] @ W_down[:, start:end].T
     torch.cuda.synchronize()
     t_fp16 = (time.time() - t0) / 10
+
+    torch.cuda.synchronize()
+    t0 = time.time()
+    for _ in range(10):
+        out_simu = x[:, start:end] @ W_down_simu[:, start:end].T
+    torch.cuda.synchronize()
+    t_simu = (time.time() - t0) / 10
 
     torch.cuda.synchronize()
     t0 = time.time()
@@ -392,35 +465,37 @@ def test_moe_down(args):
     t_triton = (time.time() - t0) / 10
 
     out_fp16_float = out_fp16.float()
+    out_simu_float = out_simu.float()
     out_dequant_float = out_dequant.float()
     out_triton_float = out_triton.float()
 
-    abs_diff_dequant = torch.abs(out_fp16_float - out_dequant_float)
-    abs_diff_triton = torch.abs(out_fp16_float - out_triton_float)
-    abs_diff_between = torch.abs(out_dequant_float - out_triton_float)
+    abs_diff_simu_fp16 = torch.abs(out_fp16_float - out_simu_float)
+    abs_diff_dequant_simu = torch.abs(out_dequant_float - out_simu_float)
+    abs_diff_dequant_triton = torch.abs(out_dequant_float - out_triton_float)
 
     print("\n" + "=" * 70)
     print("场景2.2汇总")
     print("=" * 70)
     print(f"FP16:              {t_fp16 * 1000:8.2f} ms")
+    print(f"SimuQuant:         {t_simu * 1000:8.2f} ms")
     print(f"反量化+GEMM:       {t_dequant * 1000:8.2f} ms")
     print(f"Triton:            {t_triton * 1000:8.2f} ms")
-    print(f"\n误差对比 (vs FP16):")
-    print(f"反量化+GEMM:       max={abs_diff_dequant.max():.6f}, mean={abs_diff_dequant.mean():.6f}")
-    print(f"Triton:            max={abs_diff_triton.max():.6f}, mean={abs_diff_triton.mean():.6f}")
-    print(f"\n反量化+GEMM vs Triton:")
-    print(f"                    max={abs_diff_between.max():.6f}, mean={abs_diff_between.mean():.6f}")
+    print(f"\n误差对比:")
+    print(f"SimuQuant vs FP16:  max={abs_diff_simu_fp16.max():.6f}, mean={abs_diff_simu_fp16.mean():.6f}")
+    print(f"反量化+GEMM vs SimuQuant: max={abs_diff_dequant_simu.max():.6f}, mean={abs_diff_dequant_simu.mean():.6f}")
+    print(f"反量化+GEMM vs Triton: max={abs_diff_dequant_triton.max():.6f}, mean={abs_diff_dequant_triton.mean():.6f}")
 
     return {
         "t_fp16": t_fp16,
+        "t_simu": t_simu,
         "t_dequant": t_dequant,
         "t_triton": t_triton,
-        "err_dequant_max": abs_diff_dequant.max().item(),
-        "err_dequant_mean": abs_diff_dequant.mean().item(),
-        "err_triton_max": abs_diff_triton.max().item(),
-        "err_triton_mean": abs_diff_triton.mean().item(),
-        "err_between_max": abs_diff_between.max().item(),
-        "err_between_mean": abs_diff_between.mean().item(),
+        "err_simu_fp16_max": abs_diff_simu_fp16.max().item(),
+        "err_simu_fp16_mean": abs_diff_simu_fp16.mean().item(),
+        "err_dequant_simu_max": abs_diff_dequant_simu.max().item(),
+        "err_dequant_simu_mean": abs_diff_dequant_simu.mean().item(),
+        "err_dequant_triton_max": abs_diff_dequant_triton.max().item(),
+        "err_dequant_triton_mean": abs_diff_dequant_triton.mean().item(),
     }
 
 
@@ -447,27 +522,33 @@ def main():
 
     print("\n场景1: 单独 Linear")
     print(f"    FP16:             {linear_result['t_fp16'] * 1000:8.2f} ms")
+    print(f"    SimuQuant:        {linear_result['t_simu'] * 1000:8.2f} ms")
     print(f"    反量化+GEMM:      {linear_result['t_dequant'] * 1000:8.2f} ms")
     print(f"    Triton:           {linear_result['t_triton'] * 1000:8.2f} ms")
-    print(f"  误差对比 (vs FP16):")
-    print(f"    Triton:               max={linear_result['err_triton_max']:.6f}, mean={linear_result['err_triton_mean']:.6f}")
-    print(f"    反量化+GEMM vs Triton: max={linear_result['err_between_max']:.6f}, mean={linear_result['err_between_mean']:.6f}")
+    print(f"  误差对比:")
+    print(f"    SimuQuant vs FP16:    max={linear_result['err_simu_fp16_max']:.6f}, mean={linear_result['err_simu_fp16_mean']:.6f}")
+    print(f"    反量化+GEMM vs SimuQuant: max={linear_result['err_dequant_simu_max']:.6f}, mean={linear_result['err_dequant_simu_mean']:.6f}")
+    print(f"    反量化+GEMM vs Triton: max={linear_result['err_dequant_triton_max']:.6f}, mean={linear_result['err_dequant_triton_mean']:.6f}")
 
     print("\n场景2.1: MoE up_gate (slice_rows)")
     print(f"    FP16:             {moe_up_result['t_fp16'] * 1000:8.2f} ms")
+    print(f"    SimuQuant:        {moe_up_result['t_simu'] * 1000:8.2f} ms")
     print(f"    反量化+GEMM:      {moe_up_result['t_dequant'] * 1000:8.2f} ms")
     print(f"    Triton:           {moe_up_result['t_triton'] * 1000:8.2f} ms")
-    print(f"  误差对比 (vs FP16):")
-    print(f"    Triton:               max={moe_up_result['err_triton_max']:.6f}, mean={moe_up_result['err_triton_mean']:.6f}")
-    print(f"    反量化+GEMM vs Triton: max={moe_up_result['err_between_max']:.6f}, mean={moe_up_result['err_between_mean']:.6f}")
+    print(f"  误差对比:")
+    print(f"    SimuQuant vs FP16:    max={moe_up_result['err_simu_fp16_max']:.6f}, mean={moe_up_result['err_simu_fp16_mean']:.6f}")
+    print(f"    反量化+GEMM vs SimuQuant: max={moe_up_result['err_dequant_simu_max']:.6f}, mean={moe_up_result['err_dequant_simu_mean']:.6f}")
+    print(f"    反量化+GEMM vs Triton: max={moe_up_result['err_dequant_triton_max']:.6f}, mean={moe_up_result['err_dequant_triton_mean']:.6f}")
 
     print("\n场景2.2: MoE down (slice_in_features)")
     print(f"    FP16:             {moe_down_result['t_fp16'] * 1000:8.2f} ms")
+    print(f"    SimuQuant:        {moe_down_result['t_simu'] * 1000:8.2f} ms")
     print(f"    反量化+GEMM:      {moe_down_result['t_dequant'] * 1000:8.2f} ms")
     print(f"    Triton:           {moe_down_result['t_triton'] * 1000:8.2f} ms")
-    print(f"  误差对比 (vs FP16):")
-    print(f"    Triton:               max={moe_down_result['err_triton_max']:.6f}, mean={moe_down_result['err_triton_mean']:.6f}")
-    print(f"    反量化+GEMM vs Triton: max={moe_down_result['err_between_max']:.6f}, mean={moe_down_result['err_between_mean']:.6f}")
+    print(f"  误差对比:")
+    print(f"    SimuQuant vs FP16:    max={moe_down_result['err_simu_fp16_max']:.6f}, mean={moe_down_result['err_simu_fp16_mean']:.6f}")
+    print(f"    反量化+GEMM vs SimuQuant: max={moe_down_result['err_dequant_simu_max']:.6f}, mean={moe_down_result['err_dequant_simu_mean']:.6f}")
+    print(f"    反量化+GEMM vs Triton: max={moe_down_result['err_dequant_triton_max']:.6f}, mean={moe_down_result['err_dequant_triton_mean']:.6f}")
 
     print("\n" + "=" * 70)
     print("测试完成！")
