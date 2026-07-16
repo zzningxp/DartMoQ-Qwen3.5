@@ -104,7 +104,7 @@ def _turboquant_fused_matmul_kernel_nbit(
         acc += tl.dot(
             inp_tile.to(tl.float32),
             tl.trans(w_quant.to(tl.float32)),
-            allow_tf32=False,
+            allow_tf32=True,
         )
 
     norm_vals = tl.load(norms_ptr + rn, mask=mask_n, other=1.0)
