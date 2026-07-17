@@ -765,6 +765,22 @@ def quant_layer_mix_precision(layer, layer_idx, quant_attn, n_experts, slice_exp
     print(f"  [DEBUG] quant_layer_mix_precision total time: {time.time() - tick_start:.4f}s")
 
 @torch.no_grad()
+def collect_all_linears_recursive(module, parent_module=None, prefix="", result=None):
+    """递归收集模块中的所有 nn.Linear，返回 (parent_module, name, linear_module) 的列表"""
+    if result is None:
+        result = []
+
+    # 先检查直接子模块
+    for name, child in module.named_children():
+        if isinstance(child, nn.Linear):
+            result.append((module, name, child))
+        else:
+            # 递归处理子模块
+            collect_all_linears_recursive(child, module, name, result)
+
+    return result
+
+
 def quant_layer_mix_precision_wxa16(layer, layer_idx, quant_attn, n_experts, slice_expert_num,
                 attn_hidden_states, ffn_hidden_states, attention_mask, position_ids, position_embeddings,
                 qscheme, use_hybrid_moe, quantmode, seed=42, group_size=128):
@@ -803,13 +819,12 @@ def quant_layer_mix_precision_wxa16(layer, layer_idx, quant_attn, n_experts, sli
     from wxa16_dartmoq_backend import wxa16_quantize_linear
 
     ffn_filters = ['up_proj', 'gate_proj', 'down_proj']
-    attn_filters = ['q_proj', 'k_proj', 'v_proj', 'o_proj', 'kv_a_proj_with_mqa', 'kv_b_proj']
 
     # 收集需要量化的层
     tick_collect = time.time()
     all_modules = []
 
-    # Attention 层 (W8A16)
+    # Attention 层 (W8A16) - 动态收集所有 nn.Linear
     if quant_attn:
         if hasattr(layer, 'self_attn'):
             attn = layer.self_attn
@@ -820,11 +835,10 @@ def quant_layer_mix_precision_wxa16(layer, layer_idx, quant_attn, n_experts, sli
 
         if attn is not None:
             bit_attn = qscheme['attn'][0] if isinstance(qscheme['attn'], (list, tuple)) else qscheme['attn']
-            for name in attn_filters:
-                if hasattr(attn, name):
-                    linear = getattr(attn, name)
-                    if isinstance(linear, nn.Linear):
-                        all_modules.append((attn, name, linear, bit_attn))
+            # 递归收集注意力层中的所有 nn.Linear
+            attn_linears = collect_all_linears_recursive(attn)
+            for parent, name, linear in attn_linears:
+                all_modules.append((parent, name, linear, bit_attn))
 
     # Shared expert (W8A16)
     if hasattr(layer.mlp, 'shared_expert') and layer.mlp.shared_expert is not None:
