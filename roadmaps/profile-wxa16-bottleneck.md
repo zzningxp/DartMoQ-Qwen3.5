@@ -374,6 +374,19 @@ baseline (单 4-bit):
 - 修复前：62 个新编译变体 / 12.71s（平均 ~205ms/个新 col_start）；修复后：2 个变体 / 0.39s，数值 max_diff=0；
 - 运行：`python test/test_colstart_recompile.py`（或 `PYTHONPATH=$PWD conda run -n dart312 python test/test_colstart_recompile.py`）。
 
+### `test/test_eval_shape_bench.py`（本次新增，真实 eval 形状基准）
+
+- micro 测试形状（B=64）与真实形状（eval per-expert B≈9280 / mini_batch B≈1024）差距大，本脚本在真实形状下对比「clone 旧路径」vs「col_start 新路径」的 kernel 本体时间，并单测 clone 本身开销与旋转访问流成本；
+- 关键实测（2-bit，B=9280）：gate_up clone 旧路径 252.7µs（clone 本身仅 5.0µs）vs col_start 新路径 366.4µs（**新路径反而慢 +113.7µs**）；down 486.4µs vs 716.3µs（**+229.8µs**）；B=1024 时差值仅 +9.6µs / +31.8µs；
+- 结论：clone 去除省的 ~5µs/call 被大 stride 寻址惩罚抵消且随 B 增大反超——mini_batch 尺度净收益≈0，eval 尺度净回归。
+
+### `test/test_rotation_thrash_count.py`（本次新增，旋转缓存抖动精确计数）
+
+- monkey-patch `torch.linalg.qr` 计数，模拟一次真实 forward 的旋转访问流（254 expert × 20 组 = 5080 次访问，1032 个不同 (d,seed) key，down 的 seed 含 expert 偏移故每 expert 不同）；
+- 实测：上限 128 时**每个 forward QR 重算 1160 次 ≈ 284~308ms**（forward#2 与 #1 相同 → 抖动每 forward 重复支付）；上限提到 4096 后 cold 一次 1032 次，稳态 forward **0 次 / 0.9ms** → 抖动确实存在且可通过调大上限消除；
+- **踩坑记录（双模块陷阱）**：`turboquant_utils/__init__.py` 的 `sys.modules.setdefault("turboquant_model", ...)` 别名 + vendored 模块用 `from turboquant_model.rotation import ...`，导致 rotation.py 被执行两次、进程内存在两个 rotation 模块对象，包属性 `rotation` 被重绑到副本；`import turboquant_utils.rotation as m` 可能拿到副本，monkey-patch 打空（本测试首版因此误判"抖动不存在"）。测试里必须用 `sys.modules[generate_rotation_matrix.__module__]` 反查函数真实所属模块；
+- 运行：`python test/test_rotation_thrash_count.py`。
+
 ### `turboquant_utils/test_triton_mixed_precision.py`（已更新，用于对齐验证）
 
 - 三个场景（单独 Linear / MoE up_gate slice_rows / MoE down slice_in_features）复用主流程同款 kernel；
@@ -397,6 +410,8 @@ baseline (单 4-bit):
 | clone 占 ~18%，但为正确性约束 | ✅ 确认占比，但实为列切片正确性约束，需配套 kernel 列偏移寻址去除（见 §七） |
 | autotune 是可启用杠杆 | ❌ 不成立。kernel 高度动态（K=128 小矩阵、多次 launch），不启用，差距视为固有算子效率差距 |
 | col_start 做成 constexpr 只多一次整数加法 | ❌ **不成立（真实流程回归事故）**。constexpr 参与 Triton 编译 key，每个不同 col_start 触发一次完整重编译（实测 ~205ms/个）；真实 MoE 里 col_start 随 expert×bit 有上千取值 → 编译风暴（首 mini_batch 240s）。micro 测试 col_start 恒为 1~2 个值所以测不出（详见 §十 记录 3） |
+| clone 去除每次省 ~5µs，收益与形状无关 | ❌ **不成立（真实形状下为净回归）**。去 clone 后 kernel 直接按整张宽度（512B 行距）跳读 32B 切片，宽 stride 惩罚随 B 增长：B=9280 时 gate_up +113.7µs/call、down +229.8µs/call，远超省下的 ~5µs clone。mini_batch（B≈1024）净收益≈0 → 对应"与最早版本无区别"；eval（B≈9280）净回归 → 对应 eval +26%/+17%（详见 §十 记录 4） |
+| 旋转缓存上限 128 足够（"缓存首个 batch 冷一次后全热"） | ❌ **不成立**。down 方向 seed = base + expert 偏移 + group 偏移，每 forward 工作集 1032 个 key > 上限 128 → 每 forward QR 重算 1160 次 ≈ 284ms（forward#2 不衰减）；上限提到 4096 后稳态 0 次 / 0.9ms。该开销在 dfb8fc1 与当前代码两代共有（详见 test/test_rotation_thrash_count.py） |
 
 ### 已落地代码记录（本次迭代）
 
@@ -412,6 +427,8 @@ baseline (单 4-bit):
 **正确性验证**：`turboquant_utils/test_clone_removal.py` 对比 clone 旧路径 vs `col_start` 新路径，bit=1/2/4/8 全 `max_diff=0.000e+00`，确认无静默读错内存；`test_triton_mixed_precision.py` 三个场景「反量化+GEMM vs Triton」误差与改动前一致（max≈0.15~0.25）。
 
 **热路径实测**（warm、不清缓存，模拟真实 eval）：clone 旧 0.314ms → col_start 新 0.174ms，**省 44.5%** 每次 kernel 调用。这是当前真实可测、且不影响数值的改进。
+
+**后续纠正（真实 eval 形状实测，见记录 4）**：上述 44.5% 是 micro 小形状（B 小、张量 L2 驻留）下的结论。真实 eval 形状（B≈9280）下宽 stride 寻址惩罚随 B 增长，新路径反而比 clone 旧路径慢（+113.7µs/+229.8µs 每次调用），clone 去除在 eval 尺度为净回归、mini_batch 尺度约打平。修复方向不是退回 clone，而是加载期把权重按 group 重排成连续布局（见记录 4 方案 A）。
 
 #### 2. 旋转矩阵设备端缓存（变体 1）—— P0，已落地但真实收益≈0 ✅（需纠正预期）
 
@@ -438,10 +455,41 @@ baseline (单 4-bit):
 
 **测试方法补充**：给 Triton kernel 增加 constexpr 参数前，必须确认该参数在真实流程里是否「动态且多取值」——凡是每个 expert/每个 group/每个 bit 都会变的量，一律不得做 constexpr。排查同类问题可复用 `test/test_colstart_recompile.py` 的做法：以 `~/.triton/cache` 目录增量计数编译次数。
 
+#### 4. 与最早版本（dfb8fc1）端到端效率无差异的归因 —— clone 去除在真实形状下是净回归 ⚠️
+
+**现象**：编译风暴修复后代码能跑通，但 mini_batch 与最早（dfb8fc1 时代，logs/0707.6）基本无差（稳态 1.1672/1.0683/1.0193s vs 1.0470/1.0513/1.0195s），PPL eval 反而回归：pass1 10.54→13.24s（+26%）、pass2 18.13→21.27s（+17%）。dense 层（L1/L2/L4）两代耗时完全一致，排除机器状态差异。
+
+**代码差异范围**：dfb8fc1..当前，与 MoE 热路径相关的改动只有两处——clone 去除（col_start 寻址）与旋转设备端缓存（§十 记录 1/2）。设备端缓存只会更快不会更慢；嫌疑集中在 clone 去除。
+
+**根因（test/test_eval_shape_bench.py 实测）**：去 clone 后 kernel 在整张宽（行距 512B）上跳读 32B 有用切片，宽 stride 惩罚随 B 增长，而 clone 本身只有 ~5µs：
+
+| 形状 | clone 旧路径 | col_start 新路径 | 净差（新−旧） |
+|------|-------------|-----------------|--------------|
+| gate_up B=1024 | ~持平 | ~持平 | +9.6µs/call |
+| gate_up B=9280 | 252.7µs | 366.4µs | **+113.7µs/call** |
+| down B=9280 | 486.4µs | 716.3µs | **+229.8µs/call** |
+
+**定量对上观测**：layer 0 一次 forward ≈ 4064 次 gate_up + 1016 次 down 调用。
+- mini_batch（B≈1024）：净增 ≈ 4064×9.6µs + 1016×31.8µs ≈ **+70ms/forward**，占 ~1s 的 7% → 观感"无区别"（首个稳态 mini_batch 实测 +120ms，含一次性冷启动，量级吻合）；
+- eval（B≈9280，仅 layer 0 量化、其余 39 层 dense）：bench 尺度外推 ≈ +0.7s，实测 +2.7s/+3.15s。缺口来自 bench 张量小（0.5MB，L2 驻留）而真实 gate_up packed 张量 ≈134MB 超出 L2，宽 stride 读叠加 DRAM/TLB 放大（约 3~4 倍），方向一致。
+- 历史上 c2631d8（7 月 19 日 "rollback-and-remove-clone"）就是同款去 clone 尝试的回滚——同一坑第二次踩到，这次有了定量解释。
+
+**附带发现（两代共有的可修开销）**：旋转缓存上限 128 < 工作集 1032 key（down 的 seed 含 expert 偏移），每 forward QR 重算 1160 次 ≈ 284ms，mini_batch 里占 ~25%；上限提到 ≥2048 后稳态 0 次（test/test_rotation_thrash_count.py）。这是独立于回归的现成收益。
+
+**候选修复方向（未实施，待决策）**：
+- **方案 A（推荐，不降级）**：加载期把 packed 权重按 group 重排为 group-first 连续布局（如 `(num_groups, N, group_packed_bytes)`，一次 permute+contiguous，134MB 一次性 <0.1s），推理时每组切片天然连续 → kernel 无 clone、无宽 stride、col_start 恒 0。同时优于旧 clone 路径（省掉每 call 的 clone）与现路径。改动点：packed 数据生成/装载处（`wxa16_bit_partitioned_moe.py` 的 `set_packed_data` 一线）+ wrapper 的切片方式。
+- **方案 B（一行修复，独立收益）**：`rotation.py` 的 `_MAX_CACHE_SIZE` 128 → ≥2048，消掉每 forward ~284ms QR 重算（CPU 66MB + GPU 66MB 常驻，可接受；`clear_rotation_cache()` 仍可释放）。
+- **方案 C（不推荐）**：退回 clone 旧路径——只回到 dfb8fc1 水平、无增益，且按规范须本人同意，不作为选项实施。
+- 结构性方向不变：P1 多 group 合并 launch / FP16 accumulator（§七）仍是关 10 倍差距的主线。
+
+**教训（第三次 micro≠真实）**：凡"省掉一次小操作"类优化，必须在真实 B、真实张量尺寸（尤其是否超 L2）下复测 kernel 本体；寻址 stride 的代价随 B 与张量尺寸非线性放大，micro 形状完全不可见。
+
 #### 遗留待办 / 未解决
 
 - **真实 10 倍差距未消除**：WxA16 量化层比 dense 慢 10 倍，主因是 64 expert × 多 bit × 多个小 Triton kernel（TF32 Tensor Core，比 FP16 慢 1.5~2.8x）+ 逐 expert Python 循环 + 多次 launch（md 实验 2/5 定性 Triton 4-bit 比 fp16 慢 4.29x）。clone 去除真实一步，但关不掉这 10 倍。
-- **COL_START 编译风暴回归已修复**（见已落地记录 3）：240s 首 mini_batch 为 constexpr 重编译所致，与 clone 去除本身无关；修复后预期回到 baseline 水平且保留 clone 去除收益（每次 kernel 调用 -44.5%）。真实回归幅度以本人手动 run.q.sh 复测为准。
+- **COL_START 编译风暴回归已修复**（见已落地记录 3）：240s 首 mini_batch 为 constexpr 重编译所致，与 clone 去除本身无关；修复后预期回到 baseline 水平且保留 clone 去除收益（每次 kernel 调用 -44.5%）。真实回归幅度以本人手动 run.q.sh 复测为准。**〔纠正〕**复测结果：编译风暴消除，但未快于 dfb8fc1，eval 反而 +26%/+17%——clone 去除本身在真实形状下是净回归（详见记录 4），"-44.5%"仅 micro 形状成立。
+- **去 clone 净回归待修**（记录 4 方案 A）：加载期 group-first 连续布局重排，待决策后实施；实施后需跑 `test/test_eval_shape_bench.py`（新路径应 ≤ clone 旧路径）+ 数值一致性 + 本人手动 run.q.sh 复测。
+- **旋转缓存上限待调**（记录 4 方案 B）：`_MAX_CACHE_SIZE` 128 → ≥2048，消每 forward ~284ms QR 重算（两代共有开销），一行改动，独立于方案 A。
 - **P1 待做**：多 group 合并一次 launch、FP16 accumulator（见 §七）。
 - **待办**：旋转结果跨 bit 复用（需统一 seed+改量化+验精度）、接线 `triton_fused_dual_matmul`、去 `.item()` D2H 同步。
 - **测试方法**：micro 测试须区分 cold/warm 路径，warm 才是真实场景；全模型 eval 由本人手动跑（`run.q.sh` / `eval_qwen35.py`），不自动执行。
