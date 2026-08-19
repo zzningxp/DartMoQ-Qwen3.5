@@ -191,7 +191,7 @@ bit-partition 在单 bit 场景下反而更快，因为 N 变小后单次 kernel
 
 **两个最大瓶颈：**
 1. **旋转占 40%** — 每个 group 做 `x_g @ Pi.T`，(B,128) @ (128,128) 小矩阵乘利用率极低；此外这 40% 还包含一个未剥离的隐藏开销：旋转矩阵 `Pi` 由 `generate_rotation_matrix` 生成后缓存于 CPU（`Q.cpu()`），每次 forward 访问都要 `.to(device)` 重新拷回 GPU（128×128×4B），每个 group×bit×expert 一次。
-2. **clone 占 18%** — `indices_packed[:, packed_start:packed_end].clone()` 每个 group 一次。注意这并非"可随意删的纯开销"：内核 `triton_fused_matmul` 按 `rn*PACKED_K + byte_col` 寻址，要求输入为行 stride=PACKED_K 的连续张量，而列切片真实行 stride 为原始总宽（≠ 切片宽），直接删 clone 会静默读错内存。正确做法是给内核加列偏移（`col_start` / `full_packed_k`）参数按偏移寻址后再去 clone。
+2. **clone 占 18%** — `indices_packed[:, packed_start:packed_end].clone()` 每个 group 一次。注意这并非"可随意删的纯开销"：内核 `triton_fused_matmul` 按 `rn*PACKED_K + byte_col` 寻址，要求输入为行 stride=PACKED_K 的连续张量，而列切片真实行 stride 为原始总宽（≠ 切片宽），直接删 clone 会静默读错内存。**已落地**：给内核加 `COL_START` 偏移（`byte_off = rn*PACKED_K + (COL_START + byte_col)`），传整张 `indices_packed` + `col_start=packed_start`，去掉 clone。热路径实测省 44.5%（见 §十 代码开发记录）。
 
 纯 kernel 计算只占不到 30%，剩下 70% 都是 Python 端的辅助开销！
 
@@ -223,7 +223,20 @@ Triton kernel 内部 accumulator 是 float32（走 TF32 Tensor Core），大形�
 - **QR 重算占 90.5%**——每个 (bit,group) 首次出现时算一次（seed 不含 expert 维度，同一 bit 内 8 个 Pi 跨 16 expert 复用），每 forward 仍重算 3×8=24 次；
 - seed 确定 → 可在**模型加载时预计算一次钉在 GPU**，永久消除 QR 重算与逐次重拷。
 
-**决策门结论**：下一步优先「旋转矩阵设备端缓存 / 加载时预计算」（同时干掉重拷与 QR 重算），**而非**「旋转融合进 kernel」——后者针对的纯矩阵乘仅占 ~5%，收益极小。
+**决策门原结论（已被 §补充复盘修正预期）**：当时基于实验 6 数据优先「旋转矩阵设备端缓存 / 加载时预计算」（同时干掉重拷与 QR 重算），**而非**「旋转融合进 kernel」（纯矩阵乘仅占 ~5%，收益极小）。落地后实测证明前者真实收益≈0（cold 假象），见下方补充复盘。
+
+### 实验 6 补充：决策门落地后的实测复盘（重要纠正）
+
+旋转矩阵设备端缓存（变体 1）**已实现**（`rotation.py` 新增 `_ROTATION_CACHE_DEV`，`triton_kernels.py` 调用时传 `device=x.device` 命中）。但接进真实 eval 后**端到端无任何提速**，复盘如下：
+
+- 真实 run 里**没有任何 `clear_rotation_cache()` 调用**，旋转矩阵按 `(d, seed+g_start)` 缓存，首个 batch 冷一次、之后全热；
+- 那个 CPU→GPU 重拷每 group 才 64KB（(d,g_dim) = (128,128)×4B），本就是微秒级；
+- 实验 6 的 "warm 路径重拷占 ~50% / cold QR 占 90%" 是**基于人为打冷（每 forward `clear_rotation_cache()`）的 micro 假象**——真实 eval 缓存不冷，重拷只在首次出现，对 19.71s 的 WxA16 层贡献 ≈ 0；
+- 佐证：`eval_qwen35.py` 跑 Layer 0（WxA16 量化层）forward 19.62s 对比 Layer 1（dense）1.92s，慢 10 倍，旋转缓存改前后完全一致——说明这 10 倍差距**与旋转无关**。
+
+**结论**：旋转缓存改得对（正确性没问题、显存增量≈4MB 可忽略），但不该被当成"主优化方向"。它消除的是**冷启动**开销，而真实推理是热路径。真正吞掉 19.71s 的是**结构性**开销（见 §六/§十）。
+
+**关于 micro 测试方法的纠正**：`test_triton_mixed_precision.py` 当时为"展示改进"每轮都 `clear_rotation_cache()` 强制打冷，得到 "90% 节省" 是误导。后续测试必须区分 cold/warm 路径，warm 路径才是真实场景。
 
 ---
 
@@ -231,11 +244,11 @@ Triton kernel 内部 accumulator 是 float32（走 TF32 Tensor Core），大形�
 
 | 开销来源 | 贡献 | 说明 |
 |----------|------|------|
-| **Python 端旋转** | ~40% grouped 时间 | 小形状 matmul 利用率低 |
-| **clone 开销** | ~18% grouped 时间 | 列切片正确性约束，需 kernel 列偏移寻址去除（非随意删） |
+| **Python 端旋转** | warm 路径 ~40% grouped 时间 | 小形状 matmul 利用率低；**仅首个 batch（cold）显著，warm 后该开销已在基线内**，详见实验 6 补充复盘 |
+| **clone 开销** | ~18% grouped 时间 | 列切片正确性约束；**已落地去除**（内核 `COL_START` 偏移，真实省 44.5%） |
 | **TF32 vs FP16** | 1.5~2.8x | 大形状更明显 |
 | **Triton vs cuBLAS 算子效率** | 1.5~2x | 动态小 kernel 不启用 autotune，视为固有算子效率差距 |
-| **旋转矩阵 CPU→GPU 重复拷贝** | 含于旋转 ~40% | 旋转矩阵缓存于 CPU，每次 forward 重拷回 GPU，未剥离的隐藏开销 |
+| **旋转矩阵 CPU→GPU 重复拷贝** | cold 路径显著，warm ≈ 0 | 旋转矩阵缓存于 CPU，每次 forward 重拷回 GPU；设备端缓存已落地，但真实 eval 缓存本就热，**对端到端无贡献**（详见实验 6 补充复盘） |
 | **小形状 + grouped 拆分** | 显著 | K=128 小矩阵乘 + 多次 launch |
 | Launch overhead | 小 | ~15μs/次，仅极小形状显著 |
 | 位运算反量化 | **几乎 0** | 2-bit 反而更快（带宽节省） |
@@ -246,17 +259,17 @@ Triton kernel 内部 accumulator 是 float32（走 TF32 Tensor Core），大形�
 
 ## 七、优化方向（按优先级）
 
-| 优先级 | 优化点 | 预期收益 | 难度 |
-|--------|--------|---------|------|
-| **P0** | 旋转矩阵设备端缓存 / 加载时预计算（消除 CPU→GPU 重拷 + QR 重算） | 旋转开销大部分（见实验 6：重拷 ~50% + QR 90% of cold） | 低 |
-| **P0** | kernel 列偏移寻址去 clone（保持正确性，内核加 `col_start`/`full_packed_k`） | -18% grouped 时间 | 低 |
-| **P1** | 多 group 合并到一次 kernel launch（减少 launch + 更好 SM 利用率） | 20-30% | 中 |
-| **P1** | FP16 accumulator（如果精度允许） | 理论 1.5-2x | 中 |
-| **P2** | 旋转融合进 Triton kernel（实验 6 显示纯矩阵乘仅占 ~5%，收益有限，降级） | 视情况 | 中 |
-| ⛔ 否决 | Triton autotune 调参（BLOCK 大小、num_warps、num_stages） | — | — | 动态小 kernel，搜索编译开销 > 收益，不启用 |
-| 📋 待办 | 旋转结果复用（跨 bit / 跨 gate_up&down，需先统一跨 bit seed + 改量化 + 验精度） | 视情况 | 中 |
-| 📋 待办 | 接线 `triton_fused_dual_matmul`（已实现未调用，合并两次 matmul，依赖统一 seed） | 视情况 | 中 |
-| **P3** | 去掉 `.item()` D2H 同步 | 小 | 低 |
+| 优先级 | 优化点 | 预期收益 | 难度 | 状态 |
+|--------|--------|---------|------|------|
+| **P0** | kernel 列偏移寻址去 clone（保持正确性，内核加 `col_start`） | 热路径省 44.5%（grouped kernel 端开销） | 低 | ✅ **已落地**（实测 0.314→0.174ms/次，全 bit 宽度 allclose 通过） |
+| **P0** | 旋转矩阵设备端缓存 / 加载时预计算 | 消除 cold 路径重拷+QR 重算 | 低 | ✅ **已落地，但真实收益≈0**（见实验 6 补充复盘：warm 路径本就热，对端到端无贡献；micro 的 90% 是打冷假象） |
+| **P1** | 多 group 合并到一次 kernel launch（减少 launch + 更好 SM 利用率） | 20-30% | 中 | ⏳ 待做（真正能啃 10 倍差距的大头之一） |
+| **P1** | FP16 accumulator（如果精度允许） | 理论 1.5-2x | 中 | ⏳ 待做（真正能啃 10 倍差距的大头之一，需验精度） |
+| **P2** | 旋转融合进 Triton kernel | 视情况 | 中 | ⛔ 降级（纯矩阵乘仅占 ~5%，收益有限） |
+| ⛔ 否决 | Triton autotune 调参 | — | — | 动态小 kernel，搜索编译开销 > 收益，不启用 |
+| 📋 待办 | 旋转结果复用（跨 bit / 跨 gate_up&down，需先统一跨 bit seed + 改量化 + 验精度） | 视情况 | 中 | ⏳ 待做 |
+| 📋 待办 | 接线 `triton_fused_dual_matmul`（已实现未调用，合并两次 matmul，依赖统一 seed） | 视情况 | 中 | ⏳ 待做 |
+| **P3** | 去掉 `.item()` D2H 同步 | 小 | 低 | ⏳ 待做 |
 
 ---
 
@@ -349,6 +362,24 @@ baseline (单 4-bit):
 - Gate-Up 细粒度：旋转 / clone / kernel 各阶段占比
 - 混合比特特有开销的分析（旋转重复、per-bit 循环、小形状效率）
 
+### `turboquant_utils/test_clone_removal.py`（本次新增，验证 clone 去除正确性）
+
+- 对比「clone 旧路径」与「`col_start` 新路径」在同一列切片上的输出逐元素一致性；
+- 覆盖 bit=1/2/4/8 全宽度，`max_diff=0.000e+00`，确认内核列偏移寻址无静默读错内存；
+- 运行：`PYTHONPATH=$PWD conda run -n dart312 python turboquant_utils/test_clone_removal.py`。
+
+### `test/test_colstart_recompile.py`（本次新增，复现/验证 col_start 编译风暴）
+
+- 64 个不同 col_start 各调一次 `triton_fused_matmul`，测耗时 + 统计 `~/.triton/cache` 新增目录数（= 新编译 kernel 变体数）；阶段 2 重复同批值验证缓存命中，阶段 3 固定单值模拟 micro 测试模式，另附 clone vs col_start 数值抽查；
+- 修复前：62 个新编译变体 / 12.71s（平均 ~205ms/个新 col_start）；修复后：2 个变体 / 0.39s，数值 max_diff=0；
+- 运行：`python test/test_colstart_recompile.py`（或 `PYTHONPATH=$PWD conda run -n dart312 python test/test_colstart_recompile.py`）。
+
+### `turboquant_utils/test_triton_mixed_precision.py`（已更新，用于对齐验证）
+
+- 三个场景（单独 Linear / MoE up_gate slice_rows / MoE down slice_in_features）复用主流程同款 kernel；
+- 场景汇总里直接织入 `Triton(改后 hot)` vs `Triton(改前 cold)` 对照 + 数值一致性；
+- **注意**：该测试的 cold 路径是每轮 `clear_rotation_cache()` 人为打冷所得，仅用于展示 cold/warm 差异，不代表真实 eval 收益（详见实验 6 补充复盘）。
+
 ---
 
 ## 十、关键决策点（基于实测数据更新）
@@ -362,40 +393,59 @@ baseline (单 4-bit):
 | 量化 kernel 本身慢 4 倍 | ✅ **确认**。无 partition 的 4-bit 比 fp16 慢 4.29x |
 | bit-partition 架构慢很多 | ❌ 不成立。单 bit 下反而更快（-23%，N 变小） |
 | 多 bit 混合有额外开销 | ✅ 确认。约 +15%（per-bit 循环 + 每 bit 独立旋转） |
-| 旋转是主要开销 | ✅ **重磅确认**。占 grouped 流程 ~40%（warm 路径）；实验 6 进一步拆出：warm 中重拷≈一半，且每个 (bit,group) 首次有 QR 重算（cold 占 90%） |
+| 旋转是主要开销（仅 cold 路径） | ✅ 确认 warm 路径占 ~40%，但**仅首个 batch（cold）显著**；真实 eval 缓存热后该开销已在基线内（详见实验 6 补充复盘），不再是主优化方向 |
 | clone 占 ~18%，但为正确性约束 | ✅ 确认占比，但实为列切片正确性约束，需配套 kernel 列偏移寻址去除（见 §七） |
 | autotune 是可启用杠杆 | ❌ 不成立。kernel 高度动态（K=128 小矩阵、多次 launch），不启用，差距视为固有算子效率差距 |
+| col_start 做成 constexpr 只多一次整数加法 | ❌ **不成立（真实流程回归事故）**。constexpr 参与 Triton 编译 key，每个不同 col_start 触发一次完整重编译（实测 ~205ms/个）；真实 MoE 里 col_start 随 expert×bit 有上千取值 → 编译风暴（首 mini_batch 240s）。micro 测试 col_start 恒为 1~2 个值所以测不出（详见 §十 记录 3） |
 
-### 优化方向决策
+### 已落地代码记录（本次迭代）
 
-按性价比排序（收益 × 可行性）：
+#### 1. clone 去除（内核列偏移寻址）—— P0，真实可见改进 ✅
 
-| 优先级 | 优化点 | 预期收益 | 难度 | 备注 |
-|--------|--------|---------|------|------|
-| **P0** | 旋转矩阵设备端缓存 / 加载时预计算 | 旋转开销大部分（重拷 ~50% + QR 90% of cold） | 低 | 纯结构性，不碰 kernel 数学；seed 确定可加载时算一次钉 GPU |
-| **P0** | kernel 列偏移寻址去 clone（保持正确性） | grouped 时间 -18% | 低 | 改动最小；clone 非随意删，需配套内核列偏移寻址 |
-| **P1** | 多 group 合并为一次 kernel launch | 20-30% | 中 | 减少 launch + 提升 SM 利用率 |
-| **P1** | FP16 accumulator | 理论 1.5-2x | 中 | 需验证精度损失 |
-| **P2** | 旋转融合进 Triton kernel | 视情况（纯矩阵乘仅占 ~5%，收益有限） | 中 | 实验 6 显示收益远低于预期，降级 |
-| ⛔ 否决 | Triton autotune 深度调参 | — | — | 动态小 kernel，搜索开销 > 收益，不启用 |
-| 📋 待办 | 旋转结果复用（跨 bit / 跨 gate_up&down） | 视情况 | 中 | 需统一 seed+改量化+验精度 |
-| 📋 待办 | 接线 `triton_fused_dual_matmul` 合并 launch | 视情况 | 中 | 已实现未调用，依赖统一 seed |
-| **P3** | 去掉 `.item()` D2H 同步 | 小 | 低 | 仅在 per-expert 循环极多时显著 |
+**背景**：md 实验 4 已确认 clone 占 grouped 时间 ~18%，且是列切片正确性约束（直接删会静默读错显存）。
 
-### 下一步代码开发（已决策：旋转矩阵设备端缓存，变体 1）
+**实现（改 `turboquant_utils/triton_kernels.py`）**：
+- 内核 `_turboquant_fused_matmul_kernel_nbit` 新增 `COL_START` constexpr，寻址改为 `byte_off = rn*PACKED_K + (COL_START + byte_col)`；
+- `triton_fused_matmul` 新增 `col_start` 参数（默认 0，向后兼容 `module.py` 等其他调用方）；
+- 三个 wrapper（grouped / slice_rows / slice_in_features）去掉 `indices_packed[:, packed_start:packed_end].clone()`，改传整张张量 + `col_start=packed_start`。
 
-**目标**：消除实验 6 拆出的两笔隐藏浪费——warm 路径里 ~50% 的旋转 CPU→GPU 重拷（0.097ms/次），以及每进程首次出现的 QR 重算。
+**正确性验证**：`turboquant_utils/test_clone_removal.py` 对比 clone 旧路径 vs `col_start` 新路径，bit=1/2/4/8 全 `max_diff=0.000e+00`，确认无静默读错内存；`test_triton_mixed_precision.py` 三个场景「反量化+GEMM vs Triton」误差与改动前一致（max≈0.15~0.25）。
 
-**正确性前提（已核对）**：量化侧 `quantize.py` 调 `generate_rotation_matrix` **不传 device**，在 CPU 算 QR；推理侧 `triton_kernels.py` 传 `device=x.device`，命中缓存后只 `.to(device)` 拷贝。因此矩阵值始终由 **CPU QR** 派生，设备端缓存必须**基于 CPU 基矩阵派生副本**，绝不可在 GPU 上重算 QR（否则与量化侧矩阵值不一致 → 反量化静默出错）。
+**热路径实测**（warm、不清缓存，模拟真实 eval）：clone 旧 0.314ms → col_start 新 0.174ms，**省 44.5%** 每次 kernel 调用。这是当前真实可测、且不影响数值的改进。
 
-**实现要点（改 `turboquant_utils/rotation.py`）**：
-- 保留现有 CPU 基缓存 `_ROTATION_CACHE`（key=(d,seed)），保证值一致、QR 仅在 miss 时算一次；
-- 新增 device-keyed 缓存 `_ROTATION_CACHE_DEV`（key=(d,seed,device)），首次按 device 派生一次 `.to(device)` 后常驻，后续直接返回，**消除每前向重拷**；
-- `clear_rotation_cache()` 同时清空两个缓存；设备端缓存加容量上限与 LRU 淘汰，避免多模型串行加载时的 GPU 显存累积（CLAUDE.md 内存泄露约束）。
+#### 2. 旋转矩阵设备端缓存（变体 1）—— P0，已落地但真实收益≈0 ✅（需纠正预期）
 
-**预期收益**：warm 路径旋转开销减半（去掉重拷）；本模型显存增量 ≈ 64×(128×128×4B) ≈ 4MB，可忽略。
+**实现（改 `turboquant_utils/rotation.py`）**：保留 CPU 基缓存 `_ROTATION_CACHE`，新增 device-keyed `_ROTATION_CACHE_DEV`（key=(d,seed,device)），首次派生 `.to(device)` 后常驻。显存增量≈4MB 可忽略。
 
-**验证方式**：micro-benchmark 确认 (a) `generate_rotation_matrix(d,seed,device=cuda)` 返回矩阵与 CPU 基矩阵逐元素一致；(b) 第二次及以后调用不再产生 `.to(device)` 拷贝（时间下降）。
+**实测复盘（关键纠正）**：接进真实 eval（`eval_qwen35.py` 跑 Layer 0 WxA16 19.62s vs Layer 1 dense 1.92s）**端到端无任何提速**。根因：真实 run 不调 `clear_rotation_cache()`，缓存首个 batch 冷一次后全热；CPU→GPU 重拷每 group 仅 64KB，本就微秒级。**此前 micro 测试显示的 90% 节省是每轮 `clear_rotation_cache()` 人为打冷的假象**，不代表真实收益（详见 §五 实验 6 补充复盘）。
+
+**结论**：该改正确、零风险，但不应作为主优化方向；真实 10 倍差距来自结构性开销，须靠 P1（多 group 合并 launch / FP16 accumulator）啃。
+
+#### 3. COL_START 编译风暴修复（constexpr → 运行时参数）—— 真实流程回归的定位与修复 ✅
+
+**现象**：clone 去除落地后，真实 run.q.sh 流程 WxA16 MoE forward 从 ~1.2s/mini_batch 恶化为首个 mini_batch **240s**、后续 33/12/16s，PPL eval Layer0 forward 68s（此前 ~19.7s）；而 micro 测试（test_clone_removal / test_triton_mixed_precision）全部正常。
+
+**根因**：内核 `COL_START` 当时声明为 `tl.constexpr`。Triton 把 constexpr 取值写进编译缓存 key，**每个不同的 col_start 值触发一次完整重编译**（实测 ~205ms/个）。真实 MoE 里 col_start = expert 在 packed 维偏移 + group 偏移，随 expert×bit 变化有上千个取值，叠加 B/N/K 运行时参数的整除特化类，后续 mini_batch 与 eval 仍持续出现新组合 → 编译贯穿全程。证据：run 期间 `~/.triton/cache` 新增 ~2000 个编译变体，全部是 `_turboquant_fused_matmul_kernel_nbit`；编译时间线（13:15–13:24）与各慢速阶段完全重叠。
+
+**为何 micro 测试测不出**：micro 场景 col_start 只有 1~2 个取值，编译缓存恒热。这是又一次「micro 测试未反映真实流程」教训（同旋转 cold 路径假象）。
+
+**修复**：`turboquant_utils/triton_kernels.py` 中 `COL_START` 由 `tl.constexpr` 改为运行时参数（仅这一处，调用点本来就是按位置传参）。寻址逻辑与数值不变；col_start 不再参与编译 key，仅剩整数整除特化（≤2 类）。**clone 去除优化保留，未降级**。
+
+**验证**：
+- `test/test_colstart_recompile.py`（新增）：64 个不同 col_start，修复前新增 62 个编译变体 / 12.71s → 修复后 2 个变体 / 0.39s，数值 max_diff=0；
+- `turboquant_utils/test_clone_removal.py`：bit=1/2/4/8 全宽度 clone vs col_start max_diff=0.000e+00；
+- `turboquant_utils/test_triton_mixed_precision.py`：三场景数值误差与改前一致（max≈0.15~0.25）。
+
+**测试方法补充**：给 Triton kernel 增加 constexpr 参数前，必须确认该参数在真实流程里是否「动态且多取值」——凡是每个 expert/每个 group/每个 bit 都会变的量，一律不得做 constexpr。排查同类问题可复用 `test/test_colstart_recompile.py` 的做法：以 `~/.triton/cache` 目录增量计数编译次数。
+
+#### 遗留待办 / 未解决
+
+- **真实 10 倍差距未消除**：WxA16 量化层比 dense 慢 10 倍，主因是 64 expert × 多 bit × 多个小 Triton kernel（TF32 Tensor Core，比 FP16 慢 1.5~2.8x）+ 逐 expert Python 循环 + 多次 launch（md 实验 2/5 定性 Triton 4-bit 比 fp16 慢 4.29x）。clone 去除真实一步，但关不掉这 10 倍。
+- **COL_START 编译风暴回归已修复**（见已落地记录 3）：240s 首 mini_batch 为 constexpr 重编译所致，与 clone 去除本身无关；修复后预期回到 baseline 水平且保留 clone 去除收益（每次 kernel 调用 -44.5%）。真实回归幅度以本人手动 run.q.sh 复测为准。
+- **P1 待做**：多 group 合并一次 launch、FP16 accumulator（见 §七）。
+- **待办**：旋转结果跨 bit 复用（需统一 seed+改量化+验精度）、接线 `triton_fused_dual_matmul`、去 `.item()` D2H 同步。
+- **测试方法**：micro 测试须区分 cold/warm 路径，warm 才是真实场景；全模型 eval 由本人手动跑（`run.q.sh` / `eval_qwen35.py`），不自动执行。
+
 
 
 ---

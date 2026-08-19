@@ -52,7 +52,11 @@ def _turboquant_fused_matmul_kernel_nbit(
     # Dims
     B, N, K,
     PACKED_K,         # packed dimension (stride) for indices (FULL tensor width)
-    COL_START: tl.constexpr,  # byte-column offset of this slice within the full tensor
+    # 注意：COL_START 必须是运行时参数，不能声明为 tl.constexpr。
+    # constexpr 会参与编译缓存 key：真实 MoE 里 col_start 随 expert×bit 变化有
+    # 成百上千个取值，每个取值触发一次完整重编译（实测 ~205ms/个），
+    # 导致首个 mini_batch 240s 的编译风暴（见 test/test_colstart_recompile.py）。
+    COL_START,        # byte-column offset of this slice within the full tensor
     N_LEVELS: tl.constexpr,
     BIT_WIDTH: tl.constexpr,
     BLOCK_B: tl.constexpr = 16,
