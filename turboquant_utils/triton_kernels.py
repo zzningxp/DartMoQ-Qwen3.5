@@ -51,7 +51,8 @@ def _turboquant_fused_matmul_kernel_nbit(
     output_ptr,       # (B, N)
     # Dims
     B, N, K,
-    PACKED_K,         # packed dimension for indices
+    PACKED_K,         # packed dimension (stride) for indices (FULL tensor width)
+    COL_START: tl.constexpr,  # byte-column offset of this slice within the full tensor
     N_LEVELS: tl.constexpr,
     BIT_WIDTH: tl.constexpr,
     BLOCK_B: tl.constexpr = 16,
@@ -88,7 +89,7 @@ def _turboquant_fused_matmul_kernel_nbit(
 
         if BIT_WIDTH == 8:
             # 8-bit fast path: no unpacking needed
-            byte_off = rn[:, None] * PACKED_K + rk[None, :]
+            byte_off = rn[:, None] * PACKED_K + (COL_START + rk[None, :])
             w_mask = mask_n[:, None] & mask_k[None, :]
             idx = tl.load(indices_ptr + byte_off, mask=w_mask, other=0).to(tl.int32)
             w_quant = tl.load(codebook_ptr + idx, mask=w_mask, other=0.0)
@@ -98,7 +99,7 @@ def _turboquant_fused_matmul_kernel_nbit(
             byte_col = rk // ELEMENTS_PER_BYTE
             pos_in_byte = rk % ELEMENTS_PER_BYTE
 
-            byte_off = rn[:, None] * PACKED_K + byte_col[None, :]
+            byte_off = rn[:, None] * PACKED_K + (COL_START + byte_col[None, :])
             w_mask = mask_n[:, None] & mask_k[None, :]
             packed = tl.load(indices_ptr + byte_off, mask=w_mask, other=0).to(tl.uint8)
 
@@ -131,6 +132,7 @@ def triton_fused_matmul(
     K: int,
     bit_width: int = 4,
     scale: float | None = None,
+    col_start: int = 0,
 ) -> torch.Tensor:
     if bit_width not in {1, 2, 4, 8}:
         raise ValueError(f"bit_width must be 1/2/4/8, got {bit_width}")
@@ -152,7 +154,7 @@ def triton_fused_matmul(
 
     _turboquant_fused_matmul_kernel_nbit[grid](
         x_rot, indices_packed, codebook, norms_scaled, output,
-        B, N, K, PACKED_K,
+        B, N, K, PACKED_K, col_start,
         N_LEVELS=codebook.shape[0],
         BIT_WIDTH=bit_width,
     )
@@ -348,11 +350,11 @@ def triton_fused_matmul_grouped(
         packed_end = g_end // ELEMENTS_PER_BYTE
         if g_end % ELEMENTS_PER_BYTE != 0:
             packed_end += 1
-        indices_packed_g = indices_packed[:, packed_start:packed_end].clone()
 
         norms_g = norms[:, group_idx]
 
-        out_g = triton_fused_matmul(x_rot_g, indices_packed_g, codebook, norms_g, g_dim, bit_width)
+        # 去除列切片 clone：直接传整张 indices_packed，由内核按 col_start 偏移寻址
+        out_g = triton_fused_matmul(x_rot_g, indices_packed, codebook, norms_g, g_dim, bit_width, col_start=packed_start)
 
         output += out_g
 
@@ -407,11 +409,11 @@ def triton_fused_matmul_grouped_slice_rows(
         packed_end = g_end // ELEMENTS_PER_BYTE
         if g_end % ELEMENTS_PER_BYTE != 0:
             packed_end += 1
-        indices_packed_g = indices_packed_slice[:, packed_start:packed_end].clone()
 
         norms_g = norms_slice[:, group_idx]
 
-        out_g = triton_fused_matmul(x_rot_g, indices_packed_g, codebook, norms_g, g_dim, bit_width)
+        # 去除列切片 clone：传行切片后的整张 indices_packed_slice，由内核按 col_start 偏移寻址
+        out_g = triton_fused_matmul(x_rot_g, indices_packed_slice, codebook, norms_g, g_dim, bit_width, col_start=packed_start)
 
         output += out_g
 
@@ -472,12 +474,12 @@ def triton_fused_matmul_grouped_slice_in_features(
         packed_end = g_end_original // ELEMENTS_PER_BYTE
         if g_end_original % ELEMENTS_PER_BYTE != 0:
             packed_end += 1
-        indices_packed_g = indices_packed[:, packed_start:packed_end].clone()
 
         group_idx_original = g_start_original // group_size
         norms_g = norms[:, group_idx_original]
 
-        out_g = triton_fused_matmul(x_rot_g, indices_packed_g, codebook, norms_g, g_dim, bit_width)
+        # 去除列切片 clone：传整张 indices_packed，由内核按 col_start 偏移寻址
+        out_g = triton_fused_matmul(x_rot_g, indices_packed, codebook, norms_g, g_dim, bit_width, col_start=packed_start)
 
         output += out_g
 

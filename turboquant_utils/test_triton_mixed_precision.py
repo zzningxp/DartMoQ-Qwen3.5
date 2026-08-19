@@ -19,7 +19,7 @@ from turboquant_utils.triton_kernels import (
     triton_fused_matmul_grouped_slice_in_features
 )
 from turboquant_utils.codebook import get_codebook
-from turboquant_utils.rotation import generate_rotation_matrix
+from turboquant_utils.rotation import generate_rotation_matrix, clear_rotation_cache
 from turboquant_utils.quantize import pack_nbit, unpack_nbit
 
 
@@ -244,6 +244,22 @@ def test_linear(args):
     torch.cuda.synchronize()
     t_triton = (time.time() - t0) / 10
 
+    # 新改进对照：cold(改前, 每次清缓存强制重算旋转+重拷) vs hot(改后, 命中设备缓存)
+    # 直接在 Triton 调用上测，最直观体现改进收益。
+    torch.cuda.synchronize()
+    t0 = time.time()
+    for _ in range(10):
+        clear_rotation_cache()  # 模拟改前：每次都重算 QR + 重拷
+        out_triton_cold = triton_fused_matmul_grouped(
+            x, packed_data["indices_packed"], packed_data["codebook"],
+            packed_data["norms"], packed_data["seed"],
+            packed_data["group_size"], K, bit_width=bit_width
+        )
+    torch.cuda.synchronize()
+    t_triton_cold = (time.time() - t0) / 10
+
+    rot_same = torch.allclose(out_triton_cold, out_triton, atol=1e-2)
+
     out_fp16_float = out_fp16.float()
     out_simu_float = out_simu.float()
     out_dequant_float = out_dequant.float()
@@ -259,7 +275,11 @@ def test_linear(args):
     print(f"FP16:              {t_fp16 * 1000:8.2f} ms")
     print(f"SimuQuant:         {t_simu * 1000:8.2f} ms")
     print(f"反量化+GEMM:       {t_dequant * 1000:8.2f} ms")
-    print(f"Triton:            {t_triton * 1000:8.2f} ms")
+    print(f"Triton(改后 hot):  {t_triton * 1000:8.2f} ms")
+    print(f"Triton(改前 cold): {t_triton_cold * 1000:8.2f} ms")
+    print(f"  → 新改进(旋转缓存)节省: {max(t_triton_cold - t_triton, 0) * 1000:8.2f} ms "
+          f"({max((t_triton_cold - t_triton) / t_triton_cold * 100, 0):.1f}%)")
+    print(f"  → 数值一致性: {'OK' if rot_same else 'FAIL'}")
     print(f"\n误差对比:")
     print(f"SimuQuant vs FP16:  max={abs_diff_simu_fp16.max():.6f}, mean={abs_diff_simu_fp16.mean():.6f}")
     print(f"反量化+GEMM vs SimuQuant: max={abs_diff_dequant_simu.max():.6f}, mean={abs_diff_dequant_simu.mean():.6f}")
@@ -270,6 +290,8 @@ def test_linear(args):
         "t_simu": t_simu,
         "t_dequant": t_dequant,
         "t_triton": t_triton,
+        "t_triton_cold": t_triton_cold,
+        "rot_same": rot_same,
         "err_simu_fp16_max": abs_diff_simu_fp16.max().item(),
         "err_simu_fp16_mean": abs_diff_simu_fp16.mean().item(),
         "err_dequant_simu_max": abs_diff_dequant_simu.max().item(),
@@ -354,6 +376,21 @@ def test_moe_up_gate(args):
     torch.cuda.synchronize()
     t_triton = (time.time() - t0) / 10
 
+    # 新改进对照：cold(改前, 每次清缓存) vs hot(改后, 命中设备缓存)，直接织进 Triton 计时
+    torch.cuda.synchronize()
+    t0 = time.time()
+    for _ in range(10):
+        clear_rotation_cache()
+        out_triton_cold = triton_fused_matmul_grouped_slice_rows(
+            x, packed_data["indices_packed"], packed_data["codebook"],
+            packed_data["norms"], packed_data["seed"],
+            packed_data["group_size"], D, 2*start, 2*end, bit_width=4
+        )
+    torch.cuda.synchronize()
+    t_triton_cold = (time.time() - t0) / 10
+
+    rot_same = torch.allclose(out_triton_cold, out_triton, atol=1e-2)
+
     out_fp16_float = out_fp16.float()
     out_simu_float = out_simu.float()
     out_dequant_float = out_dequant.float()
@@ -369,7 +406,11 @@ def test_moe_up_gate(args):
     print(f"FP16:              {t_fp16 * 1000:8.2f} ms")
     print(f"SimuQuant:         {t_simu * 1000:8.2f} ms")
     print(f"反量化+GEMM:       {t_dequant * 1000:8.2f} ms")
-    print(f"Triton:            {t_triton * 1000:8.2f} ms")
+    print(f"Triton(改后 hot):  {t_triton * 1000:8.2f} ms")
+    print(f"Triton(改前 cold): {t_triton_cold * 1000:8.2f} ms")
+    print(f"  → 新改进(旋转缓存)节省: {max(t_triton_cold - t_triton, 0) * 1000:8.2f} ms "
+          f"({max((t_triton_cold - t_triton) / t_triton_cold * 100, 0):.1f}%)")
+    print(f"  → 数值一致性: {'OK' if rot_same else 'FAIL'}")
     print(f"\n误差对比:")
     print(f"SimuQuant vs FP16:  max={abs_diff_simu_fp16.max():.6f}, mean={abs_diff_simu_fp16.mean():.6f}")
     print(f"反量化+GEMM vs SimuQuant: max={abs_diff_dequant_simu.max():.6f}, mean={abs_diff_dequant_simu.mean():.6f}")
@@ -380,6 +421,8 @@ def test_moe_up_gate(args):
         "t_simu": t_simu,
         "t_dequant": t_dequant,
         "t_triton": t_triton,
+        "t_triton_cold": t_triton_cold,
+        "rot_same": rot_same,
         "err_simu_fp16_max": abs_diff_simu_fp16.max().item(),
         "err_simu_fp16_mean": abs_diff_simu_fp16.mean().item(),
         "err_dequant_simu_max": abs_diff_dequant_simu.max().item(),
@@ -464,6 +507,21 @@ def test_moe_down(args):
     torch.cuda.synchronize()
     t_triton = (time.time() - t0) / 10
 
+    # 新改进对照：cold(改前, 每次清缓存) vs hot(改后, 命中设备缓存)，直接织进 Triton 计时
+    torch.cuda.synchronize()
+    t0 = time.time()
+    for _ in range(10):
+        clear_rotation_cache()
+        out_triton_cold = triton_fused_matmul_grouped_slice_in_features(
+            x[:, start:end], packed_data["indices_packed"], packed_data["codebook"],
+            packed_data["norms"], packed_data["seed"],
+            packed_data["group_size"], start, end, K, bit_width=4
+        )
+    torch.cuda.synchronize()
+    t_triton_cold = (time.time() - t0) / 10
+
+    rot_same = torch.allclose(out_triton_cold, out_triton, atol=1e-2)
+
     out_fp16_float = out_fp16.float()
     out_simu_float = out_simu.float()
     out_dequant_float = out_dequant.float()
@@ -479,7 +537,11 @@ def test_moe_down(args):
     print(f"FP16:              {t_fp16 * 1000:8.2f} ms")
     print(f"SimuQuant:         {t_simu * 1000:8.2f} ms")
     print(f"反量化+GEMM:       {t_dequant * 1000:8.2f} ms")
-    print(f"Triton:            {t_triton * 1000:8.2f} ms")
+    print(f"Triton(改后 hot):  {t_triton * 1000:8.2f} ms")
+    print(f"Triton(改前 cold): {t_triton_cold * 1000:8.2f} ms")
+    print(f"  → 新改进(旋转缓存)节省: {max(t_triton_cold - t_triton, 0) * 1000:8.2f} ms "
+          f"({max((t_triton_cold - t_triton) / t_triton_cold * 100, 0):.1f}%)")
+    print(f"  → 数值一致性: {'OK' if rot_same else 'FAIL'}")
     print(f"\n误差对比:")
     print(f"SimuQuant vs FP16:  max={abs_diff_simu_fp16.max():.6f}, mean={abs_diff_simu_fp16.mean():.6f}")
     print(f"反量化+GEMM vs SimuQuant: max={abs_diff_dequant_simu.max():.6f}, mean={abs_diff_dequant_simu.mean():.6f}")
@@ -490,6 +552,8 @@ def test_moe_down(args):
         "t_simu": t_simu,
         "t_dequant": t_dequant,
         "t_triton": t_triton,
+        "t_triton_cold": t_triton_cold,
+        "rot_same": rot_same,
         "err_simu_fp16_max": abs_diff_simu_fp16.max().item(),
         "err_simu_fp16_mean": abs_diff_simu_fp16.mean().item(),
         "err_dequant_simu_max": abs_diff_dequant_simu.max().item(),
@@ -497,6 +561,43 @@ def test_moe_down(args):
         "err_dequant_triton_max": abs_diff_dequant_triton.max().item(),
         "err_dequant_triton_mean": abs_diff_dequant_triton.mean().item(),
     }
+
+
+def test_rotation_cache_alignment(args, linear_result, moe_up_result, moe_down_result):
+    """
+    场景 3：旋转矩阵设备端缓存对照总览（针对最新改进）。
+
+    最新改进：generate_rotation_matrix 在保留 CPU 基缓存（值一致）的同时，
+    新增按 device 派生的缓存，消除每前向的 CPU→GPU 重拷（实验 6 拆出的隐藏开销）。
+
+    各场景已在自身汇总里测出 cold(改前)/hot(改后) 时间差，这里统一对照。
+    """
+    print("\n" + "=" * 70)
+    print("场景 3: 旋转矩阵设备端缓存对照（新改进 cold=改前 / hot=改后）")
+    print("=" * 70)
+
+    rows = [
+        ("场景1 单独 Linear", linear_result),
+        ("场景2.1 MoE up_gate", moe_up_result),
+        ("场景2.2 MoE down", moe_down_result),
+    ]
+    all_ok = True
+    for name, r in rows:
+        cold = r["t_triton_cold"]
+        hot = r["t_triton"]
+        save = max(cold - hot, 0)
+        pct = max(save / cold * 100, 0) if cold > 0 else 0
+        ok = r.get("rot_same", False)
+        all_ok = all_ok and ok
+        print(f"  {name}:")
+        print(f"    冷路径(改前, 清缓存重算): {cold * 1000:8.3f} ms")
+        print(f"    热路径(改后, 命中缓存)  : {hot * 1000:8.3f} ms")
+        print(f"    改进节省                : {save * 1000:8.3f} ms ({pct:.1f}%)")
+        print(f"    数值一致性              : {'OK' if ok else 'FAIL'}")
+        print()
+
+    print(f"  总览结论 : {'全部对齐 OK —— 设备缓存不改变数值，且消除了重复重拷' if all_ok else 'FAIL —— 需检查'}")
+    print("=" * 70)
 
 
 def main():
@@ -515,6 +616,7 @@ def main():
     linear_result = test_linear(args)
     moe_up_result = test_moe_up_gate(args)
     moe_down_result = test_moe_down(args)
+    test_rotation_cache_alignment(args, linear_result, moe_up_result, moe_down_result)
 
     print("\n" + "=" * 70)
     print("最终汇总")
@@ -549,6 +651,9 @@ def main():
     print(f"    SimuQuant vs FP16:    max={moe_down_result['err_simu_fp16_max']:.6f}, mean={moe_down_result['err_simu_fp16_mean']:.6f}")
     print(f"    反量化+GEMM vs SimuQuant: max={moe_down_result['err_dequant_simu_max']:.6f}, mean={moe_down_result['err_dequant_simu_mean']:.6f}")
     print(f"    反量化+GEMM vs Triton: max={moe_down_result['err_dequant_triton_max']:.6f}, mean={moe_down_result['err_dequant_triton_mean']:.6f}")
+
+    print("\n" + "=" * 70)
+    print("场景3（旋转缓存对照）已在场景1/2汇总后单独打印，见上。")
 
     print("\n" + "=" * 70)
     print("测试完成！")

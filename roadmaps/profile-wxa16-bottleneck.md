@@ -195,6 +195,8 @@ bit-partition 在单 bit 场景下反而更快，因为 N 变小后单次 kernel
 
 纯 kernel 计算只占不到 30%，剩下 70% 都是 Python 端的辅助开销！
 
+> 注：本实验测的是** warm 路径**（旋转矩阵缓存已热，仅含 `x_g @ Pi.T` 矩阵乘 + 每次访问的 CPU→GPU 重拷）。实验 6 进一步拆分表明：warm 路径里矩阵乘与重拷各占约一半；而每个 (bit,group) **首次**出现时还有一次 QR 重算（约 1.9ms，占 cold 路径 90%），该 QR 因 seed 确定、可在模型加载时预计算一次消除。详见 §五 实验 6。
+
 ### 实验 5：精度影响（FP16 vs TF32）
 
 | 形状 | fp16 TFLOPS | fp32/TF32 TFLOPS | 比值 |
@@ -205,6 +207,23 @@ bit-partition 在单 bit 场景下反而更快，因为 N 变小后单次 kernel
 
 Triton kernel 内部 accumulator 是 float32（走 TF32 Tensor Core），大形状下 TF32 吞吐只有 fp16 的 ~35%。
 这解释了为什么大形状下 4-bit 与 fp16 的差距反而更大。
+
+### 实验 6：旋转开销拆分（matmul vs CPU→GPU 拷贝 vs QR 重算）
+
+（完整测量见 `test/profile_moe_l2.py` 的 `experiment6_rotation_split`，形状同实验 4：B=64, K=1024, group_size=128, num_groups=8）
+
+| 变体 | 时间(ms) | 占 cold 比 |
+|------|-----------|-----------|
+| A 纯矩阵乘（GPU 钉住，无拷贝） | 0.103 | 4.9% |
+| B warm（含 CPU→GPU 重拷） | 0.199 | 9.5% |
+| C cold（QR 重算 + 重拷） | 2.102 | 100% |
+
+拆分结论：
+- 纯矩阵乘仅占 4.9%；**CPU→GPU 重拷占 4.6%**（在会重复的 warm 路径里 ≈ 旋转开销的一半）；
+- **QR 重算占 90.5%**——每个 (bit,group) 首次出现时算一次（seed 不含 expert 维度，同一 bit 内 8 个 Pi 跨 16 expert 复用），每 forward 仍重算 3×8=24 次；
+- seed 确定 → 可在**模型加载时预计算一次钉在 GPU**，永久消除 QR 重算与逐次重拷。
+
+**决策门结论**：下一步优先「旋转矩阵设备端缓存 / 加载时预计算」（同时干掉重拷与 QR 重算），**而非**「旋转融合进 kernel」——后者针对的纯矩阵乘仅占 ~5%，收益极小。
 
 ---
 
@@ -229,11 +248,11 @@ Triton kernel 内部 accumulator 是 float32（走 TF32 Tensor Core），大形�
 
 | 优先级 | 优化点 | 预期收益 | 难度 |
 |--------|--------|---------|------|
+| **P0** | 旋转矩阵设备端缓存 / 加载时预计算（消除 CPU→GPU 重拷 + QR 重算） | 旋转开销大部分（见实验 6：重拷 ~50% + QR 90% of cold） | 低 |
 | **P0** | kernel 列偏移寻址去 clone（保持正确性，内核加 `col_start`/`full_packed_k`） | -18% grouped 时间 | 低 |
-| **P0** | 旋转矩阵设备端缓存 / 预计算旋转后输入（消除 CPU→GPU 重拷） | 削减旋转 40% 中的隐藏拷贝占比 | 低 |
-| **P0** | 把旋转融合进 Triton kernel（或预计算所有 group 旋转后输入） | -40% 旋转时间 | 中 |
 | **P1** | 多 group 合并到一次 kernel launch（减少 launch + 更好 SM 利用率） | 20-30% | 中 |
 | **P1** | FP16 accumulator（如果精度允许） | 理论 1.5-2x | 中 |
+| **P2** | 旋转融合进 Triton kernel（实验 6 显示纯矩阵乘仅占 ~5%，收益有限，降级） | 视情况 | 中 |
 | ⛔ 否决 | Triton autotune 调参（BLOCK 大小、num_warps、num_stages） | — | — | 动态小 kernel，搜索编译开销 > 收益，不启用 |
 | 📋 待办 | 旋转结果复用（跨 bit / 跨 gate_up&down，需先统一跨 bit seed + 改量化 + 验精度） | 视情况 | 中 |
 | 📋 待办 | 接线 `triton_fused_dual_matmul`（已实现未调用，合并两次 matmul，依赖统一 seed） | 视情况 | 中 |
@@ -343,7 +362,7 @@ baseline (单 4-bit):
 | 量化 kernel 本身慢 4 倍 | ✅ **确认**。无 partition 的 4-bit 比 fp16 慢 4.29x |
 | bit-partition 架构慢很多 | ❌ 不成立。单 bit 下反而更快（-23%，N 变小） |
 | 多 bit 混合有额外开销 | ✅ 确认。约 +15%（per-bit 循环 + 每 bit 独立旋转） |
-| 旋转是主要开销 | ✅ **重磅确认**。占 grouped 流程时间 ~40%（含旋转矩阵 CPU→GPU 重拷隐藏开销） |
+| 旋转是主要开销 | ✅ **重磅确认**。占 grouped 流程 ~40%（warm 路径）；实验 6 进一步拆出：warm 中重拷≈一半，且每个 (bit,group) 首次有 QR 重算（cold 占 90%） |
 | clone 占 ~18%，但为正确性约束 | ✅ 确认占比，但实为列切片正确性约束，需配套 kernel 列偏移寻址去除（见 §七） |
 | autotune 是可启用杠杆 | ❌ 不成立。kernel 高度动态（K=128 小矩阵、多次 launch），不启用，差距视为固有算子效率差距 |
 
@@ -353,15 +372,31 @@ baseline (单 4-bit):
 
 | 优先级 | 优化点 | 预期收益 | 难度 | 备注 |
 |--------|--------|---------|------|------|
+| **P0** | 旋转矩阵设备端缓存 / 加载时预计算 | 旋转开销大部分（重拷 ~50% + QR 90% of cold） | 低 | 纯结构性，不碰 kernel 数学；seed 确定可加载时算一次钉 GPU |
 | **P0** | kernel 列偏移寻址去 clone（保持正确性） | grouped 时间 -18% | 低 | 改动最小；clone 非随意删，需配套内核列偏移寻址 |
-| **P0** | 旋转矩阵设备端缓存 / 预计算旋转后输入 | 削减旋转 40% 中的 CPU→GPU 重拷 | 低 | 纯结构性，不碰 kernel 数学 |
-| **P0** | 旋转融合进 Triton kernel | grouped 时间 -40% | 中 | 最大的单一开销来源 |
 | **P1** | 多 group 合并为一次 kernel launch | 20-30% | 中 | 减少 launch + 提升 SM 利用率 |
 | **P1** | FP16 accumulator | 理论 1.5-2x | 中 | 需验证精度损失 |
+| **P2** | 旋转融合进 Triton kernel | 视情况（纯矩阵乘仅占 ~5%，收益有限） | 中 | 实验 6 显示收益远低于预期，降级 |
 | ⛔ 否决 | Triton autotune 深度调参 | — | — | 动态小 kernel，搜索开销 > 收益，不启用 |
 | 📋 待办 | 旋转结果复用（跨 bit / 跨 gate_up&down） | 视情况 | 中 | 需统一 seed+改量化+验精度 |
 | 📋 待办 | 接线 `triton_fused_dual_matmul` 合并 launch | 视情况 | 中 | 已实现未调用，依赖统一 seed |
 | **P3** | 去掉 `.item()` D2H 同步 | 小 | 低 | 仅在 per-expert 循环极多时显著 |
+
+### 下一步代码开发（已决策：旋转矩阵设备端缓存，变体 1）
+
+**目标**：消除实验 6 拆出的两笔隐藏浪费——warm 路径里 ~50% 的旋转 CPU→GPU 重拷（0.097ms/次），以及每进程首次出现的 QR 重算。
+
+**正确性前提（已核对）**：量化侧 `quantize.py` 调 `generate_rotation_matrix` **不传 device**，在 CPU 算 QR；推理侧 `triton_kernels.py` 传 `device=x.device`，命中缓存后只 `.to(device)` 拷贝。因此矩阵值始终由 **CPU QR** 派生，设备端缓存必须**基于 CPU 基矩阵派生副本**，绝不可在 GPU 上重算 QR（否则与量化侧矩阵值不一致 → 反量化静默出错）。
+
+**实现要点（改 `turboquant_utils/rotation.py`）**：
+- 保留现有 CPU 基缓存 `_ROTATION_CACHE`（key=(d,seed)），保证值一致、QR 仅在 miss 时算一次；
+- 新增 device-keyed 缓存 `_ROTATION_CACHE_DEV`（key=(d,seed,device)），首次按 device 派生一次 `.to(device)` 后常驻，后续直接返回，**消除每前向重拷**；
+- `clear_rotation_cache()` 同时清空两个缓存；设备端缓存加容量上限与 LRU 淘汰，避免多模型串行加载时的 GPU 显存累积（CLAUDE.md 内存泄露约束）。
+
+**预期收益**：warm 路径旋转开销减半（去掉重拷）；本模型显存增量 ≈ 64×(128×128×4B) ≈ 4MB，可忽略。
+
+**验证方式**：micro-benchmark 确认 (a) `generate_rotation_matrix(d,seed,device=cuda)` 返回矩阵与 CPU 基矩阵逐元素一致；(b) 第二次及以后调用不再产生 `.to(device)` 拷贝（时间下降）。
+
 
 ---
 

@@ -31,6 +31,7 @@ import torch
 # ---------------------------------------------------------------------------
 
 _ROTATION_CACHE: dict[Tuple[int, int], torch.Tensor] = {}
+_ROTATION_CACHE_DEV: dict[Tuple[int, int, str], torch.Tensor] = {}  # 按 device 缓存派生副本，避免每调用 .to(device) 重拷
 _MAX_CACHE_SIZE = 128  # 最多缓存128个旋转矩阵，足够用了
 
 
@@ -61,47 +62,56 @@ def generate_rotation_matrix(d: int, seed: int = 42, device: Optional[torch.devi
     Returns:
         Q: d×d 的正交矩阵，数据类型为 float32
     """
-    global _ROTATION_CACHE
+    global _ROTATION_CACHE, _ROTATION_CACHE_DEV
 
-    # 检查缓存
-    cache_key = (d, seed)
-    if cache_key in _ROTATION_CACHE:
-        cached_q = _ROTATION_CACHE[cache_key]
-        # 如果需要的话，移到目标设备
-        if device is not None and cached_q.device != device:
-            cached_q = cached_q.to(device)
-        return cached_q
+    # 基矩阵（CPU）始终只计算一次，保证与量化侧（不传 device、在 CPU 算 QR）
+    # 算出的矩阵值完全一致，避免推理侧在 GPU 上重算 QR 导致反量化静默出错。
+    base_key = (d, seed)
+    if base_key not in _ROTATION_CACHE:
+        # 创建指定种子的随机数生成器
+        gen = torch.Generator().manual_seed(seed)
+        # 生成标准高斯随机矩阵
+        G = torch.randn(d, d, generator=gen)
+        # QR分解：Q是正交矩阵，R是上三角矩阵
+        Q, R = torch.linalg.qr(G)
+        # 修正符号歧义：QR分解中Q的列符号不唯一
+        # 通过乘以R对角线元素的符号，确保Q服从Haar分布
+        diag_sign = torch.sign(torch.diag(R))
+        Q = Q * diag_sign.unsqueeze(0)
 
-    # 创建指定种子的随机数生成器
-    gen = torch.Generator().manual_seed(seed)
-    # 生成标准高斯随机矩阵
-    G = torch.randn(d, d, generator=gen)
-    # QR分解：Q是正交矩阵，R是上三角矩阵
-    Q, R = torch.linalg.qr(G)
-    # 修正符号歧义：QR分解中Q的列符号不唯一
-    # 通过乘以R对角线元素的符号，确保Q服从Haar分布
-    diag_sign = torch.sign(torch.diag(R))
-    Q = Q * diag_sign.unsqueeze(0)
+        # 缓存结果（先存 CPU 上，节省显存）
+        if len(_ROTATION_CACHE) >= _MAX_CACHE_SIZE:
+            # 简单的LRU：移除最早的项
+            first_key = next(iter(_ROTATION_CACHE.keys()))
+            del _ROTATION_CACHE[first_key]
 
-    # 缓存结果（先存 CPU 上，节省显存）
-    if len(_ROTATION_CACHE) >= _MAX_CACHE_SIZE:
-        # 简单的LRU：移除最早的项
-        first_key = next(iter(_ROTATION_CACHE.keys()))
-        del _ROTATION_CACHE[first_key]
+        _ROTATION_CACHE[base_key] = Q.cpu()
 
-    _ROTATION_CACHE[cache_key] = Q.cpu()
+    base = _ROTATION_CACHE[base_key]
 
-    # 如果需要的话，移到目标设备
-    if device is not None:
-        Q = Q.to(device)
+    if device is None:
+        return base
 
-    return Q
+    # 按 device 缓存派生副本：首次派生一次 .to(device) 后常驻，
+    # 后续调用直接返回，消除每前向的 CPU→GPU 重拷（实验 6 拆出的隐藏开销）。
+    dev_key = (d, seed, str(device))
+    if dev_key in _ROTATION_CACHE_DEV:
+        return _ROTATION_CACHE_DEV[dev_key]
+
+    if len(_ROTATION_CACHE_DEV) >= _MAX_CACHE_SIZE:
+        first_key = next(iter(_ROTATION_CACHE_DEV.keys()))
+        del _ROTATION_CACHE_DEV[first_key]
+
+    Qd = base.to(device)
+    _ROTATION_CACHE_DEV[dev_key] = Qd
+    return Qd
 
 
 def clear_rotation_cache() -> None:
     """清空旋转矩阵缓存，释放内存"""
-    global _ROTATION_CACHE
+    global _ROTATION_CACHE, _ROTATION_CACHE_DEV
     _ROTATION_CACHE.clear()
+    _ROTATION_CACHE_DEV.clear()
 
 
 # ---------------------------------------------------------------------------
