@@ -190,8 +190,8 @@ bit-partition 在单 bit 场景下反而更快，因为 N 变小后单次 kernel
 | 假想 fp16 大 matmul | 0.006 | 1.2% |
 
 **两个最大瓶颈：**
-1. **旋转占 40%** — 每个 group 做 `x_g @ Pi.T`，(B,128) @ (128,128) 小矩阵乘利用率极低
-2. **clone 占 18%** — `indices_packed[:, packed_start:packed_end].clone()` 每个 group 一次
+1. **旋转占 40%** — 每个 group 做 `x_g @ Pi.T`，(B,128) @ (128,128) 小矩阵乘利用率极低；此外这 40% 还包含一个未剥离的隐藏开销：旋转矩阵 `Pi` 由 `generate_rotation_matrix` 生成后缓存于 CPU（`Q.cpu()`），每次 forward 访问都要 `.to(device)` 重新拷回 GPU（128×128×4B），每个 group×bit×expert 一次。
+2. **clone 占 18%** — `indices_packed[:, packed_start:packed_end].clone()` 每个 group 一次。注意这并非"可随意删的纯开销"：内核 `triton_fused_matmul` 按 `rn*PACKED_K + byte_col` 寻址，要求输入为行 stride=PACKED_K 的连续张量，而列切片真实行 stride 为原始总宽（≠ 切片宽），直接删 clone 会静默读错内存。正确做法是给内核加列偏移（`col_start` / `full_packed_k`）参数按偏移寻址后再去 clone。
 
 纯 kernel 计算只占不到 30%，剩下 70% 都是 Python 端的辅助开销！
 
@@ -213,9 +213,10 @@ Triton kernel 内部 accumulator 是 float32（走 TF32 Tensor Core），大形�
 | 开销来源 | 贡献 | 说明 |
 |----------|------|------|
 | **Python 端旋转** | ~40% grouped 时间 | 小形状 matmul 利用率低 |
-| **clone 开销** | ~18% grouped 时间 | 完全可以避免 |
+| **clone 开销** | ~18% grouped 时间 | 列切片正确性约束，需 kernel 列偏移寻址去除（非随意删） |
 | **TF32 vs FP16** | 1.5~2.8x | 大形状更明显 |
-| **Triton vs cuBLAS 算子效率** | 1.5~2x | autotune 调优空间 |
+| **Triton vs cuBLAS 算子效率** | 1.5~2x | 动态小 kernel 不启用 autotune，视为固有算子效率差距 |
+| **旋转矩阵 CPU→GPU 重复拷贝** | 含于旋转 ~40% | 旋转矩阵缓存于 CPU，每次 forward 重拷回 GPU，未剥离的隐藏开销 |
 | **小形状 + grouped 拆分** | 显著 | K=128 小矩阵乘 + 多次 launch |
 | Launch overhead | 小 | ~15μs/次，仅极小形状显著 |
 | 位运算反量化 | **几乎 0** | 2-bit 反而更快（带宽节省） |
@@ -228,12 +229,14 @@ Triton kernel 内部 accumulator 是 float32（走 TF32 Tensor Core），大形�
 
 | 优先级 | 优化点 | 预期收益 | 难度 |
 |--------|--------|---------|------|
-| **P0** | 去掉 `indices_packed_g.clone()`，kernel 内用偏移量寻址 | -18% grouped 时间 | 低 |
-| **P0** | 把旋转融合进 Triton kernel（或预计算所有 group 的旋转后输入） | -40% 旋转时间 | 中 |
+| **P0** | kernel 列偏移寻址去 clone（保持正确性，内核加 `col_start`/`full_packed_k`） | -18% grouped 时间 | 低 |
+| **P0** | 旋转矩阵设备端缓存 / 预计算旋转后输入（消除 CPU→GPU 重拷） | 削减旋转 40% 中的隐藏拷贝占比 | 低 |
+| **P0** | 把旋转融合进 Triton kernel（或预计算所有 group 旋转后输入） | -40% 旋转时间 | 中 |
 | **P1** | 多 group 合并到一次 kernel launch（减少 launch + 更好 SM 利用率） | 20-30% | 中 |
 | **P1** | FP16 accumulator（如果精度允许） | 理论 1.5-2x | 中 |
-| **P2** | Triton autotune 调参（BLOCK 大小、num_warps、num_stages） | 10-30% | 低 |
-| **P2** | 旋转复用（不同 bit 之间、gate_up/down 之间复用旋转结果） | 视情况 | 中 |
+| ⛔ 否决 | Triton autotune 调参（BLOCK 大小、num_warps、num_stages） | — | — | 动态小 kernel，搜索编译开销 > 收益，不启用 |
+| 📋 待办 | 旋转结果复用（跨 bit / 跨 gate_up&down，需先统一跨 bit seed + 改量化 + 验精度） | 视情况 | 中 |
+| 📋 待办 | 接线 `triton_fused_dual_matmul`（已实现未调用，合并两次 matmul，依赖统一 seed） | 视情况 | 中 |
 | **P3** | 去掉 `.item()` D2H 同步 | 小 | 低 |
 
 ---
@@ -282,12 +285,18 @@ baseline (单 4-bit):
 
 #### 8.4 旋转的重复计算
 
-每个 bit 的 gate_up 都要对同一输入做一次完整的旋转（num_groups 次 matmul）。
-3 种 bit 就是 3 倍的旋转计算量。
-但旋转是对同一个输入做的，理论上可以复用。
+> 原假设"3 个 bit 的 gate_up 对同一输入做相同旋转、可复用"**不成立**，原因如下：
 
-**关键问题**：当前代码中，3 个 bit 的 gate_up 是各自调一次 `triton_fused_matmul_grouped_slice_rows`，
-每次都会重新算旋转。这部分是不是被浪费了？
+- 量化时每个 bit 使用了**不同 seed**（`seed=42+bit` / `42+bit+1000`，见 `wxa16_bit_partitioned_moe.py`），
+  因此旋转矩阵 `Pi` 随 bit 不同而不同，当前代码**不存在**跨 bit 的旋转重复计算。
+- 旋转 40% 的真实来源是两部分：
+  1. 每个 group 一次 `(B,128)@(128,128)` 极小矩阵乘从 Python 端 launch，Tensor Core 占用率极低；
+  2. **隐藏开销**——旋转矩阵缓存存于 CPU（`Q.cpu()`），每次 forward 访问都 `.to(device)` 重新拷回 GPU。
+
+**关于"若统一 seed 能否复用"**：技术上**可以**——旋转作用在输入 `x` 上，仅依赖 `g_dim/group_size/g_start`（跨 bit 相同），只要 seed 统一，`x_rot_g` 即跨 bit 相同，可计算一次喂给多 bit 的 kernel。
+但前提是**量化侧也要统一跨 bit 的 seed**（方案改动），且必须重新验证精度，因此可行但**耦合量化、推迟为待办**。
+
+> 另：`triton_kernels.py` 已实现 `triton_fused_dual_matmul`（支持 `SAME_INPUT` 合并两次 matmul），但主 forward 完全未调用，属未接线的死代码。其意图与"多 group 合并 launch"一致，但需先统一跨 bit seed（`SAME_INPUT` 才成立），故推迟为待办。
 
 #### 8.5 小形状 kernel 的低效率
 
@@ -333,9 +342,10 @@ baseline (单 4-bit):
 | launch overhead 是主因 | ❌ 不成立。~15μs/次，仅极小形状占比大 |
 | 量化 kernel 本身慢 4 倍 | ✅ **确认**。无 partition 的 4-bit 比 fp16 慢 4.29x |
 | bit-partition 架构慢很多 | ❌ 不成立。单 bit 下反而更快（-23%，N 变小） |
-| 多 bit 混合有额外开销 | ✅ 确认。约 +15%（per-bit 循环 + 重复旋转） |
-| 旋转是主要开销 | ✅ **重磅确认**。占 grouped 流程时间的 ~40% |
-| clone 是不必要开销 | ✅ **确认**。占 ~18%，完全可以去掉 |
+| 多 bit 混合有额外开销 | ✅ 确认。约 +15%（per-bit 循环 + 每 bit 独立旋转） |
+| 旋转是主要开销 | ✅ **重磅确认**。占 grouped 流程时间 ~40%（含旋转矩阵 CPU→GPU 重拷隐藏开销） |
+| clone 占 ~18%，但为正确性约束 | ✅ 确认占比，但实为列切片正确性约束，需配套 kernel 列偏移寻址去除（见 §七） |
+| autotune 是可启用杠杆 | ❌ 不成立。kernel 高度动态（K=128 小矩阵、多次 launch），不启用，差距视为固有算子效率差距 |
 
 ### 优化方向决策
 
@@ -343,10 +353,15 @@ baseline (单 4-bit):
 
 | 优先级 | 优化点 | 预期收益 | 难度 | 备注 |
 |--------|--------|---------|------|------|
-| **P0** | 去掉 `indices_packed_g.clone()` | grouped 时间 -18% | 低 | 改动最小，收益明确 |
+| **P0** | kernel 列偏移寻址去 clone（保持正确性） | grouped 时间 -18% | 低 | 改动最小；clone 非随意删，需配套内核列偏移寻址 |
+| **P0** | 旋转矩阵设备端缓存 / 预计算旋转后输入 | 削减旋转 40% 中的 CPU→GPU 重拷 | 低 | 纯结构性，不碰 kernel 数学 |
 | **P0** | 旋转融合进 Triton kernel | grouped 时间 -40% | 中 | 最大的单一开销来源 |
 | **P1** | 多 group 合并为一次 kernel launch | 20-30% | 中 | 减少 launch + 提升 SM 利用率 |
 | **P1** | FP16 accumulator | 理论 1.5-2x | 中 | 需验证精度损失 |
-| **P2** | Triton autotune 深度调参 | 10-30% | 低 | BLOCK 大小、num_warps、num_stages |
-| **P2** | 旋转结果复用（跨 bit / 跨 gate_up&down） | 视情况 | 中 | 减少旋转计算次数 |
+| ⛔ 否决 | Triton autotune 深度调参 | — | — | 动态小 kernel，搜索开销 > 收益，不启用 |
+| 📋 待办 | 旋转结果复用（跨 bit / 跨 gate_up&down） | 视情况 | 中 | 需统一 seed+改量化+验精度 |
+| 📋 待办 | 接线 `triton_fused_dual_matmul` 合并 launch | 视情况 | 中 | 已实现未调用，依赖统一 seed |
 | **P3** | 去掉 `.item()` D2H 同步 | 小 | 低 | 仅在 per-expert 循环极多时显著 |
+
+---
+
