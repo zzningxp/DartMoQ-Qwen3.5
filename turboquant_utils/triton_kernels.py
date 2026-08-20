@@ -149,7 +149,9 @@ def triton_fused_matmul(
 
     norms_scaled = norms / scale
 
-    output = torch.empty(B, N, dtype=torch.float32, device=x_rot.device)
+    # Step 1 (FP16 链路改造): output 改为 fp16，accumulator 仍为 fp32
+    # kernel 内 acc.to(output_ptr.dtype.element_ty) 会自动适配输出类型
+    output = torch.empty(B, N, dtype=torch.float16, device=x_rot.device)
 
     grid = (
         triton.cdiv(B, 16),
@@ -291,7 +293,7 @@ def triton_fused_dual_matmul(
 
     same_input = x_rot1.data_ptr() == x_rot2.data_ptr()
 
-    output = torch.empty(B, N, dtype=torch.float32, device=x_rot1.device)
+    output = torch.empty(B, N, dtype=torch.float16, device=x_rot1.device)  # Step 1: output fp16
 
     grid = (
         triton.cdiv(B, 16),
@@ -340,7 +342,7 @@ def triton_fused_matmul_grouped(
         x_rot_g = x_g @ Pi.T
         x_rot_list.append(x_rot_g)
 
-    output = torch.zeros(batch_size, out_features, dtype=torch.float32, device=x.device)
+    output = torch.zeros(batch_size, out_features, dtype=torch.float16, device=x.device)  # Step 1: output fp16
 
     group_idx = 0
     for g_start in range(0, in_features, group_size):
@@ -400,7 +402,7 @@ def triton_fused_matmul_grouped_slice_rows(
         x_rot_g = x_g @ Pi.T
         x_rot_list.append(x_rot_g)
 
-    output = torch.zeros(batch_size, slice_out_features, dtype=torch.float32, device=x.device)
+    output = torch.zeros(batch_size, slice_out_features, dtype=torch.float16, device=x.device)  # Step 1: output fp16
 
     group_idx = 0
     for g_start in range(0, in_features, group_size):
@@ -462,7 +464,7 @@ def triton_fused_matmul_grouped_slice_in_features(
         x_rot_g = x_g @ Pi.T
         x_rot_list.append(x_rot_g)
 
-    output = torch.zeros(batch_size, out_features, dtype=torch.float32, device=x.device)
+    output = torch.zeros(batch_size, out_features, dtype=torch.float16, device=x.device)  # Step 1: output fp16
 
     group_idx_in_slice = 0
     for g_start_in_slice in range(0, slice_in_features, group_size):

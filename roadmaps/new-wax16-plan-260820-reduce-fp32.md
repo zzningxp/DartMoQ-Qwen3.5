@@ -177,28 +177,58 @@ FP16 accumulator 的精度影响需要验证：
 阈值参考：当前 fp32 accumulator 下相对误差 ~0.3%，如果 fp16 accumulator 后
 误差在 1% 以内应该可以接受。
 
-### 实施步骤
+### 实施步骤（三步走，风险递进，每步都有可停的中间态）
 
-1. **第一步**：只改 output dtype（fp32→fp16），accumulator 保持 fp32
-   - 最小改动，验证输出类型转换是否正确
-   - 收益：减少输出带宽，可能有限
+#### Step 1：只改 output dtype（fp32→fp16），accumulator 保持 fp32 ⏳ 进行中
 
-2. **第二步**：codebook + norms 改为 fp16，accumulator 保持 fp32
-   - 验证混合精度（fp16 输入，fp32 累加）下的数值正确性
-   - 收益：w_quant 从 fp32 变 fp16，tl.dot 可能更高效
+- **改动**：
+  - kernel 内 `acc` 还是 fp32，`tl.dot` 还是 TF32，store 时 `acc.to(tl.float16)`
+  - 四个 wrapper（`triton_fused_matmul` / grouped / slice_rows / slice_in_features）
+    的 output tensor 从 `torch.float32` → `torch.float16`
+  - Python 端 `output = torch.zeros(..., dtype=torch.float32)` 全部改 fp16
+  - forward 中 `expert_out = torch.zeros_like(expert_tokens)` 自动 fp16（因为输入是 fp16）
+- **预期收益**：~5-10%（省输出带宽 50% + 下游 silu/mul/scatter 从 fp32 降回 fp16）
+- **风险**：极低。accumulator 还是 fp32，数值精度不变（只是最后 trunc 到 fp16）
+- **目的**：打通 fp16 输出链路，确认 Python 端所有下游操作在 fp16 下正常工作
 
-3. **第三步**：accumulator 改为 fp16（完整 FP16 链路）
-   - 最大改动，也是最大收益
-   - 需要仔细验证精度
+#### Step 2：codebook + norms 改为 fp16，accumulator 保持 fp32 ⏳ 待做
+
+- **改动**：
+  - `quantize.py`：`turboquant_quantize_packed_full` 中 codebook 和 norms 存 fp16
+  - kernel 内：`codebook_ptr` / `norms_ptr` 元素类型 fp16，`w_quant` 自动 fp16
+  - `tl.dot(inp_tile fp16, w_quant fp16, allow_tf32=?)` → 两边都是 fp16
+- **关键待验证**：两边 fp16 时 Triton 实际走 FP16 Tensor Core 还是仍走 TF32？
+- **预期收益**：~10-20%（codebook/norms 带宽减半 + 可能的 FP16 Tensor Core 部分提升）
+- **风险**：低。codebook 从 fp32→fp16 误差极小（码本值是归一化标量），
+  accumulator 仍为 fp32，不影响累加精度
+
+#### Step 3：accumulator 改为 fp16（完整 FP16 链路）⏳ 待做
+
+- **改动**：
+  - kernel 内 `acc = tl.zeros(dtype=tl.float16)`，去掉 `allow_tf32=True`
+  - 全程 fp16 计算 → FP16 Tensor Core
+- **预期收益**：理论上限 2~3x kernel 级；端到端预计 15-30%
+  （kernel 占 ~97%，但实际受带宽/寄存器等制约）
+- **风险**：中。需验证 FP16 accumulator 对 PPL 的影响
+  - 溢出风险低：K=128，权重归一化，累加值 ≈128，远小于 fp16 max=65504
+- **回退**：精度不达标就退回到 Step 2（fp16 输入 + fp32 累加）
 
 ### 风险与回退
 
-- **精度下降**：如果 PPL 影响不可接受，回退到 fp16 输入 + fp32 累加（第二步）
+- **精度下降**：如果 PPL 影响不可接受，回退到 fp16 输入 + fp32 累加（Step 2）
 - **kernel 编译问题**：Triton 对 fp16 accumulator 的支持可能需要特殊处理
   （如某些架构下 fp16 dot 需要特定配置）
 - **溢出风险**：fp16 范围有限（max 65504），如果累加值过大可能上溢。
   但 TurboQuant 是归一化量化，权重 norm 后幅值 ≈ 1，累加 K=128 个乘积，
   每个乘积 ≈ 1，总和 ≈ 128，远小于 fp16 上限。溢出风险低。
+
+### P2 进度追踪
+
+| Step | 单 kernel 精度 | e2e 精度 | e2e 性能 | run.q.sh 性能 | run.q.sh PPL | 状态 |
+|------|--------------|----------|----------|---------------|--------------|------|
+| Step 1: output fp16 | ⏳ | ⏳ | ⏳ | ⏳ | ⏳ | 进行中 |
+| Step 2: codebook+norms fp16 | ⏳ | ⏳ | ⏳ | ⏳ | ⏳ | 待做 |
+| Step 3: acc fp16 | ⏳ | ⏳ | ⏳ | ⏳ | ⏳ | 待做 |
 
 ---
 
