@@ -434,7 +434,7 @@ baseline (单 4-bit):
 
 **实现（改 `turboquant_utils/rotation.py`）**：保留 CPU 基缓存 `_ROTATION_CACHE`，新增 device-keyed `_ROTATION_CACHE_DEV`（key=(d,seed,device)），首次派生 `.to(device)` 后常驻。显存增量≈4MB 可忽略。
 
-**实测复盘（关键纠正）**：接进真实 eval（`eval_qwen35.py` 跑 Layer 0 WxA16 19.62s vs Layer 1 dense 1.92s）**端到端无任何提速**。根因：真实 run 不调 `clear_rotation_cache()`，缓存首个 batch 冷一次后全热；CPU→GPU 重拷每 group 仅 64KB，本就微秒级。**此前 micro 测试显示的 90% 节省是每轮 `clear_rotation_cache()` 人为打冷的假象**，不代表真实收益（详见 §五 实验 6 补充复盘）。
+**实测复盘（关键纠正）**：接进真实 eval（`eval_qwen35.py` 跑 Layer 0 moe WxA16 19.62s vs Layer 1 moe fp16 1.92s）**端到端无任何提速**。根因：真实 run 不调 `clear_rotation_cache()`，缓存首个 batch 冷一次后全热；CPU→GPU 重拷每 group 仅 64KB，本就微秒级。**此前 micro 测试显示的 90% 节省是每轮 `clear_rotation_cache()` 人为打冷的假象**，不代表真实收益（详见 §五 实验 6 补充复盘）。
 
 **结论**：该改正确、零风险，但不应作为主优化方向；真实 10 倍差距来自结构性开销，须靠 P1（多 group 合并 launch / FP16 accumulator）啃。
 
@@ -493,6 +493,73 @@ baseline (单 4-bit):
 - **P1 待做**：多 group 合并一次 launch、FP16 accumulator（见 §七）。
 - **待办**：旋转结果跨 bit 复用（需统一 seed+改量化+验精度）、接线 `triton_fused_dual_matmul`、去 `.item()` D2H 同步。
 - **测试方法**：micro 测试须区分 cold/warm 路径，warm 才是真实场景；全模型 eval 由本人手动跑（`run.q.sh` / `eval_qwen35.py`），不自动执行。
+
+---
+
+## 十一、mini-MoE e2e bench 补充发现（2026-08-20）
+
+### 背景
+
+micro test 和真实 run.q.sh 结果出入大（旋转缓存收益假象、col_start 编译风暴、clone 去除净回归），
+根因是单 kernel micro test 的形状、调用次数、参数多样性都和真实流程差太远。
+
+新增 `turboquant_utils/test_triton_mp_moe_e2e_bench.py`：构造和真实模型同形状的
+`WxA16BitPartitionedGroupMoE`（权重随机初始化），完整走一遍 forward 流程，作为
+单 kernel test 和全模型 run 之间的桥梁。
+
+配套：`WxA16BitPartitionedGroupMoE` 新增 `enable_timing` 开关 + `last_timings` 属性，
+可程序化获取各阶段时间（router / sort / triton / compute / cleanup 等）。
+
+### 核心发现：端到端差距是几十倍，不是 4 倍
+
+profile 文档实验 2 结论是"Triton 4-bit 比 fp16 慢 4.29x"，那是**单 kernel 对比**。
+完整 MoE forward 端到端的差距要大得多：
+
+| 配置（单 4-bit, 16 experts, B≈64/expert） | 时间 | 比值 |
+|-------------------------------------------|------|------|
+| FP16 cuBLAS MoE（预反量化权重） | 1.6 ms | 1.0x |
+| Triton 混合比特 MoE | 103 ms | **63x** |
+
+| 配置（单 4-bit, 8 experts, B≈128/expert） | 时间 | 比值 |
+|-------------------------------------------|------|------|
+| FP16 cuBLAS MoE | 3.6 ms | 1.0x |
+| Triton 混合比特 MoE | 272 ms | **75x** |
+
+### 差距分层拆解
+
+端到端几十倍的差距由三层叠加而来：
+
+| 层面 | 慢多少 | 占总差距比例 | 说明 |
+|------|--------|------------|------|
+| 纯 kernel（Triton vs cuBLAS） | ~6x | ~10% | TF32 vs FP16 + Triton 算子效率（同实验 2/5） |
+| 分组架构开销（旋转 + clone + 多次 launch） | ~3.5x | ~20% | 小形状利用率低，纯 kernel 仅占 compute 时间 ~28%（同实验 4） |
+| per-expert × per-bit Python 循环 | ~3~4x | ~70% | `.item()` D2H 同步 + 循环体开销 + 额外 launch 累积 |
+
+**关键结论**：
+- 纯 kernel 内的优化（如 clone 去除、反量化位运算）端到端收益有限——kernel 只占总时间的一小部分
+- 真正能大幅提速的方向是减少 Python 循环和 launch 次数（多 group 合并、多 expert 合并）
+- 这也解释了"micro test 有收益、run.q.sh 没效果"：micro 测的是 kernel 内优化，放到端到端被稀释了一个数量级
+
+### 精度验证
+
+端到端数值正确性已验证：
+- Triton MoE vs FP16 反量化 reference（完整 router → sort → per-expert×per-bit → scatter 全路径）
+- max_diff ≈ 0.002，相对误差 ≈ 0.3%，与单 kernel 测试误差量级一致
+
+### 扩展性质疑（待解释）
+
+B（per-expert token 数）从 32 增加到 256（8 倍），Triton MoE 总时间几乎不变（~100ms）。
+FP16 的时间也增长远慢于线性。原因可能是：
+- 小形状下 launch overhead 和固定开销主导，计算时间占比低
+- per-expert Python 循环开销是固定的（expert 数不变）
+
+需要更大 B（如 B=1024+）才能看到计算密集区的线性扩展。
+
+### 与真实 run.q.sh 的量级对比（待补）
+
+目前缺真实模型一层 MoE forward 的时间数据，无法确认 bench 和 run.q.sh 的量级是否一致。
+需本人手动跑一次 `run.q.sh --quant-layers 0`，读取
+`[WxA16BitPartitionedGroupMoE] forward total: X.XXXs` 进行对比。
 
 
 

@@ -32,7 +32,10 @@ import torch
 
 _ROTATION_CACHE: dict[Tuple[int, int], torch.Tensor] = {}
 _ROTATION_CACHE_DEV: dict[Tuple[int, int, str], torch.Tensor] = {}  # 按 device 缓存派生副本，避免每调用 .to(device) 重拷
-_MAX_CACHE_SIZE = 128  # 最多缓存128个旋转矩阵，足够用了
+_MAX_CACHE_SIZE = 2048  # 最多缓存2048个旋转矩阵
+# 注：down 方向 seed = base + expert_offset + group_offset，每 forward 工作集
+# ~1032 个 key（256 experts × 4 groups 等），128 不够会导致每 forward 抖动、
+# QR 反复重算。调到 2048 避免抖动，稳态后不再重算。CPU+GPU 各约 66MB 常驻。
 
 
 # ---------------------------------------------------------------------------

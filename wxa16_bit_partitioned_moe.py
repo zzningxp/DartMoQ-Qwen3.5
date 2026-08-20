@@ -173,6 +173,11 @@ class WxA16BitPartitionedGroupMoE(nn.Module):
         self.shared_expert = shared_expert
         self.shared_expert_gate = shared_expert_gate
 
+        # 计时开关：开启时 forward 会测量各阶段时间并存入 self.last_timings
+        # 关闭时跳过所有计时采样和 print，零额外开销
+        self.enable_timing = True
+        self.last_timings = {}
+
         # 按 bit 分组的权重
         self.bit_weights = nn.ModuleDict()  # "8" -> WxA16Weights, "4" -> ...
 
@@ -442,23 +447,35 @@ class WxA16BitPartitionedGroupMoE(nn.Module):
         del flat_expert_indices, flat_expert_weights, flat_token_indices
         del idxs, sorted_experts, sorted_weights, sorted_tokens, tokens_per_expert
 
-        # 及时清理显存
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
         t_compute_end = time.time()
         t4 = t_compute_end
 
         result = final_hidden_states.reshape(batch_size, seq_len, hidden_dim)
-        t5 = time.time()
 
-        # 打印详细时间（仅第一次）
-        if not hasattr(self, '_log_printed'):
-            self._log_printed = True
-            print(f"  [WxA16BitPartitionedGroupMoE] forward total: {t5 - t0:.4f}s", flush=True)
-            print(f"    init: {t1 - t0:.4f}s, shared: {t_shared_end - t_shared_start:.4f}s, router: {t_router_end - t_router_start:.4f}s", flush=True)
-            print(f"    compute: {t_compute_end - t_compute_start:.4f}s (triton: {time_triton_total:.4f}s, dequant: {time_dequant_total:.4f}s, gemm: {time_gemm_total:.4f}s)", flush=True)
-            print(f"    reshape: {t5 - t4:.4f}s, active_experts: {active_experts_count}, active_bits: {active_bits_count}", flush=True)
+        if self.enable_timing:
+            t5 = time.time()
+            self.last_timings = {
+                'total': t5 - t0,
+                'init': t1 - t0,
+                'shared': t_shared_end - t_shared_start,
+                'router': t_router_end - t_router_start,
+                'sort_scatter_prep': t_compute_start - t_router_end,
+                'compute': t_compute_end - t_compute_start,
+                'triton': time_triton_total,
+                'dequant': time_dequant_total,
+                'gemm': time_gemm_total,
+                'cleanup_reshape': t5 - t_compute_end,
+                'active_experts': active_experts_count,
+                'active_bits': active_bits_count,
+            }
+
+            # 打印详细时间（仅第一次 forward）
+            if not hasattr(self, '_log_printed'):
+                self._log_printed = True
+                lt = self.last_timings
+                print(f"  [WxA16BitPartitionedGroupMoE] forward total: {lt['total']:.4f}s", flush=True)
+                print(f"    init: {lt['init']:.4f}s, shared: {lt['shared']:.4f}s, router: {lt['router']:.4f}s", flush=True)
+                print(f"    compute: {lt['compute']:.4f}s (triton: {lt['triton']:.4f}s, dequant: {lt['dequant']:.4f}s, gemm: {lt['gemm']:.4f}s)", flush=True)
+                print(f"    reshape+cleanup: {lt['cleanup_reshape']:.4f}s, active_experts: {lt['active_experts']}, active_bits: {lt['active_bits']}", flush=True)
 
         return result
