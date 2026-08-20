@@ -38,32 +38,83 @@ norms (fp32) → acc * norms → output (fp32)
 在做大改动之前，先验证几个低开销的小优化，确认各自的收益量级。
 全部在 `test_triton_mp_moe_e2e_bench.py` 上测，有收益的再上 run.q.sh。
 
-### P3-a：旋转缓存上限 128 → 2048
+### P3-a：旋转缓存上限 128 → 2048 ✅ 已落地
 
 - **背景**：down 方向 seed 含 expert 偏移，每 forward 工作集 ~1032 个 key > 上限 128，
   导致每 forward 都发生缓存抖动，QR 重算 ~1160 次 ≈ 284ms（详见 profile 文档 §十 记录 4）
 - **改动**：`rotation.py` 的 `_MAX_CACHE_SIZE` 从 128 改到 2048
-- **预期收益**：mini_batch 尺度 ~25%（284ms / 1.1s），eval 尺度更小
 - **显存代价**：CPU ~66MB + GPU ~66MB（1032 个 128×128 矩阵 × 4B），可接受
 - **风险**：极低，一行改动
+- **实测结果**：
+  - 双模块陷阱排查：`turboquant_utils.rotation` 和 `turboquant_model.rotation` 是同一模块对象
+    （`sys.modules.setdefault` 别名机制），`_MAX_CACHE_SIZE = 2048` 已全局生效，无需重复修改
+  - mini-MoE e2e bench（16 experts）：几乎无收益（expert 少，工作集未超 128，本来就不抖）
+  - 真实 run.q.sh（256 experts）：收益应已包含在 gc 删除之前的 baseline 中，无法单独剥离
+- **结论**：改正确、零风险，已经生效；真实场景有收益但无法单独量化，留着即可。
 
-### P3-b：去掉 forward 末尾的 gc.collect() / empty_cache()
+### P3-b：去掉 forward 末尾的 gc.collect() / empty_cache() ✅ 已落地
 
 - **背景**：`WxA16BitPartitionedGroupMoE.forward` 末尾每轮都调 `gc.collect()` 和
   `torch.cuda.empty_cache()`。前者是 CPU 同步+扫描，后者触发 GPU 同步+释放，
-  在每 forward 都调的情况下可能贡献显著开销
-- **改动**：注释掉或加开关控制
-- **预期收益**：待实测（可能几 ms ~ 几十 ms）
-- **风险**：显存碎片可能增加，但推理阶段分配模式稳定，应该问题不大
+  在每 forward 都调的情况下贡献显著开销
+- **改动**：直接删除（不加开关）
+- **风险**：显存碎片可能增加，但推理阶段分配模式稳定，实际未发现问题
+- **实测结果**：
+  - mini-MoE e2e bench：~24% 加速（forward 末尾同步开销被移除后，triton 占比从 ~70% → 97.8%）
+  - 真实 run.q.sh：Layer 0 forward 从 ~19-20s → **12.51s**，约 **35-38%** 加速
+    （比 bench 幅度更大，可能因为 attention + MoE 叠加效应）
+- **结论**：本轮最大的"白捡"优化，已落地且效果显著。
 
-### P3-c：去掉 expert_offsets[expert_idx].item() 的 D2H 同步
+### P3-c：去掉 expert_offsets[expert_idx].item() 的 D2H 同步 ✅ 已落地
 
-- **背景**：per-expert 循环里 `start = int(expert_offsets[expert_idx].item())` 每次都触发
-  D2H 同步（CPU 等 GPU 把数值传回来）。num_experts × num_bits 次同步，累积开销可能不小
-- **改动**：提前把 `expert_offsets` 移到 CPU（`expert_offsets_cpu = offsets.cpu().tolist()`），
-  循环里直接读 Python list
-- **预期收益**：待实测
+- **背景**：per-expert × per-bit 循环里 `expert_offsets[expert_idx].item()` 每次触发
+  D2H 同步（CPU 等 GPU 返回一个整数）。256 experts × 2 bits = 1024 次/forward
+- **改动**：`expert_offsets` 加载时生成 CPU 常驻 Python list（`self._expert_offsets_cpu`），
+  循环里直接读 list 索引。加懒初始化兼容所有构造路径
 - **风险**：极低，不改变数值
+- **实测结果**（e2e bench，含完整 GPU 同步）：
+
+  | 配置 | 节省比例 | 绝对节省 |
+  |------|---------|---------|
+  | 16 experts, H=1024 | -2.3% | 0.59 ms |
+  | 64 experts, H=1024 | -3.0% | 2.07 ms |
+  | 256 experts, H=512 | **-5.9%** | 10.15 ms |
+
+  真实 run.q.sh（256 exp, H=2048）：Layer 0 从 12.51s → **12.31s**，约 **-1.6%**。
+  原因：大 H 下 kernel 计算占绝对主导，Python 同步开销被稀释。
+
+- **结论**：确定有效、零风险、改动极小，已落地。大 H 场景收益有限但白捡。
+
+### P3-d：scatter_reduce_ → index_add_ ✅ 已落地
+
+- **背景**：`final_hidden_states.scatter_reduce_(0, exp_token_idx.view(-1,1).repeat(1, H), ...)`
+  需要先把 1D index repeat 成 (M, H) 的大张量，每 expert 一次额外分配 + 拷贝
+- **改动**：改用 `final_hidden_states.index_add_(0, exp_token_idx, expert_out)`，
+  index 保持 1D，语义完全等价（dim=0 按行累加）
+- **风险**：极低，e2e 精度验证 max_diff = 0.0（完全一致）
+- **实测结果**（e2e bench）：
+
+  | 配置 | 节省比例 | 绝对节省 |
+  |------|---------|---------|
+  | 16 experts, H=1024 | -1.2% | 0.31 ms |
+  | 64 experts, H=1024 | -2.2% | 1.51 ms |
+  | 256 experts, H=512 | **-4.5%** | 7.76 ms |
+
+- **结论**：代码更简洁、零风险、数值完全一致，已落地。小 expert/大 B 场景收益小，
+  expert 多且每 expert token 少的场景收益更明显。
+
+### P3 小结
+
+| 优化 | e2e bench (256 exp) | run.q.sh (Layer 0) | 风险 | 状态 |
+|------|---------------------|---------------------|------|------|
+| P3-a 旋转缓存 2048 | 无法单独测（已生效） | 已包含在 baseline | 极低 | ✅ 已落地 |
+| P3-b 删 gc | ~24% | ~35%（19→12.5s） | 低 | ✅ 已落地 |
+| P3-c 去 .item() | ~5.9% | ~1.6%（12.51→12.31s） | 极低 | ✅ 已落地 |
+| P3-d index_add_ | ~4.5% | <1%（包含在上条内） | 极低 | ✅ 已落地 |
+
+P3 全部为"纯 overhead 消除、不碰计算逻辑"类优化，零风险或极低风险，累计 run.q.sh 上
+Layer 0 forward 从 ~19-20s → 12.31s，**约 36-38% 加速**。大头来自 P3-b（删 gc），
+其余几项是"白捡"的叠加收益。
 
 ---
 

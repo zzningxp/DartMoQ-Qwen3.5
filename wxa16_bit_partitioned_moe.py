@@ -183,7 +183,8 @@ class WxA16BitPartitionedGroupMoE(nn.Module):
 
         # expert 位置信息
         self.inter_size_by_bit = {}
-        self.expert_offsets = {}  # bit_str -> LongTensor
+        self.expert_offsets = {}  # bit_str -> LongTensor (GPU)
+        self._expert_offsets_cpu = {}  # bit_str -> List[int] (CPU 常驻，避免每 forward .item() D2H 同步)
 
         self.bit_list = []
 
@@ -273,6 +274,9 @@ class WxA16BitPartitionedGroupMoE(nn.Module):
 
             # 复制 offset 信息
             moe.expert_offsets[bit_str] = fp16_moe.expert_offsets[bit_str]
+            # CPU 常驻副本：每 expert×每 bit 两次 .item() 会触发 D2H 同步，
+            # 提前转成 Python list 后循环里直接读，零同步开销
+            moe._expert_offsets_cpu[bit_str] = fp16_moe.expert_offsets[bit_str].cpu().tolist()
             moe.inter_size_by_bit[bit] = fp16_moe.inter_size_by_bit[bit]
 
             moe.bit_weights[bit_str] = wxa16_weights
@@ -302,6 +306,13 @@ class WxA16BitPartitionedGroupMoE(nn.Module):
         x = hidden_states.reshape(-1, hidden_dim)
 
         final_hidden_states = torch.zeros_like(x)
+
+        # 懒初始化 CPU 端 expert_offsets（避免每轮 .item() D2H 同步）
+        # 兼容 from_build_block 和手动构造两种路径
+        if not self._expert_offsets_cpu:
+            for bit_str, offsets in self.expert_offsets.items():
+                self._expert_offsets_cpu[bit_str] = offsets.cpu().tolist()
+
         t1 = time.time()
 
         # Shared expert
@@ -377,10 +388,10 @@ class WxA16BitPartitionedGroupMoE(nn.Module):
                 active_bits_count += 1
 
                 wxa16_weights = self.bit_weights[bit_str]
-                expert_offsets = self.expert_offsets[bit_str]
+                offsets_cpu = self._expert_offsets_cpu[bit_str]
 
-                start = int(expert_offsets[expert_idx].item())
-                end = int(expert_offsets[expert_idx + 1].item())
+                start = offsets_cpu[expert_idx]
+                end = offsets_cpu[expert_idx + 1]
                 actual_inter_size = end - start
 
                 if actual_inter_size == 0:
@@ -431,13 +442,11 @@ class WxA16BitPartitionedGroupMoE(nn.Module):
                 # ==========================================
 
             # 累加回最终结果
+            # 用 index_add_ 替代 scatter_reduce_(sum)：
+            #   - 无需把 index 从 (M,) expand/repeat 到 (M, H)，省一次大张量分配+拷贝
+            #   - 语义完全等价（按行累加，dim=0）
             expert_out.mul_(expert_weights)
-            final_hidden_states.scatter_reduce_(
-                0,
-                exp_token_idx.view(-1, 1).repeat(1, x.shape[-1]),
-                expert_out,
-                reduce='sum'
-            )
+            final_hidden_states.index_add_(0, exp_token_idx, expert_out)
 
             del expert_out, expert_tokens, expert_weights, exp_token_idx
             # t1 = time.time()
