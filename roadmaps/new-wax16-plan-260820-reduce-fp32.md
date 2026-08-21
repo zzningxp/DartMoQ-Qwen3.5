@@ -167,6 +167,63 @@ FP16 accumulator 的精度影响需要验证：
 
 ---
 
+## P4：FP16 链路后的内核深度优化
+
+P2 FP16 改造完成后，kernel 计算从 TF32 切换到 FP16 Tensor Core，性能格局发生变化：
+- 2-bit kernel 加速明显（~1.3x+），计算仍是瓶颈，FP16 吃得满
+- 4-bit kernel 加速有限（~1.0x），瓶颈从计算转向 unpack + codebook lookup
+- 固定 block size 配置可能不再是 fp16 下的最优解
+
+### 优先级排序
+
+| # | 优化项 | 预期收益 | 难度 | 状态 |
+|---|--------|---------|------|------|
+| 1 | 4-bit unpack / codebook lookup 向量化优化 | 高（4-bit 瓶颈突破） | 中 | ⏳ 待做 |
+| 2 | Block size / num_warps / num_stages 离线调优 | 中（5-20%） | 低 | ⏳ 待做 |
+| 3 | Gate-Up epilogue 融合（silu+mul 合进 kernel） | 中高（gate_up 省 20-30%） | 低 | ⏳ 待做 |
+| 4 | 多 group 合并到一次 kernel launch | 高（20-30% e2e） | 中高 | ⏳ 待做 |
+| 5 | 旋转跨 bit 复用 + dual matmul 接入 | 中 | 中 | ⏳ 待做 |
+| 6 | Grouped GEMM 化（同 bit 多 expert 一次 kernel） | 高 | 高 | ⏳ 待做 |
+
+### P4-1：4-bit unpack / codebook lookup 向量化优化（最高优先级）
+
+**背景**：
+- FP16 改造后，2-bit kernel 加速 ~1.3x，4-bit 几乎不加速
+- 说明 4-bit 的瓶颈在 unpack + codebook lookup，不在 Tensor Core 计算
+- 4-bit 占 50% 神经元，突破 4-bit 瓶颈对整体性能影响很大
+
+**优化方向**：
+1. **Vectorized load**：一次加载 32-bit / 64-bit / 128-bit，一次 unpack 多个元素
+   - 当前逐 byte 加载 + 逐 element 移位，内存访问粒度小
+   - 用 `tl.load` 加载更大的 vector（如 `<64, uint32>`），然后位运算批量 unpack
+2. **Codebook lookup 模式优化**：
+   - 检查当前 gather 模式是否 coalesced
+   - 考虑按 N 维度 reorder 权重改善 locality
+3. **Bit-packing 布局重排**：
+   - 调整 packed 数据的存储顺序，使同一 warp 的 thread 访问连续的内存地址
+   - 改善 memory coalescing
+
+**预期收益**：4-bit kernel 提速 20-40%，整体 e2e 提速 10-20%
+
+### P4-2：Block size / num_warps 离线调优
+
+**背景**：
+- 当前固定配置：BLOCK_B=16, BLOCK_N=64, BLOCK_K=64，num_warps 默认（通常 4）
+- FP16 后寄存器压力降低，可能可以用更大的 block 或更多 warps
+- 2-bit 和 4-bit 的计算/访存比不同，最优配置可能不同
+- 不用 autotune（首次编译开销太大），离线扫几组参数硬编码最优值
+
+**调优参数**：
+- BLOCK_B: 16, 32, 64
+- BLOCK_N: 32, 64, 128, 256
+- BLOCK_K: 32, 64, 128
+- num_warps: 4, 8
+- num_stages: 2, 3, 4
+
+**测试形状**：对齐真实 MoE 的 per-expert 形状（B≈32-128, N=neurons, K=128 per group）
+
+---
+
 ## P3 快速验证项（低风险，先逐个试）
 
 在做大改动之前，先验证几个低开销的小优化，确认各自的收益量级。
