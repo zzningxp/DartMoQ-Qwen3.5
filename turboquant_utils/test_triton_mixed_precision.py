@@ -66,10 +66,11 @@ def quantize_weight_simple(W, bit_width=4, group_size=None, seed=42):
 
     packed = pack_nbit(full_indices, bit_width)
 
+    # Step 2 (FP16 链路改造): codebook 和 norms 存 fp16，与主流程 quantize.py 一致
     return {
         "indices_packed": packed,
-        "codebook": centroids,
-        "norms": norms_out,
+        "codebook": centroids.half(),
+        "norms": norms_out.half(),
         "seed": seed,
         "group_size": group_size,
         "bit_width": bit_width,
@@ -129,6 +130,10 @@ def dequantize_weight_simple(packed_data, W_shape):
     device = indices_packed.device
 
     full_indices = unpack_nbit(indices_packed, bit_width, K)
+
+    # Step 2: baseline 反量化用 fp32 高精度计算（codebook/norms 从 fp16 转回 fp32）
+    codebook = codebook.float()
+    norms = norms.float()
 
     if norms.dim() == 1:
         norms = norms.unsqueeze(1)

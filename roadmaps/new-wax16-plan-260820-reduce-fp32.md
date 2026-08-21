@@ -33,6 +33,135 @@ norms (fp32) → acc * norms → output (fp32)
 
 ---
 
+## P2：FP16 链路改造（核心优化）
+
+### 目标
+
+kernel 内整个计算链路改为 fp16：
+- codebook: fp32 → fp16
+- norms: fp32 → fp16
+- accumulator: fp32 → fp16
+- output: fp32 → fp16
+- tl.dot: fp16 × fp16 → FP16 Tensor Core（而非 TF32）
+
+### 预期收益
+
+**理论上限 2~3 倍**（FP16 Tensor Core 吞吐 vs TF32）。
+实际收益受限于：
+- 内存带宽是否饱和（如果瓶颈在访存，计算再快也没用）
+- 寄存器释放后能否提升并行度
+- 小形状下 launch overhead 占比高
+
+纯 kernel 层面预计 1.5~2 倍加速，端到端预计 +10~30%（因为 kernel 只占总时间的一部分）。
+
+### 改动范围
+
+#### 1. `quantize.py`：codebook 和 norms 的 dtype
+
+- `get_codebook()` 返回 fp16 版本（或调用方 cast）
+- `turboquant_quantize_packed_full()` 中 norms 存 fp16
+- packed_data dict 里增加 dtype 信息
+- **注意**：需要保证量化精度不明显下降。codebook 从 fp32 降到 fp16 的误差应该很小
+  （码本值本身就是标量，fp16 精度足够）
+
+#### 2. `triton_kernels.py`：kernel 内类型
+
+- `_turboquant_fused_matmul_kernel_nbit`：
+  - codebook_ptr 元素类型从 fp32 → fp16
+  - norms_ptr 元素类型从 fp32 → fp16
+  - acc dtype 从 tl.float32 → tl.float16
+  - tl.dot 去掉 allow_tf32（fp16 × fp16 直接走 FP16 Tensor Core）
+  - output 从 fp32 → fp16
+- 所有 wrapper 函数（`triton_fused_matmul` / grouped / slice_rows / slice_in_features）：
+  - output tensor 从 float32 → float16
+  - 输入输出 dtype 校验
+
+#### 3. `wxa16_bit_partitioned_moe.py`：forward 内类型
+
+- gate_up_out / down_out 当前是 fp32（来自 kernel 输出），改成 fp16
+- silu + mul 在 fp16 下进行（本来就是，因为输入 x 是 fp16）
+- `expert_out` 的初始零张量 dtype 可能需要调整
+
+### 精度验证
+
+FP16 accumulator 的精度影响需要验证：
+1. **单 kernel 精度**：对比 fp32 acc vs fp16 acc 的输出误差
+2. **端到端精度**：e2e bench 里 Triton vs FP16 reference 的误差是否增大
+3. **PPL 精度**：最终需要 run.q.sh 验证 ppl 影响
+
+阈值参考：当前 fp32 accumulator 下相对误差 ~0.3%，如果 fp16 accumulator 后
+误差在 1% 以内应该可以接受。
+
+### 实施步骤（三步走，风险递进，每步都有可停的中间态）
+
+#### Step 1：只改 output dtype（fp32→fp16），accumulator 保持 fp32 ✅ 代码完成
+
+- **改动**：
+  - kernel 内 `acc` 还是 fp32，`tl.dot` 还是 TF32，store 时 `acc.to(tl.float16)`
+  - 四个 wrapper（`triton_fused_matmul` / grouped / slice_rows / slice_in_features）
+    的 output tensor 从 `torch.float32` → `torch.float16`
+  - Python 端 `output = torch.zeros(..., dtype=torch.float32)` 全部改 fp16
+  - forward 中 `expert_out = torch.zeros_like(expert_tokens)` 自动 fp16（因为输入是 fp16）
+- **预期收益**：~5-10%（省输出带宽 50% + 下游 silu/mul/scatter 从 fp32 降回 fp16）
+- **风险**：极低。accumulator 还是 fp32，数值精度不变（只是最后 trunc 到 fp16）
+- **目的**：打通 fp16 输出链路，确认 Python 端所有下游操作在 fp16 下正常工作
+
+#### Step 2：codebook + norms + 旋转输入 改为 fp16，accumulator 保持 fp32 🔧 开发中
+
+- **改动**：
+  - `quantize.py`：`turboquant_quantize_packed_full` 中 codebook 和 norms 存 fp16
+    （`.half()` 后存入 result dict）
+  - `triton_kernels.py` grouped 系列函数：旋转计算从 fp32 降到 fp16
+    - `generate_rotation_matrix(...).half()` 旋转矩阵转 fp16
+    - `x[:, g_start:g_end] @ Pi.T` 去掉 `.float()`，直接 fp16 × fp16
+    - 目的：使 tl.dot 两边都是 fp16，走 FP16 Tensor Core
+  - kernel 内：`codebook_ptr` / `norms_ptr` 元素类型自动为 fp16，
+    `w_quant` 自动 fp16，`tl.dot` 两边 fp16 → FP16 Tensor Core
+  - 测试程序：`quantize_weight_simple` 返回 fp16 codebook/norms，
+    `dequantize_weight_simple` 转回 fp32 做高精度 baseline
+- **关键约束**：Triton `tl.dot` 要求两边 operand dtype 必须相同，
+  所以 codebook 改 fp16 必须同时把输入 x_rot 也改成 fp16
+- **预期收益**：~10-20%（codebook/norms 带宽减半 + FP16 Tensor Core + 旋转计算降精度）
+- **风险**：低。codebook fp32→fp16 误差极小，旋转 fp16 误差也很小，
+  accumulator 仍为 fp32，不影响累加精度
+
+#### Step 3：accumulator 改为 fp16（完整 FP16 链路）🔧 开发中
+
+- **改动**：
+  - kernel 内 `acc = tl.zeros(dtype=tl.float16)`
+  - `tl.dot` 加 `out_dtype=tl.float16`（Triton tl.dot 默认返回 fp32，需显式指定）
+  - 去掉 `allow_tf32=True`（fp16 输入下无效）
+  - 两个 kernel（单 matmul + dual matmul）同步修改
+- **关键坑**：Triton `tl.dot(fp16, fp16)` 默认返回 fp32，需要 `out_dtype=tl.float16`
+  才能让累加器保持 fp16，否则会报 loop-carried variable type mismatch 错误
+- **预期收益**：较小。因为 Step 2 已经让 tl.dot 走 FP16 Tensor Core 了，
+  Step 3 只是累加器从 fp32 变 fp16，主要收益是寄存器压力降低 → 可能提高并行度，
+  但当前 BLOCK_B=16, BLOCK_N=64 配置下提升不明显
+- **实测**：e2e 性能几乎不变（~125ms → ~126ms，在测量误差内）
+- **风险**：中。需验证 FP16 accumulator 对 PPL 的影响
+  - 溢出风险低：K=128，权重归一化，累加值 ≈128，远小于 fp16 max=65504
+  - 精度影响：单 kernel 约 0.05% mean_diff/std（额外于 Step 2 的 0.08%）
+- **回退**：精度不达标就退回到 Step 2（fp16 输入 + fp32 累加）
+
+### 风险与回退
+
+- **精度下降**：如果 PPL 影响不可接受，回退到 fp16 输入 + fp32 累加（Step 2）
+- **kernel 编译问题**：Triton 对 fp16 accumulator 的支持可能需要特殊处理
+  （如某些架构下 fp16 dot 需要特定配置）
+- **溢出风险**：fp16 范围有限（max 65504），如果累加值过大可能上溢。
+  但 TurboQuant 是归一化量化，权重 norm 后幅值 ≈ 1，累加 K=128 个乘积，
+  每个乘积 ≈ 1，总和 ≈ 128，远小于 fp16 上限。溢出风险低。
+
+### P2 进度追踪
+
+| Step | 单 kernel 精度 | e2e 精度 | e2e 性能 | run.q.sh 性能 | run.q.sh PPL | 状态 |
+|------|--------------|----------|----------|---------------|--------------|------|
+| Step 1: output fp16 | ✅ | ✅ | ⏳ | ⏳ | ⏳ | 代码完成 |
+| Step 2: codebook+norms+rot fp16 | ✅ | ✅ | ⏳ | ⏳ | ⏳ | 代码完成 |
+| Step 3: acc fp16 | ✅ | ✅ | ⏳ | ⏳ | ⏳ | 代码完成，待 PPL 验证 |
+
+---
+
 ## P3 快速验证项（低风险，先逐个试）
 
 在做大改动之前，先验证几个低开销的小优化，确认各自的收益量级。
@@ -117,118 +246,6 @@ Layer 0 forward 从 ~19-20s → 12.31s，**约 36-38% 加速**。大头来自 P3
 其余几项是"白捡"的叠加收益。
 
 ---
-
-## P2：FP16 链路改造（核心优化）
-
-### 目标
-
-kernel 内整个计算链路改为 fp16：
-- codebook: fp32 → fp16
-- norms: fp32 → fp16
-- accumulator: fp32 → fp16
-- output: fp32 → fp16
-- tl.dot: fp16 × fp16 → FP16 Tensor Core（而非 TF32）
-
-### 预期收益
-
-**理论上限 2~3 倍**（FP16 Tensor Core 吞吐 vs TF32）。
-实际收益受限于：
-- 内存带宽是否饱和（如果瓶颈在访存，计算再快也没用）
-- 寄存器释放后能否提升并行度
-- 小形状下 launch overhead 占比高
-
-纯 kernel 层面预计 1.5~2 倍加速，端到端预计 +10~30%（因为 kernel 只占总时间的一部分）。
-
-### 改动范围
-
-#### 1. `quantize.py`：codebook 和 norms 的 dtype
-
-- `get_codebook()` 返回 fp16 版本（或调用方 cast）
-- `turboquant_quantize_packed_full()` 中 norms 存 fp16
-- packed_data dict 里增加 dtype 信息
-- **注意**：需要保证量化精度不明显下降。codebook 从 fp32 降到 fp16 的误差应该很小
-  （码本值本身就是标量，fp16 精度足够）
-
-#### 2. `triton_kernels.py`：kernel 内类型
-
-- `_turboquant_fused_matmul_kernel_nbit`：
-  - codebook_ptr 元素类型从 fp32 → fp16
-  - norms_ptr 元素类型从 fp32 → fp16
-  - acc dtype 从 tl.float32 → tl.float16
-  - tl.dot 去掉 allow_tf32（fp16 × fp16 直接走 FP16 Tensor Core）
-  - output 从 fp32 → fp16
-- 所有 wrapper 函数（`triton_fused_matmul` / grouped / slice_rows / slice_in_features）：
-  - output tensor 从 float32 → float16
-  - 输入输出 dtype 校验
-
-#### 3. `wxa16_bit_partitioned_moe.py`：forward 内类型
-
-- gate_up_out / down_out 当前是 fp32（来自 kernel 输出），改成 fp16
-- silu + mul 在 fp16 下进行（本来就是，因为输入 x 是 fp16）
-- `expert_out` 的初始零张量 dtype 可能需要调整
-
-### 精度验证
-
-FP16 accumulator 的精度影响需要验证：
-1. **单 kernel 精度**：对比 fp32 acc vs fp16 acc 的输出误差
-2. **端到端精度**：e2e bench 里 Triton vs FP16 reference 的误差是否增大
-3. **PPL 精度**：最终需要 run.q.sh 验证 ppl 影响
-
-阈值参考：当前 fp32 accumulator 下相对误差 ~0.3%，如果 fp16 accumulator 后
-误差在 1% 以内应该可以接受。
-
-### 实施步骤（三步走，风险递进，每步都有可停的中间态）
-
-#### Step 1：只改 output dtype（fp32→fp16），accumulator 保持 fp32 ⏳ 进行中
-
-- **改动**：
-  - kernel 内 `acc` 还是 fp32，`tl.dot` 还是 TF32，store 时 `acc.to(tl.float16)`
-  - 四个 wrapper（`triton_fused_matmul` / grouped / slice_rows / slice_in_features）
-    的 output tensor 从 `torch.float32` → `torch.float16`
-  - Python 端 `output = torch.zeros(..., dtype=torch.float32)` 全部改 fp16
-  - forward 中 `expert_out = torch.zeros_like(expert_tokens)` 自动 fp16（因为输入是 fp16）
-- **预期收益**：~5-10%（省输出带宽 50% + 下游 silu/mul/scatter 从 fp32 降回 fp16）
-- **风险**：极低。accumulator 还是 fp32，数值精度不变（只是最后 trunc 到 fp16）
-- **目的**：打通 fp16 输出链路，确认 Python 端所有下游操作在 fp16 下正常工作
-
-#### Step 2：codebook + norms 改为 fp16，accumulator 保持 fp32 ⏳ 待做
-
-- **改动**：
-  - `quantize.py`：`turboquant_quantize_packed_full` 中 codebook 和 norms 存 fp16
-  - kernel 内：`codebook_ptr` / `norms_ptr` 元素类型 fp16，`w_quant` 自动 fp16
-  - `tl.dot(inp_tile fp16, w_quant fp16, allow_tf32=?)` → 两边都是 fp16
-- **关键待验证**：两边 fp16 时 Triton 实际走 FP16 Tensor Core 还是仍走 TF32？
-- **预期收益**：~10-20%（codebook/norms 带宽减半 + 可能的 FP16 Tensor Core 部分提升）
-- **风险**：低。codebook 从 fp32→fp16 误差极小（码本值是归一化标量），
-  accumulator 仍为 fp32，不影响累加精度
-
-#### Step 3：accumulator 改为 fp16（完整 FP16 链路）⏳ 待做
-
-- **改动**：
-  - kernel 内 `acc = tl.zeros(dtype=tl.float16)`，去掉 `allow_tf32=True`
-  - 全程 fp16 计算 → FP16 Tensor Core
-- **预期收益**：理论上限 2~3x kernel 级；端到端预计 15-30%
-  （kernel 占 ~97%，但实际受带宽/寄存器等制约）
-- **风险**：中。需验证 FP16 accumulator 对 PPL 的影响
-  - 溢出风险低：K=128，权重归一化，累加值 ≈128，远小于 fp16 max=65504
-- **回退**：精度不达标就退回到 Step 2（fp16 输入 + fp32 累加）
-
-### 风险与回退
-
-- **精度下降**：如果 PPL 影响不可接受，回退到 fp16 输入 + fp32 累加（Step 2）
-- **kernel 编译问题**：Triton 对 fp16 accumulator 的支持可能需要特殊处理
-  （如某些架构下 fp16 dot 需要特定配置）
-- **溢出风险**：fp16 范围有限（max 65504），如果累加值过大可能上溢。
-  但 TurboQuant 是归一化量化，权重 norm 后幅值 ≈ 1，累加 K=128 个乘积，
-  每个乘积 ≈ 1，总和 ≈ 128，远小于 fp16 上限。溢出风险低。
-
-### P2 进度追踪
-
-| Step | 单 kernel 精度 | e2e 精度 | e2e 性能 | run.q.sh 性能 | run.q.sh PPL | 状态 |
-|------|--------------|----------|----------|---------------|--------------|------|
-| Step 1: output fp16 | ⏳ | ⏳ | ⏳ | ⏳ | ⏳ | 进行中 |
-| Step 2: codebook+norms fp16 | ⏳ | ⏳ | ⏳ | ⏳ | ⏳ | 待做 |
-| Step 3: acc fp16 | ⏳ | ⏳ | ⏳ | ⏳ | ⏳ | 待做 |
 
 ---
 

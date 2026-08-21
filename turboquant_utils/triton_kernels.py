@@ -45,8 +45,8 @@ def _turboquant_fused_matmul_kernel_nbit(
     input_ptr,        # (B, K) pre-rotated activations
     # Quantized weight
     indices_ptr,      # (N, PACKED_K) packed uint8
-    codebook_ptr,     # (n_levels,) float32
-    norms_ptr,        # (N,) float32 — pre-scaled by 1/scale on host
+    codebook_ptr,     # (n_levels,) float16 — Step 2: codebook 改为 fp16
+    norms_ptr,        # (N,) float16 — pre-scaled by 1/scale on host, Step 2: fp16
     # Output
     output_ptr,       # (B, N)
     # Dims
@@ -79,7 +79,11 @@ def _turboquant_fused_matmul_kernel_nbit(
     mask_b = rb < B
     mask_n = rn < N
 
-    acc = tl.zeros((BLOCK_B, BLOCK_N), dtype=tl.float32)
+    # Step 3 (FP16 链路改造): accumulator 改为 fp16，完整 FP16 链路
+    # - tl.dot 两边都是 fp16 → FP16 Tensor Core
+    # - 累加在 fp16 下进行（K=128, 权重归一化，累加值≈128，远小于 fp16 max=65504）
+    # - 去掉 allow_tf32（fp16 输入下无效）
+    acc = tl.zeros((BLOCK_B, BLOCK_N), dtype=tl.float16)
 
     ELEMENTS_PER_BYTE = 8 // BIT_WIDTH
 
@@ -117,7 +121,7 @@ def _turboquant_fused_matmul_kernel_nbit(
         acc += tl.dot(
             inp_tile,
             tl.trans(w_quant),
-            allow_tf32=True,
+            out_dtype=tl.float16,
         )
 
     norm_vals = tl.load(norms_ptr + rn, mask=mask_n, other=1.0)
@@ -147,10 +151,18 @@ def triton_fused_matmul(
     if scale is None:
         scale = math.sqrt(K)
 
+    # 统一在 fp16 下计算（FP16 Tensor Core 吞吐最高）
+    # 输入为 bf16/fp32 时自动转 fp16，输出再转回原 dtype
+    orig_dtype = x_rot.dtype
+    if orig_dtype != torch.float16:
+        x_rot = x_rot.half()
+        codebook = codebook.half()
+        norms = norms.half()
+
+    # Step 2: norms 已是 fp16，除以 scale 后仍为 fp16
     norms_scaled = norms / scale
 
-    # Step 1 (FP16 链路改造): output 改为 fp16，accumulator 仍为 fp32
-    # kernel 内 acc.to(output_ptr.dtype.element_ty) 会自动适配输出类型
+    # 输出为 fp16（kernel 内部链路全 fp16）
     output = torch.empty(B, N, dtype=torch.float16, device=x_rot.device)
 
     grid = (
@@ -165,6 +177,10 @@ def triton_fused_matmul(
         BIT_WIDTH=bit_width,
     )
 
+    # 输出转回原 dtype（如 bf16）
+    if orig_dtype != torch.float16:
+        output = output.to(orig_dtype)
+
     return output
 
 
@@ -172,12 +188,12 @@ def triton_fused_matmul(
 def _turboquant_fused_dual_matmul_kernel_nbit(
     input1_ptr,
     indices1_ptr,
-    codebook1_ptr,
-    norms1_ptr,
+    codebook1_ptr,  # (n_levels,) float16 — Step 2: codebook 改为 fp16
+    norms1_ptr,     # (N,) float16 — Step 2: norms 改为 fp16
     input2_ptr,
     indices2_ptr,
-    codebook2_ptr,
-    norms2_ptr,
+    codebook2_ptr,  # (n_levels,) float16 — Step 2: codebook 改为 fp16
+    norms2_ptr,     # (N,) float16 — Step 2: norms 改为 fp16
     output_ptr,
     B, N, K,
     PACKED_K,
@@ -196,8 +212,9 @@ def _turboquant_fused_dual_matmul_kernel_nbit(
     mask_b = rb < B
     mask_n = rn < N
 
-    acc1 = tl.zeros((BLOCK_B, BLOCK_N), dtype=tl.float32)
-    acc2 = tl.zeros((BLOCK_B, BLOCK_N), dtype=tl.float32)
+    # Step 3: accumulator 改为 fp16，完整 FP16 链路
+    acc1 = tl.zeros((BLOCK_B, BLOCK_N), dtype=tl.float16)
+    acc2 = tl.zeros((BLOCK_B, BLOCK_N), dtype=tl.float16)
 
     ELEMENTS_PER_BYTE = 8 // BIT_WIDTH
 
@@ -216,7 +233,7 @@ def _turboquant_fused_dual_matmul_kernel_nbit(
             idx1 = tl.load(indices1_ptr + byte_off, mask=w_mask, other=0).to(tl.int32)
             w1 = tl.load(codebook1_ptr + idx1, mask=w_mask, other=0.0)
 
-            acc1 += tl.dot(inp1, tl.trans(w1), allow_tf32=True)
+            acc1 += tl.dot(inp1, tl.trans(w1))
 
             if SAME_INPUT:
                 inp2 = inp1
@@ -227,7 +244,7 @@ def _turboquant_fused_dual_matmul_kernel_nbit(
             idx2 = tl.load(indices2_ptr + byte_off, mask=w_mask, other=0).to(tl.int32)
             w2 = tl.load(codebook2_ptr + idx2, mask=w_mask, other=0.0)
 
-            acc2 += tl.dot(inp2, tl.trans(w2), allow_tf32=True)
+            acc2 += tl.dot(inp2, tl.trans(w2))
         else:
             # 1/2/4-bit: need bit unpacking
             BIT_MASK = (1 << BIT_WIDTH) - 1
@@ -242,7 +259,7 @@ def _turboquant_fused_dual_matmul_kernel_nbit(
             idx1 = idx1.to(tl.int32)
             w1 = tl.load(codebook1_ptr + idx1, mask=w_mask, other=0.0)
 
-            acc1 += tl.dot(inp1, tl.trans(w1), allow_tf32=True)
+            acc1 += tl.dot(inp1, tl.trans(w1))
 
             if SAME_INPUT:
                 inp2 = inp1
@@ -255,7 +272,7 @@ def _turboquant_fused_dual_matmul_kernel_nbit(
             idx2 = idx2.to(tl.int32)
             w2 = tl.load(codebook2_ptr + idx2, mask=w_mask, other=0.0)
 
-            acc2 += tl.dot(inp2, tl.trans(w2), allow_tf32=True)
+            acc2 += tl.dot(inp2, tl.trans(w2))
 
     n1 = tl.load(norms1_ptr + rn, mask=mask_n, other=1.0)
     n2 = tl.load(norms2_ptr + rn, mask=mask_n, other=1.0)
@@ -288,12 +305,22 @@ def triton_fused_dual_matmul(
     if scale is None:
         scale = math.sqrt(K)
 
+    # 统一在 fp16 下计算
+    orig_dtype = x_rot1.dtype
+    if orig_dtype != torch.float16:
+        x_rot1 = x_rot1.half()
+        x_rot2 = x_rot2.half()
+        codebook1 = codebook1.half()
+        codebook2 = codebook2.half()
+        norms1 = norms1.half()
+        norms2 = norms2.half()
+
     norms1_scaled = norms1 / scale
     norms2_scaled = norms2 / scale
 
     same_input = x_rot1.data_ptr() == x_rot2.data_ptr()
 
-    output = torch.empty(B, N, dtype=torch.float16, device=x_rot1.device)  # Step 1: output fp16
+    output = torch.empty(B, N, dtype=torch.float16, device=x_rot1.device)
 
     grid = (
         triton.cdiv(B, 16),
@@ -309,6 +336,10 @@ def triton_fused_dual_matmul(
         BIT_WIDTH=bit_width,
         SAME_INPUT=1 if same_input else 0,
     )
+
+    # 输出转回原 dtype
+    if orig_dtype != torch.float16:
+        output = output.to(orig_dtype)
 
     return output
 
@@ -330,6 +361,10 @@ def triton_fused_matmul_grouped(
         norms = norms.unsqueeze(1)
 
     # Pre-compute all rotations first
+    # Step 2 (FP16 链路改造): 旋转计算与输入同 dtype（fp16/bf16）
+    # - 旋转矩阵 Pi 从 fp32 转到 x.dtype（正交矩阵元素在 [-1,1]，低精度足够）
+    # - 输入 x 保持原 dtype，不再 .float() 升 fp32
+    # - 目的: tl.dot 两边 dtype 一致，走对应精度的 Tensor Core
     num_groups = (in_features + group_size - 1) // group_size
     x_rot_list = []
     for group_idx in range(num_groups):
@@ -337,12 +372,11 @@ def triton_fused_matmul_grouped(
         g_end = min(g_start + group_size, in_features)
         g_dim = g_end - g_start
 
-        Pi = generate_rotation_matrix(g_dim, seed + g_start, device=x.device)
-        x_g = x[:, g_start:g_end].float()
-        x_rot_g = x_g @ Pi.T
+        Pi = generate_rotation_matrix(g_dim, seed + g_start, device=x.device).to(x.dtype)
+        x_rot_g = x[:, g_start:g_end] @ Pi.T
         x_rot_list.append(x_rot_g)
 
-    output = torch.zeros(batch_size, out_features, dtype=torch.float16, device=x.device)  # Step 1: output fp16
+    output = torch.zeros(batch_size, out_features, dtype=x.dtype, device=x.device)  # Step 1: output 与输入同 dtype
 
     group_idx = 0
     for g_start in range(0, in_features, group_size):
@@ -390,6 +424,7 @@ def triton_fused_matmul_grouped_slice_rows(
         norms_slice = norms_slice.unsqueeze(1)
 
     # Pre-compute all rotations first
+    # Step 2: 旋转计算改为 fp16（同 triton_fused_matmul_grouped）
     num_groups = (in_features + group_size - 1) // group_size
     x_rot_list = []
     for group_idx in range(num_groups):
@@ -397,12 +432,11 @@ def triton_fused_matmul_grouped_slice_rows(
         g_end = min(g_start + group_size, in_features)
         g_dim = g_end - g_start
 
-        Pi = generate_rotation_matrix(g_dim, seed + g_start, device=x.device)
-        x_g = x[:, g_start:g_end].float()
-        x_rot_g = x_g @ Pi.T
+        Pi = generate_rotation_matrix(g_dim, seed + g_start, device=x.device).to(x.dtype)
+        x_rot_g = x[:, g_start:g_end] @ Pi.T
         x_rot_list.append(x_rot_g)
 
-    output = torch.zeros(batch_size, slice_out_features, dtype=torch.float16, device=x.device)  # Step 1: output fp16
+    output = torch.zeros(batch_size, slice_out_features, dtype=x.dtype, device=x.device)  # 输出与输入同 dtype
 
     group_idx = 0
     for g_start in range(0, in_features, group_size):
@@ -450,6 +484,7 @@ def triton_fused_matmul_grouped_slice_in_features(
         norms = norms.unsqueeze(1)
 
     # Pre-compute all rotations first
+    # Step 2: 旋转计算改为 fp16（同 triton_fused_matmul_grouped）
     num_groups_in_slice = (slice_in_features + group_size - 1) // group_size
     x_rot_list = []
     for group_idx_in_slice in range(num_groups_in_slice):
@@ -459,12 +494,11 @@ def triton_fused_matmul_grouped_slice_in_features(
 
         g_start_original = original_start + g_start_in_slice
 
-        Pi = generate_rotation_matrix(g_dim, seed + g_start_original, device=x.device)
-        x_g = x[:, g_start_in_slice:g_end_in_slice].float()
-        x_rot_g = x_g @ Pi.T
+        Pi = generate_rotation_matrix(g_dim, seed + g_start_original, device=x.device).to(x.dtype)
+        x_rot_g = x[:, g_start_in_slice:g_end_in_slice] @ Pi.T
         x_rot_list.append(x_rot_g)
 
-    output = torch.zeros(batch_size, out_features, dtype=torch.float16, device=x.device)  # Step 1: output fp16
+    output = torch.zeros(batch_size, out_features, dtype=x.dtype, device=x.device)  # 输出与输入同 dtype
 
     group_idx_in_slice = 0
     for g_start_in_slice in range(0, slice_in_features, group_size):

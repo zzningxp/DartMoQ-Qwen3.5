@@ -424,10 +424,14 @@ def turboquant_quantize_packed_full(
     # 准备输出
     target_device = W.device if keep_on_gpu else "cpu"
 
+    # Step 2 (FP16 链路改造): codebook 和 norms 存 fp16
+    # - codebook: 码本值是归一化标量，fp16 精度足够，误差极小
+    # - norms: 行范数值，fp16 精度足够（范围通常在 ~1 左右）
+    # 好处: 减少显存带宽，kernel 内 tl.dot 两边都是 fp16，可走 FP16 Tensor Core
     result = {
         "indices_packed": packed.to(target_device),
-        "codebook": centroids.to("cpu"),  # 码本始终放 CPU，因为小且只读
-        "norms": norms_out.to(target_device),
+        "codebook": centroids.half().to("cpu"),  # 码本始终放 CPU，fp16 存储
+        "norms": norms_out.half().to(target_device),  # norms 也改为 fp16
         "seed": seed,
         "group_size": group_size,
         "shape": (M, N),
@@ -471,6 +475,10 @@ def turboquant_dequantize_packed(packed_data: dict, device: Optional[torch.devic
         indices_packed = indices_packed.to(device)
         norms = norms.to(device)
     codebook = codebook.to(device)
+
+    # Step 2: 反量化用 fp32 高精度计算
+    codebook = codebook.float()
+    norms = norms.float()
 
     M, N = shape
 
@@ -560,6 +568,11 @@ def turboquant_dequantize_packed_rows(
         indices_packed = indices_packed.to(device)
         norms = norms.to(device)
     codebook = codebook.to(device)
+
+    # Step 2: 反量化用 fp32 高精度计算（codebook/norms 从 fp16 转回 fp32）
+    # 反量化是参考/离线路径，不追求性能，精度优先
+    codebook = codebook.float()
+    norms = norms.float()
 
     M, N = shape
 
@@ -675,6 +688,10 @@ def turboquant_dequantize_packed_cols(
         indices_packed = indices_packed.to(device)
         norms = norms.to(device)
     codebook = codebook.to(device)
+
+    # Step 2: 反量化用 fp32 高精度计算
+    codebook = codebook.float()
+    norms = norms.float()
 
     M, N = shape
 

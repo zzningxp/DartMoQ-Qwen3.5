@@ -514,7 +514,7 @@ def main():
         num_groups = args.hidden_size // args.group_size
         total_packed_bytes += total_neurons_bit * 2 * num_groups * 2  # gate_up norms
         total_packed_bytes += args.hidden_size * num_groups * 2        # down norms
-        # codebook (fp32, 很小忽略)
+        # codebook (fp16, 很小忽略) — Step 2: codebook 已改为 fp16
 
     print(f"\n权重规模估算:")
     print(f"  packed 总大小 ≈    {total_packed_bytes / 1024**2:.1f} MB")
