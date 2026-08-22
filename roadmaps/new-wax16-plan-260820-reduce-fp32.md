@@ -179,7 +179,7 @@ P2 FP16 改造完成后，kernel 计算从 TF32 切换到 FP16 Tensor Core，性
 | # | 优化项 | 预期收益 | 难度 | 状态 |
 |---|--------|---------|------|------|
 | 1 | **多 group 融合到单个 kernel launch**（P4-4） | **高（e2e 2.04x，per-kernel 2-11x）** | 中高 | ✅ 已完成 |
-| 2 | Block size / num_warps / num_stages 离线调优（P4-2） | 中（5-15%） | 低 | ⏳ 待做 |
+| 2 | Block size / num_warps / num_stages 离线调优（P4-2） | 中（e2e ~10%, per-kernel 1.4-2x） | 低 | ✅ 已完成 |
 | 3 | Gate-Up epilogue 融合（silu+mul 合进 kernel）（P4-3） | 中（gate_up 省 15-25%） | 低 | ⏳ 待做 |
 | 4 | 4-bit codebook gather 深度优化（P4-1） | 中低（大 K 场景收益大，per-group 小） | 中 | ⏳ 待做 |
 | 5 | 旋转跨 bit 复用 + dual matmul 接入（P4-5） | 中 | 中 | ⏳ 待做 |
@@ -318,22 +318,42 @@ dequant + matmul，乘 norms 后累加到 total_acc。x_rot 在 Python 侧预计
 
 ---
 
-### P4-2：Block size / num_warps 离线调优
+### P4-2：Block size / num_warps 离线调优 ✅ 已完成
 
 **背景**：
-- 当前固定配置：BLOCK_B=16, BLOCK_N=64, BLOCK_K=64，num_warps 默认（通常 4）
-- FP16 后寄存器压力降低，可能可以用更大的 block 或更多 warps
-- 2-bit 和 4-bit 的计算/访存比不同，最优配置可能不同
-- 不用 autotune（首次编译开销太大），离线扫几组参数硬编码最优值
+- P4-4 fused kernel 初始配置：BLOCK_B=16, BLOCK_N=64, BLOCK_K=64，num_warps=4
+- FP16 + fused 后寄存器压力变化大，默认配置远非最优
+- 不用 runtime autotune（首次编译开销太大），离线扫参数硬编码最优值
 
 **调优参数**：
-- BLOCK_B: 16, 32, 64
+- BLOCK_B: 16, 32
 - BLOCK_N: 32, 64, 128, 256
 - BLOCK_K: 32, 64, 128
-- num_warps: 4, 8
+- num_warps: 2, 4, 8
 - num_stages: 2, 3, 4
 
-**测试形状**：对齐真实 MoE 的 per-expert 形状（B≈32-128, N=neurons, K=128 per group）
+**调优脚本**：`test_p4_tune.py`
+
+**各 bit-width 最优配置（RTX 5090, group_size=128, B≈32）**：
+
+| bit-width | BLOCK_B | BLOCK_N | BLOCK_K | num_warps | num_stages | per-kernel 加速 |
+|-----------|---------|---------|---------|-----------|------------|----------------|
+| 1-bit | 16 | 32 | 128 | 2 | 3 | 1.50x |
+| 2-bit | 32 | 32 | 128 | 2 | 2 | 1.37x |
+| 4-bit | 32 | 32 | 128 | 8 | 3 | 1.88x |
+| 8-bit | 16 | 32 | 128 | 4 | 3 | （未精细调） |
+
+**关键发现**：
+1. **BLOCK_K=128 全场景最优**：大 K-tile 减少内层循环次数，更好利用 Tensor Core
+2. **4-bit 需要更多 warps**（访存瓶颈，多 warps 藏延迟）
+3. **1/2-bit warps=2 最优**（计算轻，warps 多了反而浪费寄存器）
+4. **BLOCK_N=32 普遍优于 64**：fused 后 N 维度利用率已高，小 block 更灵活
+
+**全模型验证（Qwen3.5-35B-A3B Layer 0）**：
+- forward: 4.13s → 3.77s（**+9.5%**，c4, 256 samples）
+- wikitext2: 2.51s → 2.31s（**+8.7%**）
+- PPL: wiki 6.5581→6.5605，c4 9.6765→9.6777（基本不变 ✅）
+- commit: abfd809+（P4-2）vs 575adf8+（P4-4 baseline）
 
 ---
 

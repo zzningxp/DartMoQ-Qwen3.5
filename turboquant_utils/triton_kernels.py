@@ -452,6 +452,23 @@ def _turboquant_fused_matmul_kernel_grouped(
     )
 
 
+# P4-2: 各 bit-width 的最优 kernel 配置（离线调优，针对 RTX 5090）
+# 调优脚本: test_p4_tune.py
+# 测试形状: group_size=128, B≈32, 典型 MoE 场景
+# 格式: (BLOCK_B, BLOCK_N, BLOCK_K, num_warps, num_stages)
+_FUSED_GROUPED_CONFIG = {
+    1: (16, 32, 128, 2, 3),   # 1-bit: 计算轻, warps 少好
+    2: (32, 32, 128, 2, 2),   # 2-bit: 计算中等
+    4: (32, 32, 128, 8, 3),   # 4-bit: 访存重, warps 多藏延迟
+    8: (16, 32, 128, 4, 3),   # 8-bit: 默认配置（attention 用，暂未精细调）
+}
+
+
+def _get_fused_grouped_config(bit_width):
+    """获取指定 bit-width 的最优配置。不在表中返回默认值。"""
+    return _FUSED_GROUPED_CONFIG.get(bit_width, (16, 64, 64, 4, 3))
+
+
 def _triton_fused_matmul_grouped_fused(
     x_rot_concat, indices_packed, codebook, norms_scaled,
     group_size, num_groups, bit_width,
@@ -486,7 +503,9 @@ def _triton_fused_matmul_grouped_fused(
 
     output = torch.empty(B, N, dtype=x_rot_concat.dtype, device=x_rot_concat.device)
 
-    grid = (triton.cdiv(B, 16), triton.cdiv(N, 64))
+    BLOCK_B, BLOCK_N, BLOCK_K, num_warps, num_stages = _get_fused_grouped_config(bit_width)
+
+    grid = (triton.cdiv(B, BLOCK_B), triton.cdiv(N, BLOCK_N))
 
     _turboquant_fused_matmul_kernel_grouped[grid](
         x_rot_concat, indices_packed, codebook, norms_scaled, output,
@@ -495,6 +514,8 @@ def _triton_fused_matmul_grouped_fused(
         norms_col_stride, norms_group_start,
         GROUP_SIZE=group_size, NUM_GROUPS=num_groups,
         BIT_WIDTH=bit_width, N_LEVELS=codebook.shape[0],
+        BLOCK_B=BLOCK_B, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        num_warps=num_warps, num_stages=num_stages,
     )
 
     return output
