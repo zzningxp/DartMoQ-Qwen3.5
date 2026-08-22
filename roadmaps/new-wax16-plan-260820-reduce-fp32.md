@@ -174,16 +174,22 @@ P2 FP16 改造完成后，kernel 计算从 TF32 切换到 FP16 Tensor Core，性
 - 4-bit kernel 加速有限（~1.0x），瓶颈从计算转向 unpack + codebook lookup
 - 固定 block size 配置可能不再是 fp16 下的最优解
 
-### 优先级排序（更新于 P4-1 实验后）
+### 优先级排序（更新于 P4-2 完成后）
 
 | # | 优化项 | 预期收益 | 难度 | 状态 |
 |---|--------|---------|------|------|
-| 1 | **多 group 融合到单个 kernel launch**（P4-4） | **高（e2e 2.04x，per-kernel 2-11x）** | 中高 | ✅ 已完成 |
+| 1 | **多 group 融合到单个 kernel launch**（P4-4） | 高（e2e 2.04x，per-kernel 2-11x） | 中高 | ✅ 已完成 |
 | 2 | Block size / num_warps / num_stages 离线调优（P4-2） | 中（e2e ~10%, per-kernel 1.4-2x） | 低 | ✅ 已完成 |
-| 3 | Gate-Up epilogue 融合（silu+mul 合进 kernel）（P4-3） | 中（gate_up 省 15-25%） | 低 | ⏳ 待做 |
-| 4 | 4-bit codebook gather 深度优化（P4-1） | 中低（大 K 场景收益大，per-group 小） | 中 | ⏳ 待做 |
-| 5 | 旋转跨 bit 复用 + dual matmul 接入（P4-5） | 中 | 中 | ⏳ 待做 |
-| 6 | Grouped GEMM 化（同 bit 多 expert 一次 kernel）（P4-6） | 高 | 高 | ⏳ 待做 |
+| 3 | **旋转计算优化（单 kernel / 减少 launch 开销）**（P4-7，新） | **高（旋转占 ~80% 前向时间）** | 中 | 🔍 分析中 |
+| 4 | Grouped GEMM 化（同 bit 多 expert 一次 kernel）（P4-6） | 高 | 高 | ⏳ 待做 |
+| 5 | 4-bit codebook gather 深度优化（P4-1） | 中低（大 K 场景收益大，per-group 小） | 中 | ⏳ 待做 |
+| 6 | Gate-Up epilogue 融合（silu+mul 合进 kernel）（P4-3） | 低（~2-3%，silu 本身占比小） | 低 | ⏸ 已评估，收益低暂不做 |
+| 7 | 旋转跨 bit 复用（P4-5 上半） | - | - | ❌ 不可行（各 bit seed 不同） |
+| 8 | dual matmul 接入 grouped（P4-5 下半） | 低 | 低 | ⏸ 价值不大（gate_up 已融合） |
+
+> **关键发现**：旋转计算占 forward 时间的 ~80%（B=32, K=2048 时约 0.17ms vs kernel 0.045ms），
+> 远大于 dequant+matmul 本身。之前所有 P4 优化都只针对那 20% 的 kernel 计算时间。
+> 旋转是下一个最大的优化空间。详见 P4-7 章节。
 
 ### P4-1：4-bit unpack / codebook lookup 优化（优先级下调）
 
@@ -354,6 +360,76 @@ dequant + matmul，乘 norms 后累加到 total_acc。x_rot 在 Python 侧预计
 - wikitext2: 2.51s → 2.31s（**+8.7%**）
 - PPL: wiki 6.5581→6.5605，c4 9.6765→9.6777（基本不变 ✅）
 - commit: abfd809+（P4-2）vs 575adf8+（P4-4 baseline）
+
+---
+
+### P4-3：Gate-Up epilogue 融合 ⏸ 已评估，收益低暂不做
+
+**预期**：把 silu(gate) * up 合进 gate_up kernel，省中间结果读写。
+
+**实际结论**：
+- silu+mul 本身计算只占 ~2-3%（B=32, inter=2816 时约 0.006ms）
+- 如果把 gate 和 up 分成两个独立 tl.dot（各 BLOCK_N 大小），
+  反而比 baseline 的一次大 matmul（2×BLOCK_N）效率更低，总体反而慢
+- 正确做法（一次大 matmul + epilogue 做 silu 合并）本质上和当前 baseline 计算量相同，
+  只能省输出写带宽（~1/2），收益有限（<5%）
+
+**代码**：`test_p4_epilogue_fusion.py`（保留做参考）
+
+**结论**：收益太小，暂不做。等其他方向都试过了再回来考虑。
+
+---
+
+### P4-7：旋转计算优化（最高优先级新发现）🔍 分析中
+
+**背景**：
+- 性能 profiling 发现：**旋转计算占 forward 时间的 ~79%**（B=32, K=2048 时）
+  - 旋转：0.17ms
+  - dequant + matmul（fused grouped kernel）：0.045ms
+- 之前 P4-1/P4-2/P4-4 都只优化了 kernel 计算（那 21%），旋转完全没动过
+
+**为什么旋转这么慢**：
+- K=2048, group_size=128 → 16 个 group，每个 group 做一次 (B,128) @ (128,128) 的小 matmul
+- 16 次 Python 循环 + 16 次 kernel launch + 16 次张量分配
+- 小 matmul 的 Tensor Core 利用率极低
+- 纯计算量只有 16.8M FLOPs（B=32），理论上应该 0.0002ms 就够
+- 实际 0.17ms，差了 1000 倍 → **瓶颈是 launch 开销 + 小 kernel 效率，不是计算量**
+
+**候选优化方案**：
+
+#### 方案 A：块对角大矩阵乘（❌ 计算量翻 16 倍，不可行）
+- 把 16 个 Pi 拼成 (2048, 2048) 的块对角矩阵，一次大 matmul
+- 大 matmul 计算量 = 2 × B × K × K = 268M FLOPs（是小 matmul 的 16 倍）
+- 即使 Tensor Core 利用率 100%，也比小 matmul 的总时间长
+- 结论：不可行
+
+#### 方案 B：单 Triton kernel 内完成所有 group 的旋转（🔍 待验证）
+- 写一个 Triton kernel，一个 launch 处理所有 group 的旋转
+- 省去 Python 循环 + 多次 kernel launch 开销
+- 每个 group 的旋转独立，并行度充足
+- 难点：128×128 的小 matmul 在 Triton 里效率不一定比 cuBLAS 高
+- 预期收益：如果 launch 是主要瓶颈，可快 2-3 倍
+
+#### 方案 C：torch.bmm（batch matrix multiply）
+- x reshape 成 (num_groups, B, group_size)
+- 所有 Pi 拼成 (num_groups, group_size, group_size)
+- `torch.bmm(x_3d, P_3d.transpose(1,2))` 一次调用
+- PyTorch 内部会优化 batch matmul 的 launch
+- 预期收益：省 Python 循环 + 减少 launch 数
+- 风险：bmm 对小尺寸 batch 的优化程度未知
+
+#### 方案 D：旋转矩阵直接缓存 fp16
+- 当前 `generate_rotation_matrix` 缓存 fp32，每次调用 `.half()`
+- 如果直接缓存 fp16 版本（或两个都缓存），省转换开销
+- 收益估计：小（half() 转换很快），但改动最小
+
+#### 方案 E：预分配 x_rot 输出 buffer + in-place 旋转
+- 当前每次 forward 都重新分配 x_rot_list + cat，有内存分配开销
+- 预分配一个 (B, K_total) 的 buffer，每个 group 的结果直接写入
+- 省去 cat + contiguous 的开销
+- 收益估计：中
+
+**下一步**：先 profiling 确认瓶颈分布（launch 开销 vs 纯计算），再选最优方案。
 
 ---
 
