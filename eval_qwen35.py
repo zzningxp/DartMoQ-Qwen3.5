@@ -158,6 +158,8 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
     # 统计全局时间
     total_time_forward = 0.0
     total_time_move = 0.0
+    total_time_attn = 0.0
+    total_time_moe = 0.0
 
     for layer_idx, layer in enumerate(layers):
         if layer_idx % 10 == 0:
@@ -173,6 +175,33 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
         t_move_end = time.time()
         time_move = t_move_end - t_move_start
         total_time_move += time_move
+
+        # --- Patch attn & mlp forward for per-component timing ---
+        # Qwen3.5 has multiple attention types: self_attn (full_attention), linear_attn (linear_attention)
+        # Auto-detect the attention attribute name
+        attn_attr_name = None
+        for _name in ('self_attn', 'linear_attn', 'attn', 'attention'):
+            if hasattr(layer, _name):
+                attn_attr_name = _name
+                break
+        attn_accum = [0.0]
+        moe_accum = [0.0]
+        _orig_attn_forward = getattr(layer, attn_attr_name).forward if attn_attr_name else None
+        _orig_mlp_forward = layer.mlp.forward
+
+        def _make_timed_forward(_orig_fn, _accum):
+            def _timed_forward(*args, **kwargs):
+                t0 = time.time()
+                try:
+                    return _orig_fn(*args, **kwargs)
+                finally:
+                    _accum[0] += time.time() - t0
+            return _timed_forward
+
+        if attn_attr_name:
+            getattr(layer, attn_attr_name).forward = _make_timed_forward(_orig_attn_forward, attn_accum)
+        layer.mlp.forward = _make_timed_forward(_orig_mlp_forward, moe_accum)
+        # --- End patch ---
 
         # Process samples in batches - hidden states stay on GPU
         new_hidden_states = torch.empty_like(hidden_states)
@@ -237,6 +266,15 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
         time_forward = t_forward_end - t_forward_start
         total_time_forward += time_forward
 
+        # Restore original forward methods and collect per-component times
+        if attn_attr_name:
+            getattr(layer, attn_attr_name).forward = _orig_attn_forward
+        layer.mlp.forward = _orig_mlp_forward
+        time_attn = attn_accum[0]
+        time_moe = moe_accum[0]
+        total_time_attn += time_attn
+        total_time_moe += time_moe
+
         # Swap hidden states pointers
         del hidden_states
         hidden_states = new_hidden_states
@@ -250,8 +288,9 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
             layer_time = time.time() - tick_layer
             mlp_type = type(layer.mlp).__name__ if hasattr(layer, 'mlp') else 'N/A'
 
+            attn_type = attn_attr_name if attn_attr_name else 'N/A'
             mem_str = get_memory_info_str()
-            print(f"  [Layer {layer_idx}] time: {layer_time:.2f}s (move: {time_move:.2f}s, forward: {time_forward:.2f}s), mlp_type={mlp_type} | Memory: {mem_str}", flush=True)
+            print(f"  [Layer {layer_idx}] time: {layer_time:.2f}s (move: {time_move:.2f}s, forward: {time_forward:.2f}s, attn: {time_attn:.2f}s, moe: {time_moe:.2f}s), attn_type={attn_type}, mlp_type={mlp_type} | Memory: {mem_str}", flush=True)
 
         del layer
         # Cleanup
@@ -263,6 +302,8 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
     print(f"\n  [Eval Global Stats]", flush=True)
     print(f"    Total move time: {total_time_move:.2f}s", flush=True)
     print(f"    Total forward time: {total_time_forward:.2f}s", flush=True)
+    print(f"    Total attn time: {total_time_attn:.2f}s", flush=True)
+    print(f"    Total moe time: {total_time_moe:.2f}s", flush=True)
 
     # Final norm and lm_head - process in batches of 4
     print("Processing final norm and lm_head...")
