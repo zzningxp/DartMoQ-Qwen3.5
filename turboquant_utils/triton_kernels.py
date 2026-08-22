@@ -344,6 +344,162 @@ def triton_fused_dual_matmul(
     return output
 
 
+# ---------------------------------------------------------------------------
+# P4-4: Multi-group fused kernel
+# ---------------------------------------------------------------------------
+# 单个 kernel launch 内处理多个 group 的 dequant + matmul + 累加，
+# 省去多次 launch + 中间张量读写 + Python 循环开销。
+#
+# 约束：所有 group 大小相同（= group_size），即 in_features % group_size == 0
+# ---------------------------------------------------------------------------
+
+@triton.jit
+def _turboquant_fused_matmul_kernel_grouped(
+    # Input
+    input_ptr,        # (B, K_total) 拼接后的旋转输入（连续存储）
+    # Quantized weight
+    indices_ptr,      # (N, PACKED_K_stride) packed uint8（行 stride = PACKED_K_stride）
+    codebook_ptr,     # (n_levels,) float16
+    norms_ptr,        # (N, NORMS_COL_STRIDE) float16 — per-group norms (pre-scaled)
+    # Output
+    output_ptr,       # (B, N)
+    # Shape
+    B, N,
+    K_total,              # 总 K = num_groups * group_size
+    PACKED_K_stride,      # packed indices 的行 stride（= 原矩阵总列数）
+    PACKED_COL_START,     # packed indices 的列起始偏移（group 0 对应的列）
+    NORMS_COL_STRIDE,     # norms 的列 stride（= 原矩阵总 group 数）
+    NORMS_GROUP_START,    # norms 的起始 group 索引
+    # Constexpr config
+    GROUP_SIZE: tl.constexpr,     # 每个 group 的 K 大小
+    NUM_GROUPS: tl.constexpr,     # group 数量（本次处理的）
+    BIT_WIDTH: tl.constexpr,
+    N_LEVELS: tl.constexpr,
+    BLOCK_B: tl.constexpr = 16,
+    BLOCK_N: tl.constexpr = 64,
+    BLOCK_K: tl.constexpr = 64,
+):
+    """Multi-group fused dequant + matmul kernel.
+
+    外层循环 NUM_GROUPS 个 group，每个 group 独立 dequant + matmul，
+    乘对应 norms 后累加到输出。
+
+    支持 packed indices 和 norms 的偏移/stride，可用于 slice_in_features 场景：
+    - packed indices 传原始大矩阵，用 PACKED_COL_START 指定切片起始列
+    - norms 传原始 (N, total_groups) 矩阵，用 NORMS_GROUP_START 指定起始 group
+    """
+    pid_b = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    rb = pid_b * BLOCK_B + tl.arange(0, BLOCK_B)
+    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_b = rb < B
+    mask_n = rn < N
+
+    total_acc = tl.zeros((BLOCK_B, BLOCK_N), dtype=tl.float16)
+
+    ELEMENTS_PER_BYTE = 8 // BIT_WIDTH
+    PACKED_PER_GROUP = GROUP_SIZE // ELEMENTS_PER_BYTE
+
+    for g in range(NUM_GROUPS):
+        g_start = g * GROUP_SIZE
+        p_start = PACKED_COL_START + g * PACKED_PER_GROUP
+
+        # 加载当前 group 的 norms: (BLOCK_N,)
+        # norms 存储: (N, total_groups) row-major → 偏移 = rn * NORMS_COL_STRIDE + (NORMS_GROUP_START + g)
+        norm_off = rn * NORMS_COL_STRIDE + (NORMS_GROUP_START + g)
+        norm_g = tl.load(norms_ptr + norm_off, mask=mask_n, other=1.0)
+
+        acc_g = tl.zeros((BLOCK_B, BLOCK_N), dtype=tl.float16)
+
+        for k_start in range(0, GROUP_SIZE, BLOCK_K):
+            rk = k_start + tl.arange(0, BLOCK_K)
+            mask_k = rk < GROUP_SIZE
+
+            # Load input tile (with group offset in K dimension)
+            inp_k = g_start + rk
+            inp_off = rb[:, None] * K_total + inp_k[None, :]
+            inp_mask = mask_b[:, None] & mask_k[None, :]
+            inp_tile = tl.load(input_ptr + inp_off, mask=inp_mask, other=0.0)
+
+            if BIT_WIDTH == 8:
+                byte_col = rk
+                byte_off = rn[:, None] * PACKED_K_stride + (p_start + byte_col[None, :])
+                w_mask = mask_n[:, None] & mask_k[None, :]
+                idx = tl.load(indices_ptr + byte_off, mask=w_mask, other=0).to(tl.int32)
+                w_quant = tl.load(codebook_ptr + idx, mask=w_mask, other=0.0)
+            else:
+                BIT_MASK = (1 << BIT_WIDTH) - 1
+                byte_col = rk // ELEMENTS_PER_BYTE
+                pos_in_byte = rk % ELEMENTS_PER_BYTE
+                pbc = p_start + byte_col
+                byte_off = rn[:, None] * PACKED_K_stride + pbc[None, :]
+                w_mask = mask_n[:, None] & mask_k[None, :]
+                packed = tl.load(indices_ptr + byte_off, mask=w_mask, other=0).to(tl.uint8)
+                shift = pos_in_byte * BIT_WIDTH
+                idx = (packed >> shift[None, :]) & BIT_MASK
+                idx = idx.to(tl.int32)
+                w_quant = tl.load(codebook_ptr + idx, mask=w_mask, other=0.0)
+
+            acc_g += tl.dot(inp_tile, tl.trans(w_quant), out_dtype=tl.float16)
+
+        # 乘 norms 后加到总累加器
+        total_acc += acc_g * norm_g[None, :]
+
+    tl.store(
+        output_ptr + rb[:, None] * N + rn[None, :],
+        total_acc.to(output_ptr.dtype.element_ty),
+        mask=mask_b[:, None] & mask_n[None, :],
+    )
+
+
+def _triton_fused_matmul_grouped_fused(
+    x_rot_concat, indices_packed, codebook, norms_scaled,
+    group_size, num_groups, bit_width,
+    packed_col_start=0, norms_group_start=0,
+    packed_k_stride=None, norms_col_stride=None,
+):
+    """内部函数：调用 fused grouped kernel。
+
+    Args:
+        x_rot_concat: (B, K_total) 拼接后的旋转输入，连续存储
+        indices_packed: (N, PACKED_K_stride) 权重 packed indices
+        codebook: (n_levels,)
+        norms_scaled: (N, NORMS_COL_STRIDE) pre-scaled norms
+        group_size: 每个 group 的 K 大小
+        num_groups: 本次处理的 group 数量
+        bit_width: 1/2/4/8
+        packed_col_start: packed indices 的列起始偏移（group 0 对应的列）
+        norms_group_start: norms 的起始 group 索引
+        packed_k_stride: packed indices 的行 stride，默认 = indices_packed.shape[1]
+        norms_col_stride: norms 的列 stride，默认 = norms_scaled.shape[1]
+
+    Returns:
+        output: (B, N)
+    """
+    B = x_rot_concat.shape[0]
+    N = indices_packed.shape[0]
+    K_total = x_rot_concat.shape[1]
+    if packed_k_stride is None:
+        packed_k_stride = indices_packed.shape[1]
+    if norms_col_stride is None:
+        norms_col_stride = norms_scaled.shape[1]
+
+    output = torch.empty(B, N, dtype=x_rot_concat.dtype, device=x_rot_concat.device)
+
+    grid = (triton.cdiv(B, 16), triton.cdiv(N, 64))
+
+    _turboquant_fused_matmul_kernel_grouped[grid](
+        x_rot_concat, indices_packed, codebook, norms_scaled, output,
+        B, N, K_total,
+        packed_k_stride, packed_col_start,
+        norms_col_stride, norms_group_start,
+        GROUP_SIZE=group_size, NUM_GROUPS=num_groups,
+        BIT_WIDTH=bit_width, N_LEVELS=codebook.shape[0],
+    )
+
+    return output
+
+
 def triton_fused_matmul_grouped(
     x, indices_packed, codebook, norms, seed, group_size, in_features, bit_width: int = 4
 ):
@@ -376,6 +532,33 @@ def triton_fused_matmul_grouped(
         x_rot_g = x[:, g_start:g_end] @ Pi.T
         x_rot_list.append(x_rot_g)
 
+    # P4-4: Multi-group fused fast path
+    # 条件：所有 group 大小相同（in_features 是 group_size 的整数倍）且 num_groups >= 2
+    if in_features % group_size == 0 and num_groups >= 2:
+        # 统一在 fp16 下计算，输入为 bf16/fp32 时自动转
+        orig_dtype = x.dtype
+        if orig_dtype != torch.float16:
+            codebook = codebook.half()
+            norms = norms.half()
+            x_rot_list = [x.half() for x in x_rot_list]
+
+        # 拼接 x_rot (B, K_total)
+        x_rot_concat = torch.cat(x_rot_list, dim=1).contiguous()
+
+        # norms pre-scaled（和 triton_fused_matmul 内一致）
+        scale = math.sqrt(group_size)
+        norms_scaled = norms / scale
+
+        output_fp16 = _triton_fused_matmul_grouped_fused(
+            x_rot_concat, indices_packed, codebook, norms_scaled,
+            group_size, num_groups, bit_width,
+        )
+
+        if orig_dtype != torch.float16:
+            return output_fp16.to(orig_dtype)
+        return output_fp16
+
+    # Fallback: 逐 group 调用（处理非对齐 in_features 等情况）
     output = torch.zeros(batch_size, out_features, dtype=x.dtype, device=x.device)  # Step 1: output 与输入同 dtype
 
     group_idx = 0
@@ -424,7 +607,6 @@ def triton_fused_matmul_grouped_slice_rows(
         norms_slice = norms_slice.unsqueeze(1)
 
     # Pre-compute all rotations first
-    # Step 2: 旋转计算改为 fp16（同 triton_fused_matmul_grouped）
     num_groups = (in_features + group_size - 1) // group_size
     x_rot_list = []
     for group_idx in range(num_groups):
@@ -436,7 +618,30 @@ def triton_fused_matmul_grouped_slice_rows(
         x_rot_g = x[:, g_start:g_end] @ Pi.T
         x_rot_list.append(x_rot_g)
 
-    output = torch.zeros(batch_size, slice_out_features, dtype=x.dtype, device=x.device)  # 输出与输入同 dtype
+    # P4-4: Multi-group fused fast path
+    if in_features % group_size == 0 and num_groups >= 2:
+        orig_dtype = x.dtype
+        if orig_dtype != torch.float16:
+            codebook = codebook.half()
+            norms_slice = norms_slice.half()
+            x_rot_list = [x.half() for x in x_rot_list]
+
+        x_rot_concat = torch.cat(x_rot_list, dim=1).contiguous()
+
+        scale = math.sqrt(group_size)
+        norms_scaled = norms_slice / scale
+
+        output_fp16 = _triton_fused_matmul_grouped_fused(
+            x_rot_concat, indices_packed_slice, codebook, norms_scaled,
+            group_size, num_groups, bit_width,
+        )
+
+        if orig_dtype != torch.float16:
+            return output_fp16.to(orig_dtype)
+        return output_fp16
+
+    # Fallback: 逐 group 调用
+    output = torch.zeros(batch_size, slice_out_features, dtype=x.dtype, device=x.device)
 
     group_idx = 0
     for g_start in range(0, in_features, group_size):
@@ -446,13 +651,9 @@ def triton_fused_matmul_grouped_slice_rows(
         x_rot_g = x_rot_list[group_idx]
 
         packed_start = g_start // ELEMENTS_PER_BYTE
-        packed_end = g_end // ELEMENTS_PER_BYTE
-        if g_end % ELEMENTS_PER_BYTE != 0:
-            packed_end += 1
 
         norms_g = norms_slice[:, group_idx]
 
-        # 去除列切片 clone：传行切片后的整张 indices_packed_slice，由内核按 col_start 偏移寻址
         out_g = triton_fused_matmul(x_rot_g, indices_packed_slice, codebook, norms_g, g_dim, bit_width, col_start=packed_start)
 
         output += out_g
@@ -484,7 +685,6 @@ def triton_fused_matmul_grouped_slice_in_features(
         norms = norms.unsqueeze(1)
 
     # Pre-compute all rotations first
-    # Step 2: 旋转计算改为 fp16（同 triton_fused_matmul_grouped）
     num_groups_in_slice = (slice_in_features + group_size - 1) // group_size
     x_rot_list = []
     for group_idx_in_slice in range(num_groups_in_slice):
@@ -498,7 +698,40 @@ def triton_fused_matmul_grouped_slice_in_features(
         x_rot_g = x[:, g_start_in_slice:g_end_in_slice] @ Pi.T
         x_rot_list.append(x_rot_g)
 
-    output = torch.zeros(batch_size, out_features, dtype=x.dtype, device=x.device)  # 输出与输入同 dtype
+    # P4-4: Multi-group fused fast path
+    # slice_in_features 已对齐 group_size（original_start 已对齐，slice_in_features 也对齐）
+    if slice_in_features % group_size == 0 and num_groups_in_slice >= 2:
+        orig_dtype = x.dtype
+        if orig_dtype != torch.float16:
+            codebook = codebook.half()
+            norms = norms.half()
+            x_rot_list = [x.half() for x in x_rot_list]
+
+        x_rot_concat = torch.cat(x_rot_list, dim=1).contiguous()
+
+        scale = math.sqrt(group_size)
+        norms_scaled = norms / scale
+
+        # packed 起始列 = original_start 的 packed 位置
+        packed_col_start = original_start // ELEMENTS_PER_BYTE
+        # norms 起始 group = original_start // group_size
+        norms_group_start = original_start // group_size
+
+        output_fp16 = _triton_fused_matmul_grouped_fused(
+            x_rot_concat, indices_packed, codebook, norms_scaled,
+            group_size, num_groups_in_slice, bit_width,
+            packed_col_start=packed_col_start,
+            norms_group_start=norms_group_start,
+            packed_k_stride=indices_packed.shape[1],
+            norms_col_stride=norms_scaled.shape[1],
+        )
+
+        if orig_dtype != torch.float16:
+            return output_fp16.to(orig_dtype)
+        return output_fp16
+
+    # Fallback: 逐 group 调用
+    output = torch.zeros(batch_size, out_features, dtype=x.dtype, device=x.device)
 
     group_idx_in_slice = 0
     for g_start_in_slice in range(0, slice_in_features, group_size):
@@ -510,15 +743,10 @@ def triton_fused_matmul_grouped_slice_in_features(
         x_rot_g = x_rot_list[group_idx_in_slice]
 
         packed_start = g_start_original // ELEMENTS_PER_BYTE
-        g_end_original = g_start_original + g_dim  # in_features 结束位置
-        packed_end = g_end_original // ELEMENTS_PER_BYTE
-        if g_end_original % ELEMENTS_PER_BYTE != 0:
-            packed_end += 1
 
         group_idx_original = g_start_original // group_size
         norms_g = norms[:, group_idx_original]
 
-        # 去除列切片 clone：传整张 indices_packed，由内核按 col_start 偏移寻址
         out_g = triton_fused_matmul(x_rot_g, indices_packed, codebook, norms_g, g_dim, bit_width, col_start=packed_start)
 
         output += out_g

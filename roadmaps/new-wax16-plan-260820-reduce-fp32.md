@@ -174,36 +174,149 @@ P2 FP16 改造完成后，kernel 计算从 TF32 切换到 FP16 Tensor Core，性
 - 4-bit kernel 加速有限（~1.0x），瓶颈从计算转向 unpack + codebook lookup
 - 固定 block size 配置可能不再是 fp16 下的最优解
 
-### 优先级排序
+### 优先级排序（更新于 P4-1 实验后）
 
 | # | 优化项 | 预期收益 | 难度 | 状态 |
 |---|--------|---------|------|------|
-| 1 | 4-bit unpack / codebook lookup 向量化优化 | 高（4-bit 瓶颈突破） | 中 | ⏳ 待做 |
-| 2 | Block size / num_warps / num_stages 离线调优 | 中（5-20%） | 低 | ⏳ 待做 |
-| 3 | Gate-Up epilogue 融合（silu+mul 合进 kernel） | 中高（gate_up 省 20-30%） | 低 | ⏳ 待做 |
-| 4 | 多 group 合并到一次 kernel launch | 高（20-30% e2e） | 中高 | ⏳ 待做 |
-| 5 | 旋转跨 bit 复用 + dual matmul 接入 | 中 | 中 | ⏳ 待做 |
-| 6 | Grouped GEMM 化（同 bit 多 expert 一次 kernel） | 高 | 高 | ⏳ 待做 |
+| 1 | **多 group 融合到单个 kernel launch**（P4-4） | **高（e2e 2.04x，per-kernel 2-11x）** | 中高 | ✅ 已完成 |
+| 2 | Block size / num_warps / num_stages 离线调优（P4-2） | 中（5-15%） | 低 | ⏳ 待做 |
+| 3 | Gate-Up epilogue 融合（silu+mul 合进 kernel）（P4-3） | 中（gate_up 省 15-25%） | 低 | ⏳ 待做 |
+| 4 | 4-bit codebook gather 深度优化（P4-1） | 中低（大 K 场景收益大，per-group 小） | 中 | ⏳ 待做 |
+| 5 | 旋转跨 bit 复用 + dual matmul 接入（P4-5） | 中 | 中 | ⏳ 待做 |
+| 6 | Grouped GEMM 化（同 bit 多 expert 一次 kernel）（P4-6） | 高 | 高 | ⏳ 待做 |
 
-### P4-1：4-bit unpack / codebook lookup 向量化优化（最高优先级）
+### P4-1：4-bit unpack / codebook lookup 优化（优先级下调）
 
-**背景**：
-- FP16 改造后，2-bit kernel 加速 ~1.3x，4-bit 几乎不加速
-- 说明 4-bit 的瓶颈在 unpack + codebook lookup，不在 Tensor Core 计算
-- 4-bit 占 50% 神经元，突破 4-bit 瓶颈对整体性能影响很大
+**实验结论（已验证）**：
+- **per-group 场景 (K=128)**：4-bit 只比 FP16 慢 27%（12.0 vs 15.2 TFLOPs），
+  dequant 开销占比不大，unpack 向量化收益有限（<5%）
+- **大 K 场景 (K=2048)**：4-bit 比 FP16 慢 6.5x，其中 **codebook gather 占 86.5%**
+  的开销，unpack 本身几乎不耗时
+- tl.where 完全展开（16 路选择）**反而更慢**（0.84x），选择指令数多于 gather 开销
+- num_warps=2 比 num_warps=4 快 ~50%（大 K 场景），说明 warp 间存在 L1 竞争
 
-**优化方向**：
-1. **Vectorized load**：一次加载 32-bit / 64-bit / 128-bit，一次 unpack 多个元素
-   - 当前逐 byte 加载 + 逐 element 移位，内存访问粒度小
-   - 用 `tl.load` 加载更大的 vector（如 `<64, uint32>`），然后位运算批量 unpack
-2. **Codebook lookup 模式优化**：
-   - 检查当前 gather 模式是否 coalesced
-   - 考虑按 N 维度 reorder 权重改善 locality
-3. **Bit-packing 布局重排**：
-   - 调整 packed 数据的存储顺序，使同一 warp 的 thread 访问连续的内存地址
-   - 改善 memory coalescing
+**优化方向（重新定位）**：
+1. **codebook gather 优化**：需要找比 `tl.load(ptr + idx)` 更高效的小表查找方式
+   - shared memory / L1 路径调优
+   - Triton 编译器层面的优化（暂未找到有效方法）
+2. **unpack 向量化**：per-K 收益有限，搁置
+3. **优先级**：等 P4-4（多 group fusion）做完后，再评估是否值得做
+   - 如果 fusion 后 K 维度变大，codebook gather 优化的价值会上升
 
-**预期收益**：4-bit kernel 提速 20-40%，整体 e2e 提速 10-20%
+### P4-4：多 group 融合到单个 kernel launch（最高优先级）
+
+**背景与问题**：
+- 当前 grouped 函数逐 group 调用 `triton_fused_matmul`（每个 group K=128），
+  然后 Python 侧 `output += out_g` 累加
+- **核心瓶颈**：每个 group 只做 K=128 的小矩阵乘，Tensor Core 利用率极低
+  - per-group (K=128): ~12 TFLOPs（4-bit），~15 TFLOPs（FP16）
+  - 整矩阵 (K=2048): ~10 TFLOPs（4-bit grouped 模拟），~65 TFLOPs（FP16）
+  - 4-bit grouped e2e 比 FP16 整矩阵慢 **5~7 倍**
+- kernel launch overhead 很低（<1%），不是主要问题
+- **真正的问题**：小 K 导致 Tensor Core 利用率低 + 每个 K-tile 的 dequant 开销固定
+
+**优化思路（从易到难，逐步推进）**：
+
+#### 方案 A：Python 侧循环消除 + 单 kernel 内多 group 累加
+- 在一个 kernel 内处理多个 group（同 bit-width），输出直接累加
+- 每个 group 仍用独立的 packed indices 偏移和独立的旋转输入
+- 收益：省去 Python 循环的 `output += out_g` 额外开销（D2D 写入+读取）
+- 难度：低
+- 预期收益：小（5-10%），主要是省中间输出带宽
+
+#### 方案 B：K 维度拼接 + 单 kernel 大矩阵乘
+- 把多个 group 的 K 维度在 kernel 内拼接起来，做一次大的 tl.dot
+- 关键点：
+  - 输入 x_rot：每个 group 旋转不同，必须分别计算（CPU 侧已预计算）
+  - 权重 packed indices：连续存储，可以按偏移访问
+  - codebook：同 bit-width 共享同一 codebook
+  - norms：每个 group 独立
+- 实现方式：
+  - kernel 循环 K 维度，但每 BLOCK_K 个元素可能跨越 group 边界
+  - 或：kernel 内按 group 循环，每次处理一个完整 group 的 K=128，累加到 acc
+- **实际上就是方案 A，但在 kernel 内做循环累加，省去多次 launch + 中间结果**
+- 预期收益：中（10-20%），主要来自省去多次 launch 的固定开销 + 中间张量读写
+
+#### 方案 C：同 bit-width 多 group 的 K 维融合（增大有效 K）
+- 把多个同 bit-width group 当作一个更大的 K 来处理
+- 输入 x_rot：每个 group 不同，无法简单拼接 K 维度
+- 但可以**按 N 维度并行、逐个 group 累加** — 本质上和方案 B 一样
+- 更大的收益点：**如果有办法让 tl.dot 做更大 K 的计算**，Tensor Core 利用率会提升
+- 但由于 x_rot 每组独立，实际上 K 维不能跨 group 拼接
+- 结论：方案 C ≈ 方案 B，收益上限受限于「单个 tl.dot 仍是 K=128」
+
+#### 方案 D：旋转矩阵 fusion（需要算法层面支持）
+- 核心想法：多个 group 的旋转矩阵可以合并成一个大旋转矩阵
+  R = diag(R0, R1, ..., Rn)（块对角矩阵）
+- 则 x_rot = x @ R^T，整个 K 维度一次旋转完成
+- 然后可以用完整 K 的 dequant + matmul，Tensor Core 利用率大幅提升
+- 但 packed indices 是按 group 存储的，需要确认 K 维连续性
+- 这是**理论上收益最大**的方向，但实现复杂度也最高
+- 难度：高
+- 预期收益：高（30-50%+），取决于 Tensor Core 利用率提升幅度
+
+**实施计划**：
+1. 先做 **方案 A/B**（kernel 内多 group 累加）—— 低风险、立即可做
+2. 评估收益后，再决定是否推进方案 D（旋转 fusion + 大 K matmul）
+
+**改动范围**：
+- `triton_kernels.py`：新增 `_turboquant_fused_matmul_kernel_grouped` kernel
+- `triton_kernels.py`：新增 `_triton_fused_matmul_grouped_fused` 辅助函数
+- `triton_fused_matmul_grouped` / `_slice_rows` / `_slice_in_features` 各加 fast path
+
+---
+
+#### P4-4 实验结果（已完成）
+
+**实现方案**：方案 A/B 混合 — 单 kernel 内循环 NUM_GROUPS 个 group，每个 group 独立
+dequant + matmul，乘 norms 后累加到 total_acc。x_rot 在 Python 侧预计算并拼接为
+`(B, K_total)`，packed indices 直接按偏移访问。kernel 支持 `packed_col_start` /
+`norms_group_start` 偏移参数，兼容 slice_in_features 场景。
+
+**支持范围**：
+- bit-width：1/2/4/8（BIT_WIDTH 为 constexpr）
+- 接口：`triton_fused_matmul_grouped`、`_slice_rows`、`_slice_in_features`
+- 接口完全不变，内部自动选择 fast path（条件：`in_features % group_size == 0 and num_groups >= 2`）
+
+**性能结果**（MoE 场景，group_size=128）：
+
+| 场景 | Baseline | Fused | Speedup |
+|------|----------|-------|---------|
+| down_proj 4-bit, B=128 (22 groups) | 0.53 ms (2.8 TFLOPs) | 0.16 ms (9.1 TFLOPs) | **3.26x** |
+| down_proj 4-bit, B≤64 (22 groups) | 0.53 ms | 0.096 ms | **5.5x** |
+| gate_up 2-bit 段, B=128 (8 groups) | 0.19 ms (3.9 TFLOPs) | 0.054 ms (13.8 TFLOPs) | **3.59x** |
+| gate_up 2-bit 段, B≤32 (8 groups) | 0.19 ms | 0.025 ms | **7.7x** |
+| gate_up 4-bit 段, B=128 (8 groups) | 0.20 ms (3.8 TFLOPs) | 0.089 ms (8.3 TFLOPs) | **2.21x** |
+| gate_up 4-bit 段, B≤32 (8 groups) | 0.20 ms | 0.038 ms | **5.2x** |
+| 1-bit, B=64 (16 groups) | 0.38 ms (1.4 TFLOPs) | 0.033 ms (16.1 TFLOPs) | **11.5x** |
+
+**精度**：
+- mean/std ≈ 0.03-0.05%（FP16 累加顺序差异，完全正常）
+- max_diff 在 FP16 精度范围内
+- slice_rows：max_diff = 0（完全一致）
+- slice_in_features：mean/std ≈ 0.03%
+- 全模型 PPL：wikitext2 6.5581 vs baseline 6.5613，c4 9.6765 vs 9.677 — 基本吻合
+
+**全模型验证（Qwen3.5-35B-A3B Layer 0, 256 experts, 256 tokens）**：
+- Baseline forward: **8.44s**
+- P4-4 fused forward: **4.13s**
+- **加速比：2.04x**
+
+**关键洞察**：
+1. **收益远超预期** — 最初预期 10-20%，实际 2-11x
+2. 原因：baseline 中每个 group K=128 的小 matmul Tensor Core 利用率极低
+   （2-4 TFLOPs vs 峰值 80 TFLOPs），fused 后有效工作负载变大，利用率大幅提升
+3. **小 B 时收益更大** — MoE 场景 per-expert batch size 通常很小（top-k 分散），
+   这正是收益最大的情况
+4. **1-bit 收益最大（11.5x）** — 因为单 group 计算量最小，填充率最低
+
+**未做项 / 后续可做**：
+- [ ] `triton_fused_dual_matmul` 的 grouped 版本 fusion（主路径未使用，优先级低）
+- [ ] 方案 D：旋转矩阵 fusion + 大 K matmul（理论收益更高，但复杂度高）
+- [ ] 混合 bit-width 场景的 fusion（2-bit 段 + 4-bit 段可分别 fused，再加一次加法）
+- [ ] BLOCK_B / BLOCK_N / BLOCK_K / num_warps 的联合调优（P4-2）
+
+---
 
 ### P4-2：Block size / num_warps 离线调优
 
@@ -308,6 +421,60 @@ Layer 0 forward 从 ~19-20s → 12.31s，**约 36-38% 加速**。大头来自 P3
 其余几项是"白捡"的叠加收益。
 
 ---
+
+### P4 实验笔记（P4-1 瓶颈分析，已完成）
+
+**实验脚本**：`test_p4_4bit_unpack.py`, `test_p4_codebook_opt.py`, `test_p4_e2e_sim.py`
+
+#### 单 kernel 层面
+
+| 场景 | FP16 | 4-bit | 2-bit | 4/2 比 |
+|------|------|-------|-------|--------|
+| per-group (K=128) | 15.2 TFLOPs | 12.0 TFLOPs | - | - |
+| large K (K=2048) | 65 TFLOPs | 10 TFLOPs | ~10 TFLOPs | ~1.0x |
+
+**关键结论**：
+1. **4-bit 的瓶颈不在 unpack**，而在 **codebook gather（间接内存访问）**
+   - 开销分解：tl.dot 占 ~15%，unpack 占 ~0%，gather 占 ~85%（大 K 场景）
+   - codebook 只有 16 个 fp16 值（32 字节），完全在 L1 cache，但间接寻址指令开销大
+2. **4-bit ≈ 2-bit**（1.04x），bit-width 几乎不影响性能
+   - 因为 gather 开销相同，且都远大于 tl.dot 计算
+3. **tl.where 展开反而更慢**（0.84x）：15 个选择指令 > 1 次 gather
+4. **num_warps=2 比 4 快 ~50%**：warp 间 L1 cache 竞争
+
+#### e2e grouped 调用层面
+
+| 场景 | FP16 整矩阵 | 4-bit grouped | 差距 |
+|------|------------|--------------|------|
+| down (22 groups, K=2816) | 0.023 ms (65 TFLOPs) | 0.164 ms (9 TFLOPs) | 7.25x |
+| gate_up (16 groups, K=2048) | 0.021 ms (72 TFLOPs) | 0.119 ms (12 TFLOPs) | 5.78x |
+
+**关键结论**：
+1. **kernel launch overhead 几乎为 0**（<1%），不是问题
+2. **真正的问题是小 K 导致 Tensor Core 利用率低**
+   - 每个 group K=128 的 matmul 效率只有整矩阵的 ~1/5
+   - 22 个小 kernel 的总时间 = 22 × 单个小 kernel 时间
+   - 而 FP16 整矩阵 1 个大 kernel 时间很短
+3. **分组调用方式本身是最大瓶颈**，不是单个 kernel 的计算效率
+
+#### 优先级调整
+
+P4-1（unpack 向量化）收益有限，下调优先级。
+**P4-4（多 group fusion）上调为最高优先级** — 通过减少分组次数提高 Tensor Core 利用率。
+
+#### P4-4 实验结论（已完成 ✅）
+
+- **收益**：
+  - per-kernel: 2.2x - 11.5x（视 bit-width 和 B 大小而定）
+  - **全模型 e2e (Layer 0): 2.04x**（8.44s → 4.13s, Qwen3.5-35B-A3B）
+- **覆盖范围**：`triton_fused_matmul_grouped` / `_slice_rows` / `_slice_in_features`
+- **支持 bit-width**：1/2/4/8
+- **接口不变**，内部根据 `in_features % group_size == 0 and num_groups >= 2` 自动选择 fast path
+- **精度**：
+  - 数值：FP16 累加顺序差异 ≈ 0.03-0.05%，完全正常
+  - 全模型 PPL：wikitext2 6.5581 vs 6.5613，c4 9.6765 vs 9.677（baseline），基本吻合
+- **验证日志**：`logs/0818.5.wxa16.opt.p4-4.log`
+- **commit 对比**：575adf8+ (P4-4) vs dfb8fc1 (baseline)
 
 ---
 
