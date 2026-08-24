@@ -33,6 +33,12 @@ import torch
 _ROTATION_CACHE: dict[Tuple[int, int], torch.Tensor] = {}
 _ROTATION_CACHE_DEV: dict[Tuple[int, int, str], torch.Tensor] = {}  # 按 device 缓存派生副本，避免每调用 .to(device) 重拷
 _MAX_CACHE_SIZE = 2048  # 最多缓存2048个旋转矩阵
+
+# P4-7: batch 旋转矩阵缓存
+# 缓存键: (d, seed_base, num_groups, stride, device_str, dtype_str)
+# 缓存值: (num_groups, d, d) 的 batch 旋转矩阵
+_BATCH_ROTATION_CACHE: dict[Tuple, torch.Tensor] = {}
+_MAX_BATCH_CACHE_SIZE = 512
 # 注：down 方向 seed = base + expert_offset + group_offset，每 forward 工作集
 # ~1032 个 key（256 experts × 4 groups 等），128 不够会导致每 forward 抖动、
 # QR 反复重算。调到 2048 避免抖动，稳态后不再重算。CPU+GPU 各约 66MB 常驻。
@@ -112,9 +118,96 @@ def generate_rotation_matrix(d: int, seed: int = 42, device: Optional[torch.devi
 
 def clear_rotation_cache() -> None:
     """清空旋转矩阵缓存，释放内存"""
-    global _ROTATION_CACHE, _ROTATION_CACHE_DEV
+    global _ROTATION_CACHE, _ROTATION_CACHE_DEV, _BATCH_ROTATION_CACHE
     _ROTATION_CACHE.clear()
     _ROTATION_CACHE_DEV.clear()
+    _BATCH_ROTATION_CACHE.clear()
+
+
+def generate_batch_rotation_matrices(
+    d: int,
+    seed_base: int,
+    num_groups: int,
+    stride: int,
+    device: torch.device,
+    dtype: torch.dtype = torch.float16,
+) -> torch.Tensor:
+    """生成 batch 旋转矩阵，形状 (num_groups, d, d)。
+
+    用于 P4-7 旋转优化：将 num_groups 个小 matmul 合并为一次 bmm。
+    每个 group 的 seed = seed_base + group_idx * stride。
+
+    结果按 (d, seed_base, num_groups, stride, device, dtype) 缓存。
+
+    Args:
+        d: 每个旋转矩阵的维度
+        seed_base: 起始 seed
+        num_groups: group 数量
+        stride: 每个 group 的 seed 增量（通常 = group_size）
+        device: 目标设备
+        dtype: 目标 dtype
+
+    Returns:
+        P_batch: (num_groups, d, d) 的 batch 正交矩阵
+    """
+    global _BATCH_ROTATION_CACHE
+
+    key = (d, seed_base, num_groups, stride, str(device), str(dtype))
+    if key in _BATCH_ROTATION_CACHE:
+        return _BATCH_ROTATION_CACHE[key]
+
+    # 逐个生成并堆叠（复用 generate_rotation_matrix 的 L1 缓存）
+    mats = []
+    for i in range(num_groups):
+        seed = seed_base + i * stride
+        P = generate_rotation_matrix(d, seed, device=device).to(dtype)
+        mats.append(P)
+
+    P_batch = torch.stack(mats, dim=0).contiguous()  # (num_groups, d, d)
+
+    if len(_BATCH_ROTATION_CACHE) >= _MAX_BATCH_CACHE_SIZE:
+        first_key = next(iter(_BATCH_ROTATION_CACHE.keys()))
+        del _BATCH_ROTATION_CACHE[first_key]
+
+    _BATCH_ROTATION_CACHE[key] = P_batch
+    return P_batch
+
+
+def batch_rotate_input(
+    x: torch.Tensor,
+    group_size: int,
+    seed_base: int,
+) -> torch.Tensor:
+    """对输入 x 做分组旋转，使用 batch matmul 加速。
+
+    P4-7 优化：把 num_groups 次小 matmul 合并成一次 bmm，
+    消除 Python 循环 + 多次 kernel launch 开销。
+
+    Args:
+        x: 输入张量 (B, K_total)，K_total 必须是 group_size 的整数倍
+        group_size: 每个 group 的大小
+        seed_base: 起始 seed（每个 group 的 seed = seed_base + g_start）
+
+    Returns:
+        x_rot: 旋转后的张量 (B, K_total)，连续存储
+    """
+    B, K_total = x.shape
+    num_groups = K_total // group_size
+
+    # 获取 batch 旋转矩阵 (num_groups, group_size, group_size)
+    P_batch = generate_batch_rotation_matrices(
+        group_size, seed_base, num_groups, stride=group_size,
+        device=x.device, dtype=x.dtype,
+    )
+
+    # reshape x 为 (num_groups, B, group_size) 以便 bmm
+    x_groups = x.view(B, num_groups, group_size).transpose(0, 1).contiguous()
+    # bmm: (num_groups, B, group_size) @ (num_groups, group_size, group_size).T
+    #    = (num_groups, B, group_size)
+    x_rot_groups = torch.bmm(x_groups, P_batch.transpose(1, 2))
+    # 转回 (B, K_total)
+    x_rot = x_rot_groups.transpose(0, 1).contiguous().view(B, K_total)
+    return x_rot
 
 
 # ---------------------------------------------------------------------------

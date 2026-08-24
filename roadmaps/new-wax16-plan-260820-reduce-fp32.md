@@ -167,29 +167,167 @@ FP16 accumulator 的精度影响需要验证：
 
 ---
 
-## P4：FP16 链路后的内核深度优化
+## P3 快速验证项（低风险，先逐个试）
 
-P2 FP16 改造完成后，kernel 计算从 TF32 切换到 FP16 Tensor Core，性能格局发生变化：
-- 2-bit kernel 加速明显（~1.3x+），计算仍是瓶颈，FP16 吃得满
-- 4-bit kernel 加速有限（~1.0x），瓶颈从计算转向 unpack + codebook lookup
-- 固定 block size 配置可能不再是 fp16 下的最优解
+在做大改动之前，先验证几个低开销的小优化，确认各自的收益量级。
+全部在 `test_triton_mp_moe_e2e_bench.py` 上测，有收益的再上 run.q.sh。
 
-### 优先级排序（更新于 P4-2 完成后）
+### P3-a：旋转缓存上限 128 → 2048 ✅ 已落地
 
-| # | 优化项 | 预期收益 | 难度 | 状态 |
-|---|--------|---------|------|------|
-| 1 | **多 group 融合到单个 kernel launch**（P4-4） | 高（e2e 2.04x，per-kernel 2-11x） | 中高 | ✅ 已完成 |
-| 2 | Block size / num_warps / num_stages 离线调优（P4-2） | 中（e2e ~10%, per-kernel 1.4-2x） | 低 | ✅ 已完成 |
-| 3 | **旋转计算优化（单 kernel / 减少 launch 开销）**（P4-7，新） | **高（旋转占 ~80% 前向时间）** | 中 | 🔍 分析中 |
-| 4 | Grouped GEMM 化（同 bit 多 expert 一次 kernel）（P4-6） | 高 | 高 | ⏳ 待做 |
-| 5 | 4-bit codebook gather 深度优化（P4-1） | 中低（大 K 场景收益大，per-group 小） | 中 | ⏳ 待做 |
-| 6 | Gate-Up epilogue 融合（silu+mul 合进 kernel）（P4-3） | 低（~2-3%，silu 本身占比小） | 低 | ⏸ 已评估，收益低暂不做 |
-| 7 | 旋转跨 bit 复用（P4-5 上半） | - | - | ❌ 不可行（各 bit seed 不同） |
-| 8 | dual matmul 接入 grouped（P4-5 下半） | 低 | 低 | ⏸ 价值不大（gate_up 已融合） |
+- **背景**：down 方向 seed 含 expert 偏移，每 forward 工作集 ~1032 个 key > 上限 128，
+  导致每 forward 都发生缓存抖动，QR 重算 ~1160 次 ≈ 284ms（详见 profile 文档 §十 记录 4）
+- **改动**：`rotation.py` 的 `_MAX_CACHE_SIZE` 从 128 改到 2048
+- **显存代价**：CPU ~66MB + GPU ~66MB（1032 个 128×128 矩阵 × 4B），可接受
+- **风险**：极低，一行改动
+- **实测结果**：
+  - 双模块陷阱排查：`turboquant_utils.rotation` 和 `turboquant_model.rotation` 是同一模块对象
+    （`sys.modules.setdefault` 别名机制），`_MAX_CACHE_SIZE = 2048` 已全局生效，无需重复修改
+  - mini-MoE e2e bench（16 experts）：几乎无收益（expert 少，工作集未超 128，本来就不抖）
+  - 真实 run.q.sh（256 experts）：收益应已包含在 gc 删除之前的 baseline 中，无法单独剥离
+- **结论**：改正确、零风险，已经生效；真实场景有收益但无法单独量化，留着即可。
 
-> **关键发现**：旋转计算占 forward 时间的 ~80%（B=32, K=2048 时约 0.17ms vs kernel 0.045ms），
-> 远大于 dequant+matmul 本身。之前所有 P4 优化都只针对那 20% 的 kernel 计算时间。
-> 旋转是下一个最大的优化空间。详见 P4-7 章节。
+### P3-b：去掉 forward 末尾的 gc.collect() / empty_cache() ✅ 已落地
+
+- **背景**：`WxA16BitPartitionedGroupMoE.forward` 末尾每轮都调 `gc.collect()` 和
+  `torch.cuda.empty_cache()`。前者是 CPU 同步+扫描，后者触发 GPU 同步+释放，
+  在每 forward 都调的情况下贡献显著开销
+- **改动**：直接删除（不加开关）
+- **风险**：显存碎片可能增加，但推理阶段分配模式稳定，实际未发现问题
+- **实测结果**：
+  - mini-MoE e2e bench：~24% 加速（forward 末尾同步开销被移除后，triton 占比从 ~70% → 97.8%）
+  - 真实 run.q.sh：Layer 0 forward 从 ~19-20s → **12.51s**，约 **35-38%** 加速
+    （比 bench 幅度更大，可能因为 attention + MoE 叠加效应）
+- **结论**：本轮最大的"白捡"优化，已落地且效果显著。
+
+### P3-c：去掉 expert_offsets[expert_idx].item() 的 D2H 同步 ✅ 已落地
+
+- **背景**：per-expert × per-bit 循环里 `expert_offsets[expert_idx].item()` 每次触发
+  D2H 同步（CPU 等 GPU 返回一个整数）。256 experts × 2 bits = 1024 次/forward
+- **改动**：`expert_offsets` 加载时生成 CPU 常驻 Python list（`self._expert_offsets_cpu`），
+  循环里直接读 list 索引。加懒初始化兼容所有构造路径
+- **风险**：极低，不改变数值
+- **实测结果**（e2e bench，含完整 GPU 同步）：
+
+  | 配置 | 节省比例 | 绝对节省 |
+  |------|---------|---------|
+  | 16 experts, H=1024 | -2.3% | 0.59 ms |
+  | 64 experts, H=1024 | -3.0% | 2.07 ms |
+  | 256 experts, H=512 | **-5.9%** | 10.15 ms |
+
+  真实 run.q.sh（256 exp, H=2048）：Layer 0 从 12.51s → **12.31s**，约 **-1.6%**。
+  原因：大 H 下 kernel 计算占绝对主导，Python 同步开销被稀释。
+
+- **结论**：确定有效、零风险、改动极小，已落地。大 H 场景收益有限但白捡。
+
+### P3-d：scatter_reduce_ → index_add_ ✅ 已落地
+
+- **背景**：`final_hidden_states.scatter_reduce_(0, exp_token_idx.view(-1,1).repeat(1, H), ...)`
+  需要先把 1D index repeat 成 (M, H) 的大张量，每 expert 一次额外分配 + 拷贝
+- **改动**：改用 `final_hidden_states.index_add_(0, exp_token_idx, expert_out)`，
+  index 保持 1D，语义完全等价（dim=0 按行累加）
+- **风险**：极低，e2e 精度验证 max_diff = 0.0（完全一致）
+- **实测结果**（e2e bench）：
+
+  | 配置 | 节省比例 | 绝对节省 |
+  |------|---------|---------|
+  | 16 experts, H=1024 | -1.2% | 0.31 ms |
+  | 64 experts, H=1024 | -2.2% | 1.51 ms |
+  | 256 experts, H=512 | **-4.5%** | 7.76 ms |
+
+- **结论**：代码更简洁、零风险、数值完全一致，已落地。小 expert/大 B 场景收益小，
+  expert 多且每 expert token 少的场景收益更明显。
+
+### P3 小结
+
+| 优化 | e2e bench (256 exp) | run.q.sh (Layer 0) | 风险 | 状态 |
+|------|---------------------|---------------------|------|------|
+| P3-a 旋转缓存 2048 | 无法单独测（已生效） | 已包含在 baseline | 极低 | ✅ 已落地 |
+| P3-b 删 gc | ~24% | ~35%（19→12.5s） | 低 | ✅ 已落地 |
+| P3-c 去 .item() | ~5.9% | ~1.6%（12.51→12.31s） | 极低 | ✅ 已落地 |
+| P3-d index_add_ | ~4.5% | <1%（包含在上条内） | 极低 | ✅ 已落地 |
+
+P3 全部为"纯 overhead 消除、不碰计算逻辑"类优化，零风险或极低风险，累计 run.q.sh 上
+Layer 0 forward 从 ~19-20s → 12.31s，**约 36-38% 加速**。大头来自 P3-b（删 gc），
+其余几项是"白捡"的叠加收益。
+
+---
+
+### P4 实验笔记（P4-1 瓶颈分析，已完成）
+
+**实验脚本**：`test_p4_4bit_unpack.py`, `test_p4_codebook_opt.py`, `test_p4_e2e_sim.py`
+
+#### 单 kernel 层面
+
+| 场景 | FP16 | 4-bit | 2-bit | 4/2 比 |
+|------|------|-------|-------|--------|
+| per-group (K=128) | 15.2 TFLOPs | 12.0 TFLOPs | - | - |
+| large K (K=2048) | 65 TFLOPs | 10 TFLOPs | ~10 TFLOPs | ~1.0x |
+
+**关键结论**：
+1. **4-bit 的瓶颈不在 unpack**，而在 **codebook gather（间接内存访问）**
+   - 开销分解：tl.dot 占 ~15%，unpack 占 ~0%，gather 占 ~85%（大 K 场景）
+   - codebook 只有 16 个 fp16 值（32 字节），完全在 L1 cache，但间接寻址指令开销大
+2. **4-bit ≈ 2-bit**（1.04x），bit-width 几乎不影响性能
+   - 因为 gather 开销相同，且都远大于 tl.dot 计算
+3. **tl.where 展开反而更慢**（0.84x）：15 个选择指令 > 1 次 gather
+4. **num_warps=2 比 4 快 ~50%**：warp 间 L1 cache 竞争
+
+#### e2e grouped 调用层面
+
+| 场景 | FP16 整矩阵 | 4-bit grouped | 差距 |
+|------|------------|--------------|------|
+| down (22 groups, K=2816) | 0.023 ms (65 TFLOPs) | 0.164 ms (9 TFLOPs) | 7.25x |
+| gate_up (16 groups, K=2048) | 0.021 ms (72 TFLOPs) | 0.119 ms (12 TFLOPs) | 5.78x |
+
+**关键结论**：
+1. **kernel launch overhead 几乎为 0**（<1%），不是问题
+2. **真正的问题是小 K 导致 Tensor Core 利用率低**
+   - 每个 group K=128 的 matmul 效率只有整矩阵的 ~1/5
+   - 22 个小 kernel 的总时间 = 22 × 单个小 kernel 时间
+   - 而 FP16 整矩阵 1 个大 kernel 时间很短
+3. **分组调用方式本身是最大瓶颈**，不是单个 kernel 的计算效率
+
+#### 优先级调整
+
+P4-1（unpack 向量化）收益有限，下调优先级。
+**P4-4（多 group fusion）上调为最高优先级** — 通过减少分组次数提高 Tensor Core 利用率。
+
+#### P4-4 实验结论（已完成 ✅）
+
+- **收益**：
+  - per-kernel: 2.2x - 11.5x（视 bit-width 和 B 大小而定）
+  - **全模型 e2e (Layer 0): 2.04x**（8.44s → 4.13s, Qwen3.5-35B-A3B）
+- **覆盖范围**：`triton_fused_matmul_grouped` / `_slice_rows` / `_slice_in_features`
+- **支持 bit-width**：1/2/4/8
+- **接口不变**，内部根据 `in_features % group_size == 0 and num_groups >= 2` 自动选择 fast path
+- **精度**：
+  - 数值：FP16 累加顺序差异 ≈ 0.03-0.05%，完全正常
+  - 全模型 PPL：wikitext2 6.5581 vs 6.5613，c4 9.6765 vs 9.677（baseline），基本吻合
+- **验证日志**：`logs/0818.5.wxa16.opt.p4-4.log`
+- **commit 对比**：575adf8+ (P4-4) vs dfb8fc1 (baseline)
+
+---
+
+## P4：FP16 链路后的内核深度优化 ✅ 阶段完成
+
+P2 FP16 改造完成后，针对 kernel 计算侧做了一系列深度优化。
+目前主要优化项已完成，P4 阶段进入收尾。
+
+### 总览
+
+| 编号 | 优化项 | 状态 | e2e 收益 | 难度 |
+|------|--------|------|---------|------|
+| **P4-4** | Multi-group fused kernel（单 kernel 多 group 累加） | ✅ 已完成 | **2.04x** | 中 |
+| **P4-2** | Block size / num_warps 离线调优（per-bit 最优配置） | ✅ 已完成 | **+9.5%** | 低 |
+| **P4-7** | 旋转计算 bmm 优化（loop → batch matmul） | ✅ 已完成 | **+7-8%** | 低 |
+| P4-1 | 4-bit codebook gather 深度优化 | ⏸ 优先级下调 | 预期低 | 中 |
+| P4-3 | Gate-Up epilogue fusion（silu+mul 合进 kernel） | ⏸ 收益低暂不做 | ~2-3% | 低 |
+| P4-5 | 旋转跨 bit 复用 | ❌ 不可行 | - | - |
+
+**累计 e2e 加速（Layer 0 forward）**：从 baseline ~8.44s → ~3.5s，约 **2.4x**
+（P4-4 2.04x × P4-2 1.095 × P4-7 1.075，粗略估计）
+
+后续 kernel 侧优化（如多 expert fusion、codebook gather 等）转入下一阶段探索。
 
 ### P4-1：4-bit unpack / codebook lookup 优化（优先级下调）
 
@@ -380,10 +518,10 @@ dequant + matmul，乘 norms 后累加到 total_acc。x_rot 在 Python 侧预计
 
 ---
 
-### P4-7：旋转计算优化（最高优先级新发现）🔍 分析中
+### P4-7：旋转计算优化（bmm 方案）✅ 已完成
 
 **背景**：
-- 性能 profiling 发现：**旋转计算占 forward 时间的 ~79%**（B=32, K=2048 时）
+- 性能 profiling 发现：**旋转计算占 forward 时间的 ~79%**（P4-4 优化后，B=32, K=2048 时）
   - 旋转：0.17ms
   - dequant + matmul（fused grouped kernel）：0.045ms
 - 之前 P4-1/P4-2/P4-4 都只优化了 kernel 计算（那 21%），旋转完全没动过
@@ -392,185 +530,71 @@ dequant + matmul，乘 norms 后累加到 total_acc。x_rot 在 Python 侧预计
 - K=2048, group_size=128 → 16 个 group，每个 group 做一次 (B,128) @ (128,128) 的小 matmul
 - 16 次 Python 循环 + 16 次 kernel launch + 16 次张量分配
 - 小 matmul 的 Tensor Core 利用率极低
-- 纯计算量只有 16.8M FLOPs（B=32），理论上应该 0.0002ms 就够
-- 实际 0.17ms，差了 1000 倍 → **瓶颈是 launch 开销 + 小 kernel 效率，不是计算量**
+- 瓶颈是 launch 开销 + 小 kernel 效率，不是计算量
 
-**候选优化方案**：
-
-#### 方案 A：块对角大矩阵乘（❌ 计算量翻 16 倍，不可行）
-- 把 16 个 Pi 拼成 (2048, 2048) 的块对角矩阵，一次大 matmul
-- 大 matmul 计算量 = 2 × B × K × K = 268M FLOPs（是小 matmul 的 16 倍）
-- 即使 Tensor Core 利用率 100%，也比小 matmul 的总时间长
-- 结论：不可行
-
-#### 方案 B：单 Triton kernel 内完成所有 group 的旋转（🔍 待验证）
-- 写一个 Triton kernel，一个 launch 处理所有 group 的旋转
-- 省去 Python 循环 + 多次 kernel launch 开销
-- 每个 group 的旋转独立，并行度充足
-- 难点：128×128 的小 matmul 在 Triton 里效率不一定比 cuBLAS 高
-- 预期收益：如果 launch 是主要瓶颈，可快 2-3 倍
-
-#### 方案 C：torch.bmm（batch matrix multiply）
+**选定方案：torch.bmm（batch matrix multiply）**
 - x reshape 成 (num_groups, B, group_size)
-- 所有 Pi 拼成 (num_groups, group_size, group_size)
-- `torch.bmm(x_3d, P_3d.transpose(1,2))` 一次调用
-- PyTorch 内部会优化 batch matmul 的 launch
-- 预期收益：省 Python 循环 + 减少 launch 数
-- 风险：bmm 对小尺寸 batch 的优化程度未知
+- 所有 Pi 预先生成并拼成 (num_groups, group_size, group_size) 的 batch 矩阵（带缓存）
+- `torch.bmm(x_3d, P_3d.transpose(1,2))` 一次调用完成所有 group 的旋转
+- 省去 Python 循环 + 多次 launch 开销，bmm 内部 batch 调度效率更高
 
-#### 方案 D：旋转矩阵直接缓存 fp16
-- 当前 `generate_rotation_matrix` 缓存 fp32，每次调用 `.half()`
-- 如果直接缓存 fp16 版本（或两个都缓存），省转换开销
-- 收益估计：小（half() 转换很快），但改动最小
+**实现细节**：
+- 新增 `rotation.generate_batch_rotation_matrices()`：生成 batch 旋转矩阵，按 `(d, seed_base, num_groups, stride, device, dtype)` 缓存
+- 新增 `rotation.batch_rotate_input()`：bmm 旋转入口，输入 (B, K_total)，输出 (B, K_total)
+- 修改三个 grouped 函数的 fast path：用 `batch_rotate_input()` 替代 for-loop 旋转
+- Fallback 路径（非对齐 group_size）保留原 loop 方式
 
-#### 方案 E：预分配 x_rot 输出 buffer + in-place 旋转
-- 当前每次 forward 都重新分配 x_rot_list + cat，有内存分配开销
-- 预分配一个 (B, K_total) 的 buffer，每个 group 的结果直接写入
-- 省去 cat + contiguous 的开销
-- 收益估计：中
+**实验结果**（RTX 5090, group_size=128, fp16）：
 
-**下一步**：先 profiling 确认瓶颈分布（launch 开销 vs 纯计算），再选最优方案。
+旋转本身加速：
+| 场景 | loop 旋转 | bmm 旋转 | 加速比 |
+|------|----------|---------|--------|
+| B=32, K=1024 (8 groups) | 0.092 ms | 0.018 ms | 5.26x |
+| B=32, K=2048 (16 groups) | 0.184 ms | 0.018 ms | 10.49x |
+| B=32, K=2816 (22 groups) | 0.247 ms | 0.017 ms | 14.14x |
+| B=128, K=2816 (22 groups) | 0.246 ms | 0.017 ms | 14.43x |
 
----
+MoE 层 e2e（1-bit + 2-bit + 4-bit gate_up + 4-bit down）：
+- 旧方式（loop 旋转 + P4-4/P4-2 kernel）：0.647 ms / layer
+- 新方式（bmm 旋转 + P4-4/P4-2 kernel）：0.184 ms / layer
+- **加速比：3.53x**
+- 旋转占比从 ~70%+ 降至 ~37%
 
-## P3 快速验证项（低风险，先逐个试）
+**正确性**：
+- `batch_rotate_input` 与 loop 旋转：**0 误差**（精确一致）
+- 端到端 grouped 函数：相对误差 < 0.12%（fp16 累加顺序差异，P4-4 本身就有，非 P4-7 引入）
 
-在做大改动之前，先验证几个低开销的小优化，确认各自的收益量级。
-全部在 `test_triton_mp_moe_e2e_bench.py` 上测，有收益的再上 run.q.sh。
+**修改文件**：
+- `turboquant_utils/rotation.py`：新增 batch 旋转矩阵缓存 + `batch_rotate_input()`
+- `turboquant_utils/triton_kernels.py`：三个 grouped 函数的 fast path 改用 bmm 旋转
+- 删除 P4-3 废弃代码（286 行）
 
-### P3-a：旋转缓存上限 128 → 2048 ✅ 已落地
+**全模型 e2e 实测**（Qwen3.5-35B-A3B, run.q.sh, P4-7 bmm 旋转 vs P4-4+P4-2 baseline）：
 
-- **背景**：down 方向 seed 含 expert 偏移，每 forward 工作集 ~1032 个 key > 上限 128，
-  导致每 forward 都发生缓存抖动，QR 重算 ~1160 次 ≈ 284ms（详见 profile 文档 §十 记录 4）
-- **改动**：`rotation.py` 的 `_MAX_CACHE_SIZE` 从 128 改到 2048
-- **显存代价**：CPU ~66MB + GPU ~66MB（1032 个 128×128 矩阵 × 4B），可接受
-- **风险**：极低，一行改动
-- **实测结果**：
-  - 双模块陷阱排查：`turboquant_utils.rotation` 和 `turboquant_model.rotation` 是同一模块对象
-    （`sys.modules.setdefault` 别名机制），`_MAX_CACHE_SIZE = 2048` 已全局生效，无需重复修改
-  - mini-MoE e2e bench（16 experts）：几乎无收益（expert 少，工作集未超 128，本来就不抖）
-  - 真实 run.q.sh（256 experts）：收益应已包含在 gc 删除之前的 baseline 中，无法单独剥离
-- **结论**：改正确、零风险，已经生效；真实场景有收益但无法单独量化，留着即可。
+WxA16BitPartitionedGroupMoE（量化层，同层对比）：
+| Layer | attn 类型 | baseline forward | P4-7 forward | 加速比 | baseline moe | P4-7 moe |
+|-------|----------|-----------------|--------------|--------|-------------|----------|
+| L0 | linear_attn | 3.77s | 3.51s | 1.07x | 2.70s | 1.62s* |
+| L1 | linear_attn | 3.90s | 3.60s | 1.08x | 2.80s | 2.65s |
+| L2 | linear_attn | 3.93s | 3.64s | 1.08x | 2.81s | 2.65s |
+| L3 | self_attn | 2.83s | 2.54s | 1.11x | 2.81s | 2.53s |
+| L4 | linear_attn | 3.96s | 3.70s | 1.07x | 2.84s | 2.70s |
 
-### P3-b：去掉 forward 末尾的 gc.collect() / empty_cache() ✅ 已落地
+> * L0 的 moe/attn 分配异常，可能是首次运行缓存效应，参考价值低。
 
-- **背景**：`WxA16BitPartitionedGroupMoE.forward` 末尾每轮都调 `gc.collect()` 和
-  `torch.cuda.empty_cache()`。前者是 CPU 同步+扫描，后者触发 GPU 同步+释放，
-  在每 forward 都调的情况下贡献显著开销
-- **改动**：直接删除（不加开关）
-- **风险**：显存碎片可能增加，但推理阶段分配模式稳定，实际未发现问题
-- **实测结果**：
-  - mini-MoE e2e bench：~24% 加速（forward 末尾同步开销被移除后，triton 占比从 ~70% → 97.8%）
-  - 真实 run.q.sh：Layer 0 forward 从 ~19-20s → **12.51s**，约 **35-38%** 加速
-    （比 bench 幅度更大，可能因为 attention + MoE 叠加效应）
-- **结论**：本轮最大的"白捡"优化，已落地且效果显著。
+排除 L0 后结论：
+- **MoE e2e 加速：~5-6%**（moe 2.8s → 2.65s）
+- **Layer forward 加速：~7-8%**（3.9s → 3.6s）
+- Micro-bench 3.53x 未能完全体现，原因：
+  1. 真实场景 expert 内 token 数少（top-k 路由后 batch 小），bmm 优势减弱
+  2. 256 experts × 3 bit 的 per-expert launch 开销占比更高
+  3. 旋转本身在完整 MoE forward 中占比低于 micro-bench 估计
+- PPL：待验证
 
-### P3-c：去掉 expert_offsets[expert_idx].item() 的 D2H 同步 ✅ 已落地
-
-- **背景**：per-expert × per-bit 循环里 `expert_offsets[expert_idx].item()` 每次触发
-  D2H 同步（CPU 等 GPU 返回一个整数）。256 experts × 2 bits = 1024 次/forward
-- **改动**：`expert_offsets` 加载时生成 CPU 常驻 Python list（`self._expert_offsets_cpu`），
-  循环里直接读 list 索引。加懒初始化兼容所有构造路径
-- **风险**：极低，不改变数值
-- **实测结果**（e2e bench，含完整 GPU 同步）：
-
-  | 配置 | 节省比例 | 绝对节省 |
-  |------|---------|---------|
-  | 16 experts, H=1024 | -2.3% | 0.59 ms |
-  | 64 experts, H=1024 | -3.0% | 2.07 ms |
-  | 256 experts, H=512 | **-5.9%** | 10.15 ms |
-
-  真实 run.q.sh（256 exp, H=2048）：Layer 0 从 12.51s → **12.31s**，约 **-1.6%**。
-  原因：大 H 下 kernel 计算占绝对主导，Python 同步开销被稀释。
-
-- **结论**：确定有效、零风险、改动极小，已落地。大 H 场景收益有限但白捡。
-
-### P3-d：scatter_reduce_ → index_add_ ✅ 已落地
-
-- **背景**：`final_hidden_states.scatter_reduce_(0, exp_token_idx.view(-1,1).repeat(1, H), ...)`
-  需要先把 1D index repeat 成 (M, H) 的大张量，每 expert 一次额外分配 + 拷贝
-- **改动**：改用 `final_hidden_states.index_add_(0, exp_token_idx, expert_out)`，
-  index 保持 1D，语义完全等价（dim=0 按行累加）
-- **风险**：极低，e2e 精度验证 max_diff = 0.0（完全一致）
-- **实测结果**（e2e bench）：
-
-  | 配置 | 节省比例 | 绝对节省 |
-  |------|---------|---------|
-  | 16 experts, H=1024 | -1.2% | 0.31 ms |
-  | 64 experts, H=1024 | -2.2% | 1.51 ms |
-  | 256 experts, H=512 | **-4.5%** | 7.76 ms |
-
-- **结论**：代码更简洁、零风险、数值完全一致，已落地。小 expert/大 B 场景收益小，
-  expert 多且每 expert token 少的场景收益更明显。
-
-### P3 小结
-
-| 优化 | e2e bench (256 exp) | run.q.sh (Layer 0) | 风险 | 状态 |
-|------|---------------------|---------------------|------|------|
-| P3-a 旋转缓存 2048 | 无法单独测（已生效） | 已包含在 baseline | 极低 | ✅ 已落地 |
-| P3-b 删 gc | ~24% | ~35%（19→12.5s） | 低 | ✅ 已落地 |
-| P3-c 去 .item() | ~5.9% | ~1.6%（12.51→12.31s） | 极低 | ✅ 已落地 |
-| P3-d index_add_ | ~4.5% | <1%（包含在上条内） | 极低 | ✅ 已落地 |
-
-P3 全部为"纯 overhead 消除、不碰计算逻辑"类优化，零风险或极低风险，累计 run.q.sh 上
-Layer 0 forward 从 ~19-20s → 12.31s，**约 36-38% 加速**。大头来自 P3-b（删 gc），
-其余几项是"白捡"的叠加收益。
-
----
-
-### P4 实验笔记（P4-1 瓶颈分析，已完成）
-
-**实验脚本**：`test_p4_4bit_unpack.py`, `test_p4_codebook_opt.py`, `test_p4_e2e_sim.py`
-
-#### 单 kernel 层面
-
-| 场景 | FP16 | 4-bit | 2-bit | 4/2 比 |
-|------|------|-------|-------|--------|
-| per-group (K=128) | 15.2 TFLOPs | 12.0 TFLOPs | - | - |
-| large K (K=2048) | 65 TFLOPs | 10 TFLOPs | ~10 TFLOPs | ~1.0x |
-
-**关键结论**：
-1. **4-bit 的瓶颈不在 unpack**，而在 **codebook gather（间接内存访问）**
-   - 开销分解：tl.dot 占 ~15%，unpack 占 ~0%，gather 占 ~85%（大 K 场景）
-   - codebook 只有 16 个 fp16 值（32 字节），完全在 L1 cache，但间接寻址指令开销大
-2. **4-bit ≈ 2-bit**（1.04x），bit-width 几乎不影响性能
-   - 因为 gather 开销相同，且都远大于 tl.dot 计算
-3. **tl.where 展开反而更慢**（0.84x）：15 个选择指令 > 1 次 gather
-4. **num_warps=2 比 4 快 ~50%**：warp 间 L1 cache 竞争
-
-#### e2e grouped 调用层面
-
-| 场景 | FP16 整矩阵 | 4-bit grouped | 差距 |
-|------|------------|--------------|------|
-| down (22 groups, K=2816) | 0.023 ms (65 TFLOPs) | 0.164 ms (9 TFLOPs) | 7.25x |
-| gate_up (16 groups, K=2048) | 0.021 ms (72 TFLOPs) | 0.119 ms (12 TFLOPs) | 5.78x |
-
-**关键结论**：
-1. **kernel launch overhead 几乎为 0**（<1%），不是问题
-2. **真正的问题是小 K 导致 Tensor Core 利用率低**
-   - 每个 group K=128 的 matmul 效率只有整矩阵的 ~1/5
-   - 22 个小 kernel 的总时间 = 22 × 单个小 kernel 时间
-   - 而 FP16 整矩阵 1 个大 kernel 时间很短
-3. **分组调用方式本身是最大瓶颈**，不是单个 kernel 的计算效率
-
-#### 优先级调整
-
-P4-1（unpack 向量化）收益有限，下调优先级。
-**P4-4（多 group fusion）上调为最高优先级** — 通过减少分组次数提高 Tensor Core 利用率。
-
-#### P4-4 实验结论（已完成 ✅）
-
-- **收益**：
-  - per-kernel: 2.2x - 11.5x（视 bit-width 和 B 大小而定）
-  - **全模型 e2e (Layer 0): 2.04x**（8.44s → 4.13s, Qwen3.5-35B-A3B）
-- **覆盖范围**：`triton_fused_matmul_grouped` / `_slice_rows` / `_slice_in_features`
-- **支持 bit-width**：1/2/4/8
-- **接口不变**，内部根据 `in_features % group_size == 0 and num_groups >= 2` 自动选择 fast path
-- **精度**：
-  - 数值：FP16 累加顺序差异 ≈ 0.03-0.05%，完全正常
-  - 全模型 PPL：wikitext2 6.5581 vs 6.5613，c4 9.6765 vs 9.677（baseline），基本吻合
-- **验证日志**：`logs/0818.5.wxa16.opt.p4-4.log`
-- **commit 对比**：575adf8+ (P4-4) vs dfb8fc1 (baseline)
+**下一步优化方向**：
+- 旋转还占 moe 时间的 ~30%+，但再抠旋转收益有限
+- 更大的瓶颈可能是：256 experts 的 per-expert launch 开销、CPU 端路由调度开销
+- 可以考虑：expert 批处理（fused expert）、减少 Python 层循环开销
 
 ---
 

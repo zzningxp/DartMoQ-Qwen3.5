@@ -36,7 +36,7 @@ import torch
 import triton
 import triton.language as tl
 
-from .rotation import generate_rotation_matrix
+from .rotation import generate_rotation_matrix, batch_rotate_input
 
 
 @triton.jit
@@ -537,50 +537,52 @@ def triton_fused_matmul_grouped(
     if norms.dim() == 1:
         norms = norms.unsqueeze(1)
 
-    # Pre-compute all rotations first
-    # Step 2 (FP16 链路改造): 旋转计算与输入同 dtype（fp16/bf16）
-    # - 旋转矩阵 Pi 从 fp32 转到 x.dtype（正交矩阵元素在 [-1,1]，低精度足够）
-    # - 输入 x 保持原 dtype，不再 .float() 升 fp32
-    # - 目的: tl.dot 两边 dtype 一致，走对应精度的 Tensor Core
+    # P4-7: Batch rotation via bmm（fast path，in_features 对齐 group_size）
+    # 把 num_groups 次小 matmul 合并为一次 bmm，消除 Python 循环 + 多次 launch 开销。
+    if in_features % group_size == 0:
+        num_groups = in_features // group_size
+        # P4-4: Multi-group fused fast path 条件：num_groups >= 2
+        if num_groups >= 2:
+            orig_dtype = x.dtype
+            if orig_dtype != torch.float16:
+                codebook = codebook.half()
+                norms = norms.half()
+                x_rot = batch_rotate_input(x.half(), group_size, seed)
+            else:
+                x_rot = batch_rotate_input(x, group_size, seed)
+
+            scale = math.sqrt(group_size)
+            norms_scaled = norms / scale
+
+            output_fp16 = _triton_fused_matmul_grouped_fused(
+                x_rot, indices_packed, codebook, norms_scaled,
+                group_size, num_groups, bit_width,
+            )
+
+            if orig_dtype != torch.float16:
+                return output_fp16.to(orig_dtype)
+            return output_fp16
+
+        # num_groups == 1 的 fast path：直接单次旋转 + triton_fused_matmul
+        else:
+            Pi = generate_rotation_matrix(group_size, seed, device=x.device).to(x.dtype)
+            x_rot = x @ Pi.T
+            if norms.dim() == 2:
+                norms = norms.squeeze(1)
+            return triton_fused_matmul(x_rot, indices_packed, codebook, norms, in_features, bit_width)
+
+    # Fallback: 逐 group 调用（处理非对齐 in_features 等情况）
     num_groups = (in_features + group_size - 1) // group_size
     x_rot_list = []
     for group_idx in range(num_groups):
         g_start = group_idx * group_size
         g_end = min(g_start + group_size, in_features)
         g_dim = g_end - g_start
-
         Pi = generate_rotation_matrix(g_dim, seed + g_start, device=x.device).to(x.dtype)
         x_rot_g = x[:, g_start:g_end] @ Pi.T
         x_rot_list.append(x_rot_g)
 
-    # P4-4: Multi-group fused fast path
-    # 条件：所有 group 大小相同（in_features 是 group_size 的整数倍）且 num_groups >= 2
-    if in_features % group_size == 0 and num_groups >= 2:
-        # 统一在 fp16 下计算，输入为 bf16/fp32 时自动转
-        orig_dtype = x.dtype
-        if orig_dtype != torch.float16:
-            codebook = codebook.half()
-            norms = norms.half()
-            x_rot_list = [x.half() for x in x_rot_list]
-
-        # 拼接 x_rot (B, K_total)
-        x_rot_concat = torch.cat(x_rot_list, dim=1).contiguous()
-
-        # norms pre-scaled（和 triton_fused_matmul 内一致）
-        scale = math.sqrt(group_size)
-        norms_scaled = norms / scale
-
-        output_fp16 = _triton_fused_matmul_grouped_fused(
-            x_rot_concat, indices_packed, codebook, norms_scaled,
-            group_size, num_groups, bit_width,
-        )
-
-        if orig_dtype != torch.float16:
-            return output_fp16.to(orig_dtype)
-        return output_fp16
-
-    # Fallback: 逐 group 调用（处理非对齐 in_features 等情况）
-    output = torch.zeros(batch_size, out_features, dtype=x.dtype, device=x.device)  # Step 1: output 与输入同 dtype
+    output = torch.zeros(batch_size, out_features, dtype=x.dtype, device=x.device)
 
     group_idx = 0
     for g_start in range(0, in_features, group_size):
@@ -590,14 +592,13 @@ def triton_fused_matmul_grouped(
         x_rot_g = x_rot_list[group_idx]
 
         packed_start = g_start // ELEMENTS_PER_BYTE
-        g_end = g_start + g_dim  # in_features 结束位置
+        g_end = g_start + g_dim
         packed_end = g_end // ELEMENTS_PER_BYTE
         if g_end % ELEMENTS_PER_BYTE != 0:
             packed_end += 1
 
         norms_g = norms[:, group_idx]
 
-        # 去除列切片 clone：直接传整张 indices_packed，由内核按 col_start 偏移寻址
         out_g = triton_fused_matmul(x_rot_g, indices_packed, codebook, norms_g, g_dim, bit_width, col_start=packed_start)
 
         output += out_g
@@ -605,6 +606,7 @@ def triton_fused_matmul_grouped(
         group_idx += 1
 
     return output
+
 
 
 def triton_fused_matmul_grouped_slice_rows(
@@ -627,41 +629,49 @@ def triton_fused_matmul_grouped_slice_rows(
     if norms_slice.dim() == 1:
         norms_slice = norms_slice.unsqueeze(1)
 
-    # Pre-compute all rotations first
+    # P4-7: Batch rotation via bmm（fast path，in_features 对齐 group_size）
+    if in_features % group_size == 0:
+        num_groups = in_features // group_size
+        if num_groups >= 2:
+            orig_dtype = x.dtype
+            if orig_dtype != torch.float16:
+                codebook = codebook.half()
+                norms_slice = norms_slice.half()
+                x_rot = batch_rotate_input(x.half(), group_size, seed)
+            else:
+                x_rot = batch_rotate_input(x, group_size, seed)
+
+            scale = math.sqrt(group_size)
+            norms_scaled = norms_slice / scale
+
+            output_fp16 = _triton_fused_matmul_grouped_fused(
+                x_rot, indices_packed_slice, codebook, norms_scaled,
+                group_size, num_groups, bit_width,
+            )
+
+            if orig_dtype != torch.float16:
+                return output_fp16.to(orig_dtype)
+            return output_fp16
+
+        # num_groups == 1
+        else:
+            Pi = generate_rotation_matrix(group_size, seed, device=x.device).to(x.dtype)
+            x_rot = x @ Pi.T
+            if norms_slice.dim() == 2:
+                norms_slice = norms_slice.squeeze(1)
+            return triton_fused_matmul(x_rot, indices_packed_slice, codebook, norms_slice, in_features, bit_width)
+
+    # Fallback: 逐 group 调用（非对齐情况）
     num_groups = (in_features + group_size - 1) // group_size
     x_rot_list = []
     for group_idx in range(num_groups):
         g_start = group_idx * group_size
         g_end = min(g_start + group_size, in_features)
         g_dim = g_end - g_start
-
         Pi = generate_rotation_matrix(g_dim, seed + g_start, device=x.device).to(x.dtype)
         x_rot_g = x[:, g_start:g_end] @ Pi.T
         x_rot_list.append(x_rot_g)
 
-    # P4-4: Multi-group fused fast path
-    if in_features % group_size == 0 and num_groups >= 2:
-        orig_dtype = x.dtype
-        if orig_dtype != torch.float16:
-            codebook = codebook.half()
-            norms_slice = norms_slice.half()
-            x_rot_list = [x.half() for x in x_rot_list]
-
-        x_rot_concat = torch.cat(x_rot_list, dim=1).contiguous()
-
-        scale = math.sqrt(group_size)
-        norms_scaled = norms_slice / scale
-
-        output_fp16 = _triton_fused_matmul_grouped_fused(
-            x_rot_concat, indices_packed_slice, codebook, norms_scaled,
-            group_size, num_groups, bit_width,
-        )
-
-        if orig_dtype != torch.float16:
-            return output_fp16.to(orig_dtype)
-        return output_fp16
-
-    # Fallback: 逐 group 调用
     output = torch.zeros(batch_size, slice_out_features, dtype=x.dtype, device=x.device)
 
     group_idx = 0
@@ -705,53 +715,63 @@ def triton_fused_matmul_grouped_slice_in_features(
     if norms.dim() == 1:
         norms = norms.unsqueeze(1)
 
-    # Pre-compute all rotations first
+    # P4-7: Batch rotation via bmm（fast path，slice_in_features 对齐 group_size）
+    if slice_in_features % group_size == 0:
+        num_groups_in_slice = slice_in_features // group_size
+        # seed_base 用 original_start 对齐的 seed
+        seed_base = seed + original_start
+
+        if num_groups_in_slice >= 2:
+            orig_dtype = x.dtype
+            if orig_dtype != torch.float16:
+                codebook = codebook.half()
+                norms = norms.half()
+                x_rot = batch_rotate_input(x.half(), group_size, seed_base)
+            else:
+                x_rot = batch_rotate_input(x, group_size, seed_base)
+
+            scale = math.sqrt(group_size)
+            norms_scaled = norms / scale
+
+            # packed 起始列 = original_start 的 packed 位置
+            packed_col_start = original_start // ELEMENTS_PER_BYTE
+            # norms 起始 group = original_start // group_size
+            norms_group_start = original_start // group_size
+
+            output_fp16 = _triton_fused_matmul_grouped_fused(
+                x_rot, indices_packed, codebook, norms_scaled,
+                group_size, num_groups_in_slice, bit_width,
+                packed_col_start=packed_col_start,
+                norms_group_start=norms_group_start,
+                packed_k_stride=indices_packed.shape[1],
+                norms_col_stride=norms_scaled.shape[1],
+            )
+
+            if orig_dtype != torch.float16:
+                return output_fp16.to(orig_dtype)
+            return output_fp16
+
+        # num_groups_in_slice == 1
+        else:
+            Pi = generate_rotation_matrix(group_size, seed_base, device=x.device).to(x.dtype)
+            x_rot = x @ Pi.T
+            group_idx_original = original_start // group_size
+            norms_g = norms[:, group_idx_original] if norms.dim() == 2 else norms
+            packed_start = original_start // ELEMENTS_PER_BYTE
+            return triton_fused_matmul(x_rot, indices_packed, codebook, norms_g, group_size, bit_width, col_start=packed_start)
+
+    # Fallback: 逐 group 调用（非对齐情况）
     num_groups_in_slice = (slice_in_features + group_size - 1) // group_size
     x_rot_list = []
     for group_idx_in_slice in range(num_groups_in_slice):
         g_start_in_slice = group_idx_in_slice * group_size
         g_end_in_slice = min(g_start_in_slice + group_size, slice_in_features)
         g_dim = g_end_in_slice - g_start_in_slice
-
         g_start_original = original_start + g_start_in_slice
-
         Pi = generate_rotation_matrix(g_dim, seed + g_start_original, device=x.device).to(x.dtype)
         x_rot_g = x[:, g_start_in_slice:g_end_in_slice] @ Pi.T
         x_rot_list.append(x_rot_g)
 
-    # P4-4: Multi-group fused fast path
-    # slice_in_features 已对齐 group_size（original_start 已对齐，slice_in_features 也对齐）
-    if slice_in_features % group_size == 0 and num_groups_in_slice >= 2:
-        orig_dtype = x.dtype
-        if orig_dtype != torch.float16:
-            codebook = codebook.half()
-            norms = norms.half()
-            x_rot_list = [x.half() for x in x_rot_list]
-
-        x_rot_concat = torch.cat(x_rot_list, dim=1).contiguous()
-
-        scale = math.sqrt(group_size)
-        norms_scaled = norms / scale
-
-        # packed 起始列 = original_start 的 packed 位置
-        packed_col_start = original_start // ELEMENTS_PER_BYTE
-        # norms 起始 group = original_start // group_size
-        norms_group_start = original_start // group_size
-
-        output_fp16 = _triton_fused_matmul_grouped_fused(
-            x_rot_concat, indices_packed, codebook, norms_scaled,
-            group_size, num_groups_in_slice, bit_width,
-            packed_col_start=packed_col_start,
-            norms_group_start=norms_group_start,
-            packed_k_stride=indices_packed.shape[1],
-            norms_col_stride=norms_scaled.shape[1],
-        )
-
-        if orig_dtype != torch.float16:
-            return output_fp16.to(orig_dtype)
-        return output_fp16
-
-    # Fallback: 逐 group 调用
     output = torch.zeros(batch_size, out_features, dtype=x.dtype, device=x.device)
 
     group_idx_in_slice = 0
