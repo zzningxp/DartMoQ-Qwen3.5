@@ -178,9 +178,9 @@ def _check_qmeta_seeds(meta: dict, qmeta_tensors: dict):
     if mismatched:
         print(f"  [WARN] qmeta 种子与 meta.json 不一致 {len(mismatched)} 处: {mismatched[:5]}...（文件可能错配）")
     elif missing:
-        print(f"  [WARN] qmeta 种子缺失 {len(missing)} 个 key: {missing[:5]}...")
+        print(f"  [WARN] {len(missing)} qmeta seed keys missing: {missing[:5]}...")
     else:
-        print(f"  [OK] safetensors qmeta 种子与 meta.json 一致（{len(expected)} 个）")
+        print(f"  [OK] safetensors qmeta seeds match meta.json ({len(expected)} keys)")
 
 
 # ---------------------------------------------------------------------------
