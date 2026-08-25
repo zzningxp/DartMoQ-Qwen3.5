@@ -26,20 +26,18 @@
 
 ---
 
-## 一、当前仍可优化的点（按优先级）
+## 一、当前仍可优化的点（按 P 阶段排序）
 
-### Tier 1 — 结构性主线（直接啃真实差距，已验证是真实瓶颈）
+> P5 最先做，P6/P7/P8 依次往后。同一 P 阶段内的子项主题相关、可并行或顺序灵活。
+> P2 / P3 / P4 为已完成阶段，见 `new-wax16-plan-260820-reduce-fp32.md`。
 
-> 端到端几十倍差距的三层拆解（profile 文档 §十一）：纯 kernel ~6x（10%）、分组架构 ~3.5x（20%）、**per-expert × per-bit Python 循环 ~3~4x（70%）**。Tier 1 针对后两层。
+---
 
-#### 1. 多 expert 合并（MoE grouped GEMM）：同一 bit 所有 expert 一次 kernel ✅ 高优先
-- **问题**：`wxa16_bit_partitioned_moe.py:366/385` 仍是 `for expert_idx` × `for bit_str` 的逐 expert 循环，每 expert 单独 launch。expert 多但每 expert token 少时 GPU 利用率极低，且 Python 循环体开销被放大。
-- **方案**：参考 false-grouped 的 gather/scatter + bad-triton 的 3D grid 思路，但用 grouped GEMM 方式——把同一 bit 的所有 expert 权重打包好（已是 bit-partitioned 布局），一个 kernel 内用 `expert_info_ptr` 索引各 expert 的 token_start/token_count/weight_range，每个 SM 动态分配给某个 expert 避免负载不均衡。
-- **预期收益**：MoE 部分 launch 从 `O(experts × bits × groups)` 降到 `O(bits × groups)`，并显著降低 Python 循环占比（约 70% 的差距来源）。
-- **难度**：中高。**注意**：3D grid 按 expert 并行的 bad-triton 方案已被证伪（负载不均衡 + 边界检查开销）；正确做法是 expert_info 指针 + 仅算需要的行（grouped GEMM 思路）。
-- **来源**：new-wxa16-plan-260818.md §1.2。
+### P5 — 结构性主线优化（最高优先级，直接啃真实差距）
 
-#### 2. 加载期 group-first 连续布局重排（方案 A）✅ 高优先（低难度、不降级）
+> 端到端几十倍差距的三层拆解（profile 文档 §十一）：纯 kernel ~6x（10%）、分组架构 ~3.5x（20%）、**per-expert × per-bit Python 循环 ~3~4x（70%）**。P5 针对后两层，外加零风险快速 win。
+
+#### P5-1：加载期 group-first 连续布局重排（方案 A）✅ 高优先（低难度、不降级）
 - **问题**：去 clone（col_start 寻址）在 micro 小形状省 44.5%，但真实 eval 形状（B≈9280，packed 张量 ~134MB 超 L2）下宽 stride 跳读惩罚随 B 增长，净回归（gate_up +113.7µs/call、down +229.8µs/call），eval +26%/+17%。
 - **方案**：加载期把 packed 权重按 group 重排为 group-first 连续布局 `(num_groups, N, group_packed_bytes)`（一次 permute+contiguous，134MB 一次性 <0.1s）。推理时每组切片天然连续 → kernel 无 clone、无宽 stride、col_start 恒 0。同时优于旧 clone 路径与现 col_start 路径。
 - **改动点**：`wxa16_bit_partitioned_moe.py` 的 `set_packed_data` 一线 + wrapper 切片方式。
@@ -48,79 +46,93 @@
 - **验证**：`test/test_eval_shape_bench.py`（新路径应 ≤ clone 旧路径）+ 数值一致性 + 本人手动 `run.q.sh` 复测。
 - **来源**：profile-wxa16-bottleneck.md §十 记录 4 方案 A。
 
-#### 3. 旋转结果跨 bit 复用 + 接线 `triton_fused_dual_matmul` ✅ 中优先
+#### P5-2：多 expert 合并（MoE grouped GEMM）：同一 bit 所有 expert 一次 kernel ✅ 高优先
+- **问题**：`wxa16_bit_partitioned_moe.py:366/385` 仍是 `for expert_idx` × `for bit_str` 的逐 expert 循环，每 expert 单独 launch。expert 多但每 expert token 少时 GPU 利用率极低，且 Python 循环体开销被放大。
+- **方案**：参考 false-grouped 的 gather/scatter + bad-triton 的 3D grid 思路，但用 grouped GEMM 方式——把同一 bit 的所有 expert 权重打包好（已是 bit-partitioned 布局），一个 kernel 内用 `expert_info_ptr` 索引各 expert 的 token_start/token_count/weight_range，每个 SM 动态分配给某个 expert 避免负载不均衡。
+- **预期收益**：MoE 部分 launch 从 `O(experts × bits × groups)` 降到 `O(bits × groups)`，并显著降低 Python 循环占比（约 70% 的差距来源）。
+- **难度**：中高。**注意**：3D grid 按 expert 并行的 bad-triton 方案已被证伪（负载不均衡 + 边界检查开销）；正确做法是 expert_info 指针 + 仅算需要的行（grouped GEMM 思路）。
+- **分阶段推进**：
+  1. 先做同一 bit 内所有 expert 的合并（gate_up 一个 kernel + down 一个 kernel），bit 间保留外层循环。改动小，先吃到大部分 launch 减少收益。
+  2. 再优化负载均衡 + down 路径 in_feature-slice 适配。
+- **来源**：new-wxa16-plan-260818.md §1.2。
+
+#### P5-3：BLOCK_B / BLOCK_N / BLOCK_K / num_warps 联合调优
+- P4-2 已做单维离线调优（+9.5%）。可进一步联合搜索（尤其 1/2-bit 与 4/8-bit 配置差异大）。
+- **难度**：低，**收益中等（5-15%）**，零风险。
+- **注意**：不用 runtime autotune（首次编译开销太大），离线扫后硬编码。用 `test/test_eval_shape_bench.py` 在真实 eval 形状下扫，避免 micro≠real 陷阱。
+- **来源**：new-wax16-plan-260820 P4-2。
+
+---
+
+### P6 — 跨 bit 融合 & Kernel 深化（中优先级，P5 之后或并行推进）
+
+#### P6-1：旋转结果跨 bit 复用 + 接线 `triton_fused_dual_matmul`
 - **问题**：
   - 旋转作用在输入 x 上，仅依赖 `g_dim/group_size/g_start`（跨 bit 相同），但当前每 bit 用**不同 seed**（`seed=42+bit`/`42+bit+1000`），导致旋转矩阵随 bit 不同而不同，无跨 bit 复用（profile §8.4 已验证）。
   - `triton_fused_dual_matmul` 已实现（`triton_kernels.py`），但**主 MoE 路径完全未调用**（唯一调用在 `turboquant_utils/module.py:757` 的单 Linear 路径），属死代码。
 - **方案**：统一跨 bit seed → `x_rot_g` 跨 bit 相同，计算一次喂给多 bit kernel；`SAME_INPUT` 成立后可接线 `triton_fused_dual_matmul` 合并两次 matmul。
 - **预期收益**：视情况，旋转占 grouped 时间 ~40%（cold）/~30%+（warm 稳态）；合并两次 matmul 减少一次 kernel。
 - **难度**：中（耦合量化侧改动：统一 seed + 重新验证精度）。
+- **前置依赖**：先做消融实验，验证统一 seed 后 perplexity 变化，确认精度可接受再推进。
 - **来源**：profile §8.4、§十 遗留待办；new-wax16-plan-260820 P4-4 未做项。
 
----
+#### P6-2：混合 bit-width 场景的 fusion
+- 2-bit 段 + 4-bit 段分别 fused 后，再加一次加法（目前逐 bit 各自 fused 再 Python 累加）。
+- **难度**：低-中，**收益中等**。
+- **与 P5-2 协同**：多 expert 合并后再做 bit 间 fusion，kernel 结构更清晰。
+- **来源**：new-wax16-plan-260820 P4-4 未做项。
 
-### Tier 2 — Kernel 深度优化（收益中等，部分已有验证路径）
-
-#### 4. 方案 D：旋转矩阵 fusion + 大 K matmul（理论收益最大）
+#### P6-3：方案 D：旋转矩阵 fusion + 大 K matmul（理论收益最大）
 - **思路**：多个 group 的旋转矩阵合并成块对角 `R = diag(R0, R1, ..., Rn)`，则 `x_rot = x @ R^T` 整个 K 维度一次旋转完成，之后用完整 K 的 dequant + matmul，Tensor Core 利用率大幅提升。
 - **预期收益**：理论 30-50%+（取决于利用率提升），但 packed indices 需确认 K 维连续性。
 - **难度**：高（算法层面支持 + 内核改动）。
+- **建议**：先做小范围 PoC 验证 Tensor Core 利用率提升上限，再决定是否全面推进。
 - **来源**：new-wax16-plan-260820 P4-4 未做项 / 方案 D。
 
-#### 5. 混合 bit-width 场景的 fusion
-- 2-bit 段 + 4-bit 段分别 fused 后，再加一次加法（目前逐 bit 各自 fused 再 Python 累加）。
-- **难度**：低-中，**收益中等**。
-- **来源**：new-wax16-plan-260820 P4-4 未做项。
-
-#### 6. `triton_fused_dual_matmul` 的 grouped 版本 fusion
-- 主路径未使用 dual_matmul；若接线（依赖 Tier1-3 统一 seed），可进一步合并。
+#### P6-4：`triton_fused_dual_matmul` 的 grouped 版本 fusion
+- 主路径未使用 dual_matmul；若接线（依赖 P6-1 统一 seed），可进一步合并。
 - **难度**：中，**优先级低**（主路径未使用）。
 - **来源**：new-wax16-plan-260820 P4-4 未做项。
 
-#### 7. BLOCK_B / BLOCK_N / BLOCK_K / num_warps 联合调优
-- P4-2 已做单维离线调优（+9.5%）。可进一步联合搜索（尤其 1/2-bit 与 4/8-bit 配置差异大）。
-- **难度**：低，**收益中等（5-15%）**。
-- **注意**：不用 runtime autotune（首次编译开销太大），离线扫后硬编码。
-- **来源**：new-wax16-plan-260820 P4-2。
-
 ---
 
-### Tier 3 — 探索性 / 高风险（高回报但需谨慎）
+### P7 — 探索性优化（高风险高回报，逐个验证）
 
-#### 8. cuTile 后端集成到 WxA16 MoE 推理路径 ✅ 探索
+#### P7-1：cuTile 后端集成到 WxA16 MoE 推理路径 ✅ 探索
 - **现状**：`turboquant_utils/cutile_kernels.py` 已实现 `cutile_fused_matmul` / `cutile_fused_matmul_autotuned` / `cutile_fused_dual_matmul`，但**未接入 WxA16 MoE forward**（MoE 文件无 `use_cutile`/`cutile` 引用）。CLI 有 `--disable-gpu-fused` 开关但面向 Metal/macOS。
 - **方案**：给 `WxA16BitPartitionedGroupMoE` 加 cuTile 后端选项，实测对比 Triton vs cuTile（cuTile 的 MMA 可能比 Triton `tl.dot` 更高效，尤其 TF32/FP16 Tensor Core 利用率）。
 - **难度**：中，**预期收益不确定（需实测）**。
+- **建议**：先做单 kernel 对比（测试程序对比 cutile vs triton 在真实形状下性能），有明显收益再接入主流程。
 - **来源**：new-wxa16-plan-260818.md §1。
 
-#### 9. Flash Attention 风格在线反量化 Attention（KV cache 量化）
-- **问题**：Attention 的 Q/K/V 投影被量化了，但 attention 计算本身全精度；若 K/V cache 也做 TurboQuant 量化，在 Flash Attention kernel 内部实时反量化，可大幅减少 KV cache 带宽。
-- **难度**：很高（深度修改 Flash Attention kernel）。
-- **来源**：new-wxa16-plan-260818.md §9。
-
-#### 10. Split-K 优化
+#### P7-2：Split-K 优化
 - 当 M 很小（单 expert 仅几十 token）但 K 很大时 GEMM 并行度不够；对 K 维 split-K，多 block 算同一输出 tile 不同 K 段，最后原子加。
 - **适用**：MoE token 数少的 expert 场景。
 - **来源**：new-wxa16-plan-260818.md §6。
 
-#### 11. Bit-packing 布局优化：按 32/128-bit 对齐
+#### P7-3：Bit-packing 布局优化：按 32/128-bit 对齐
 - 当前 uint8 逐字节加载，对 memory coalescing 非最优；改成 32-bit/128-bit vector 存储+加载。
 - **来源**：new-wxa16-plan-260818.md §8。
 
-#### 12. 权重预排序（codebook lookup 友好）
+#### P7-4：权重预排序（codebook lookup 友好）
 - 按激活数值排序权重行/列，使相邻位置访问相近码本条目，提升 L1 命中率。需配合量化算法改。
 - **来源**：new-wxa16-plan-260818.md §10。
 
+#### P7-5：Flash Attention 风格在线反量化 Attention（KV cache 量化）
+- **问题**：Attention 的 Q/K/V 投影被量化了，但 attention 计算本身全精度；若 K/V cache 也做 TurboQuant 量化，在 Flash Attention kernel 内部实时反量化，可大幅减少 KV cache 带宽。
+- **难度**：很高（深度修改 Flash Attention kernel）。
+- **来源**：new-wxa16-plan-260818.md §9。
+
 ---
 
-### Tier 4 — 备选 / 大方向（独立技术路线，非增量优化）
+### P8 — 备选 / 独立技术路线（长期方向，非增量优化）
 
-#### 13. ROADMAP 第四阶段：Machete / Marlin CUDA kernel（Blackwell wgmma）
+#### P8-1：ROADMAP 第四阶段：Machete / Marlin CUDA kernel（Blackwell wgmma）
 - 针对 RTX 5090 (SM12.0) 的高性能推理替代路线：从 vLLM 提取 Machete kernel（支持 wgmma），或 Marlin MoE kernel，替代 Triton 全路线。
 - **难度**：高（CUDA/C++ 扩展 + 集成）。
 - **来源**：ROADMAP.md 第四阶段。
 
-#### 14. QwenMultiLinear 备选方案（保持 grouped_gemm 格式）
+#### P8-2：QwenMultiLinear 备选方案（保持 grouped_gemm 格式）
 - 不转换为传统格式，直接在 Qwen3.5 grouped_gemm 格式上工作，打包所有专家指针实现一次 kernel launch，保存 `bit_to_indices` 元数据避免信息丢失。
 - **现状**：纯讨论备选，未实现。
 - **来源**：ROADMAP_ALTERNATIVE_QWENMULTILINEAR.md。
@@ -155,11 +167,13 @@
 
 ## 四、建议的迭代顺序（基于以上梳理）
 
-1. **先做 Tier1-2（group-first 重排）**：低难度、不降级、修复真实 eval 净回归，立即见效。
-2. **再做 Tier1-1（多 expert grouped GEMM）**：啃掉 ~70% 差距来源的逐 expert Python 循环，是最大的结构性 win。
-3. **Tier1-3（跨 bit 旋转复用 + dual_matmul 接线）**：需统一 seed + 验精度，与量化侧耦合，放在多 expert 合并之后。
-4. **Tier2（方案D 大K融合 / 混合bit fusion / 联合调优）**：持续提升 kernel 侧利用率。
-5. **Tier3（cuTile 集成 / Flash Attention 在线反量化 / Split-K 等）**：探索性验证，逐个试、有收益再上主流程。
-6. **Tier4（Machete/Marlin / QwenMultiLinear）**：独立技术路线，作为 Triton 路线的备选或长期替代。
+1. **P5-1（group-first 重排）**：低难度、不降级、修复真实 eval 净回归，立即见效。
+2. **P5-3（BLOCK 联合调优）**：可与 P5-1 并行，零风险稳定收益。
+3. **P5-2（多 expert grouped GEMM）**：啃掉 ~70% 差距来源的逐 expert Python 循环，P5 阶段最大的结构性 win。分两阶段推进。
+4. **P6-1（跨 bit 旋转复用 + dual_matmul 接线）**：需先做 seed 统一的精度消融实验，确认精度可接受再推进。
+5. **P6-2（混合 bit fusion） + P6-4（dual_matmul grouped 版）**：与 P5-2 / P6-1 有协同，放其后。
+6. **P6-3（方案 D 大 K 融合）**：PoC 先行，验证 Tensor Core 利用率提升上限。
+7. **P7（cuTile / Split-K / Bit-packing / 权重预排序 / Flash Attention）**：探索性验证，逐个试、有收益再上主流程。
+8. **P8（Machete/Marlin / QwenMultiLinear）**：独立技术路线，作为 Triton 路线的备选或长期替代。
 
 > 每一步改动都需配套：测试程序先对齐主流程逻辑（含 GPU 填充度 / 并行 SM 分析）+ 本人在真实 eval 形状下手动复测，避免再次落入 micro≠real 陷阱。

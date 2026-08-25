@@ -144,6 +144,38 @@ class WxA16Weights(nn.Module):
             self._down_orig_dtype = down_packed.get('orig_dtype')
 
 
+    @classmethod
+    def from_metadata(cls, bit_width: int, hidden_size: int,
+                      gate_up_meta: dict, down_meta: dict) -> "WxA16Weights":
+        """
+        从保存的元数据重建 WxA16Weights（checkpoint 加载路径）。
+
+        与量化路径共用 set_packed_data：注册占位 buffer + 恢复元数据属性，
+        实际数据由 load_state_dict(assign=True) 回填。
+        """
+        def _placeholder_pack(meta: dict) -> dict:
+            return {
+                "indices_packed": torch.empty(meta["indices_packed_shape"], dtype=torch.uint8),
+                "codebook": torch.empty(meta["codebook_shape"], dtype=torch.float16),
+                "norms": torch.empty(meta["norms_shape"], dtype=torch.float16),
+                "seed": meta["seed"],
+                "group_size": meta["group_size"],
+                "shape": tuple(meta["shape"]),
+                "bit_width": meta["bit_width"],
+                "rotation": meta["rotation"],
+                "orig_dtype": meta["orig_dtype"],
+            }
+
+        weights = cls(bit_width, hidden_size)
+        weights.set_packed_data(_placeholder_pack(gate_up_meta), _placeholder_pack(down_meta))
+        # 清空缓存字典：load_state_dict(assign=True) 只替换注册的 buffer，
+        # 字典里仍是占位张量，置 None 让 gate_up_packed/down_packed 属性
+        # 在回填后从 named_buffers 惰性重建，保证 forward 读到真实数据
+        weights._gate_up_packed = None
+        weights._down_packed = None
+        return weights
+
+
 class WxA16BitPartitionedGroupMoE(nn.Module):
     """
     按 bit 分区的 WxA16 量化 MoE。
@@ -293,6 +325,43 @@ class WxA16BitPartitionedGroupMoE(nn.Module):
         print(f"  [DEBUG] Cleanup fp16_moe: {time.time() - tick_cleanup:.4f}s")
 
         print(f"  [DEBUG] from_build_block total time: {time.time() - tick_start:.4f}s")
+        return moe
+
+    @classmethod
+    def from_metadata(cls, meta: dict, gate, shared_expert, shared_expert_gate) -> "WxA16BitPartitionedGroupMoE":
+        """
+        从保存的元数据重建 WxA16BitPartitionedGroupMoE（checkpoint 加载路径）。
+
+        复用传入的 gate/shared_expert/shared_expert_gate（与量化路径复用同一批对象，
+        保证 state_dict key 结构一致），bit_weights 按保存顺序重建，
+        expert_offsets / _expert_offsets_cpu 从 JSON list 恢复。
+        """
+        moe = cls(
+            gate=gate,
+            num_experts=meta["num_experts"],
+            hidden_size=meta["hidden_size"],
+            intermediate_size=meta["intermediate_size"],
+            top_k=meta["top_k"],
+            shared_expert=shared_expert,
+            shared_expert_gate=shared_expert_gate,
+        )
+
+        moe.bit_list = list(meta["bit_list"])
+        moe.inter_size_by_bit = {int(k): v for k, v in meta["inter_size_by_bit"].items()}
+        moe.expert_offsets = {
+            bit_str: torch.tensor(lst, dtype=torch.long) for bit_str, lst in meta["expert_offsets"].items()
+        }
+        moe._expert_offsets_cpu = {
+            bit_str: list(lst) for bit_str, lst in meta["expert_offsets"].items()
+        }
+
+        # 按 JSON 保序插入（= 保存时 ModuleDict 顺序 = forward 的 bit 处理顺序）
+        for bit_str, bit_meta in meta["bits"].items():
+            moe.bit_weights[bit_str] = WxA16Weights.from_metadata(
+                int(bit_str), meta["hidden_size"], bit_meta["gate_up"], bit_meta["down"]
+            )
+
+        moe.enable_timing = meta.get("enable_timing", True)
         return moe
 
     @torch.no_grad()

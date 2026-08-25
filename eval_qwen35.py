@@ -402,31 +402,90 @@ def qwen35_ppl_eval(model, testloader, eval_set, args):
     return ppl.item()
 
 
+def run_ppl_evaluation(model, tokenizer, args):
+    """
+    wikitext2/c4 双数据集 PPL eval：sequential 判断 + 结果打印。
+
+    量化路径（qwen35_simple_wrapper）与 checkpoint 加载路径共用，
+    避免同一段 eval 逻辑重复实现。
+    """
+    use_sequential = getattr(args, 'sequential_eval', False)
+    use_standby = getattr(args, 'standby_layer_cpu', False)
+
+    # If standby is enabled, force sequential eval for stability
+    if use_standby and not use_sequential:
+        print("Warning: standby-layer-cpu enabled, forcing sequential-eval for stability.")
+        use_sequential = True
+
+    if use_sequential:
+        print("Will use sequential PPL evaluation (layers stay on CPU)")
+    else:
+        print("Will use normal PPL evaluation")
+
+    tick_ppl_start = time.time()
+    ppl_results = {}
+    for dataset in ['wikitext2', 'c4']:
+        print(f"\nEvaluating on {dataset}")
+        _, testloader = get_loaders(
+            dataset, seed=args.seed, tokenizer=tokenizer, seqlen=model.seqlen
+        )
+
+        if use_sequential:
+            ppl = qwen35_ppl_eval_sequential(model, testloader, dataset, args)
+        else:
+            ppl = qwen35_ppl_eval(model, testloader, dataset, args)
+
+        ppl_results[dataset] = ppl
+        print(f"{dataset}: {ppl:.4f}")
+
+    tick_ppl_end = time.time()
+    print(f"\nEvaluation summary")
+    for dataset, ppl in ppl_results.items():
+        print(f"{dataset}: {ppl:.4f}")
+    print(f"PPL evaluation total time: {tick_ppl_end - tick_ppl_start:.2f}s")
+
+    return ppl_results
+
+
 def main():
     parser = argparse.ArgumentParser(description="Evaluate Qwen3.5 MoE perplexity")
-    parser.add_argument('model', type=str, help="Path to Qwen3.5 model")
+    parser.add_argument('model', type=str, nargs='?', default=None,
+                        help="Path to Qwen3.5 model (optional when --load-quantized is used)")
     parser.add_argument('--seed', type=int, default=0, help="Random seed")
     parser.add_argument('--val-samples', type=int, default=256, help="Number of evaluation samples")
     parser.add_argument('--sequential-eval', action='store_true', default=False,
                         help="Use sequential PPL evaluation (keeps layers on CPU, moves one by one)")
     parser.add_argument('--standby-cpu', action='store_true', default=False,
                         help="Use CPU standby mode (load model to CPU first for large models)")
+    parser.add_argument('--load-quantized', type=str, default=None,
+                        help='Load quantized checkpoint from this directory (skip fp16 model loading)')
     parser.add_argument('--datasets', type=str, nargs='+',
                         default=['wikitext2', 'c4'], help="Datasets to evaluate on")
 
     args = parser.parse_args()
 
-    print("Qwen3.5 MoE Evaluation (Phase 1: FP16 Baseline)")
+    if not args.load_quantized and not args.model:
+        parser.error("model path is required when not using --load-quantized")
+
+    print("Qwen3.5 MoE Evaluation")
     git_hash = get_git_hash()
     print(f"Git HEAD: {git_hash}")
     print(f"Model: {args.model}")
     print(f"Datasets: {args.datasets}")
     print(f"Sequential eval: {args.sequential_eval}")
     print(f"Standby CPU: {args.standby_cpu}")
+    if args.load_quantized:
+        print(f"Load quantized checkpoint: {args.load_quantized}")
 
-    # Load model
-    print("\nLoading model...")
-    model, tokenizer = load_model(args.model, standby_cpu=args.standby_cpu)
+    # Load model（fp16 原模型 或 量化 checkpoint，加载逻辑复用 qwen35_quant_io）
+    if args.load_quantized:
+        print("\nLoading quantized checkpoint (skip fp16 model loading)...")
+        from qwen35_quant_io import load_quantized_model
+        model, tokenizer = load_quantized_model(args.model, args.load_quantized,
+                                                standby_cpu=args.standby_cpu)
+    else:
+        print("\nLoading model...")
+        model, tokenizer = load_model(args.model, standby_cpu=args.standby_cpu)
 
     # If in CPU standby mode, make sure everything is on CPU
     if args.standby_cpu:

@@ -18,7 +18,7 @@ sys.path.insert(0, '..')
 
 from dartmoq_utils import *
 from data_utils import *
-from eval_qwen35 import qwen35_ppl_eval as cmoe_ppl_eval
+from eval_qwen35 import run_ppl_evaluation
 from qwen35_layer_reconstruct import reconstruct_moe_from_existing
 from qwen35_utils import DEV, load_model, print_memory_info, get_memory_info_str
 
@@ -318,7 +318,8 @@ def construct_moe(model, moe_model_flag, layer, layer_idx, inp,
 
 
 @torch.no_grad()
-def dartmoq_quant_grouped_gemm_moe(model, tokenizer, dataloader, args, test_ppl=True):
+def dartmoq_quant_grouped_gemm_moe(model, tokenizer, dataloader, args, test_ppl=True,
+                                   save_quantized_dir=None):
     print('Starting Grouped_GEMM_MoE quantization...')
     tick_quant_start = time.time()
 
@@ -569,49 +570,36 @@ def dartmoq_quant_grouped_gemm_moe(model, tokenizer, dataloader, args, test_ppl=
 
     print("MoE reconstruction and quantization done.")
 
-
     tick_quant_end = time.time()
     time_quant = tick_quant_end - tick_quant_start
     print(f"Runtime of quantization only: {time_quant:.2f}")
 
-    use_sequential = getattr(args, 'sequential_eval', False)
-    use_standby = getattr(args, 'standby_layer_cpu', False)
-
-    # If standby is enabled, force sequential eval for stability
-    if use_standby and not use_sequential:
-        print("Warning: standby-layer-cpu enabled, forcing sequential-eval for stability.")
-        use_sequential = True
-
-    if use_sequential:
-        print("Will use sequential PPL evaluation (layers stay on CPU)")
-    else:
-        print("Will use normal PPL evaluation")
-
     model.config.use_cache = use_cache
+
+    # 保存量化 checkpoint（量化完成后、eval 之前；保存只做 CPU 拷贝，不影响后续 eval）
+    if save_quantized_dir is not None:
+        print(f"\nSaving quantized checkpoint to: {save_quantized_dir}")
+        del inps
+        gc.collect()
+        torch.cuda.empty_cache()
+        from qwen35_quant_io import save_quantized_model
+        quant_args = {
+            "seed": getattr(args, 'seed', None),
+            "group_size": GROUPSIZE,
+            "slices": getattr(args, 'slices', None),
+            "quant_scheme": getattr(args, 'quant_scheme', None),
+            "rank_mode": getattr(args, 'rank_mode', None),
+            "quantmode": getattr(args, 'quantmode', None),
+            "git_hash": get_git_hash(),
+        }
+        save_quantized_model(
+            model, save_quantized_dir,
+            base_model_path=getattr(model, '_model_path', None),
+            quant_args=quant_args,
+        )
 
     if test_ppl:
         print("\nEvaluating perplexity...")
-        tick_ppl_start = time.time()
-
-        ppl_results = {}
-        for dataset in ['wikitext2', 'c4']:
-            print(f"\nEvaluating on {dataset}")
-            _, testloader = get_loaders(
-                dataset, seed=args.seed, tokenizer=tokenizer, seqlen=model.seqlen
-            )
-
-            if use_sequential:
-                from eval_qwen35 import qwen35_ppl_eval_sequential
-                ppl = qwen35_ppl_eval_sequential(model, testloader, dataset, args)
-            else:
-                ppl = cmoe_ppl_eval(model, testloader, dataset, args)
-
-            ppl_results[dataset] = ppl
-            print(f"{dataset}: {ppl:.4f}")
-
-        tick_ppl_end = time.time()
-        print(f"\nEvaluation summary")
-        for dataset, ppl in ppl_results.items():
-            print(f"{dataset}: {ppl:.4f}")
+        run_ppl_evaluation(model, tokenizer, args)
 
     return model

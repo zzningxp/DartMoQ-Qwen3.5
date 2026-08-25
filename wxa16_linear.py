@@ -19,6 +19,11 @@ from turboquant_utils.rotation import generate_rotation_matrix, hadamard_rotate_
 from turboquant_utils.triton_kernels import triton_fused_matmul_grouped
 
 
+def _parse_dtype_str(dtype_str) -> torch.dtype:
+    """把 "torch.bfloat16" 形式的字符串解析回 torch.dtype（与 quantize.py 的解析方式一致）。"""
+    return getattr(torch, str(dtype_str).split(".")[-1])
+
+
 class WxA16Linear(nn.Module):
     """
     WxA16 量化 Linear 层。
@@ -126,6 +131,28 @@ class WxA16Linear(nn.Module):
             rotation=rotation,
             bias=bias,
             orig_dtype=linear.weight.dtype,
+        )
+
+    @classmethod
+    def from_metadata(cls, meta: dict) -> "WxA16Linear":
+        """
+        从保存的元数据字典重建 WxA16Linear（checkpoint 加载路径）。
+
+        只注册占位 buffer 并恢复普通属性，实际数据由 load_state_dict(assign=True) 回填。
+        不修改现有量化路径（from_linear 不变）。
+        """
+        return cls(
+            in_features=meta["in_features"],
+            out_features=meta["out_features"],
+            bit_width=meta["bit_width"],
+            group_size=meta["group_size"],
+            packed_indices=torch.empty(meta["indices_packed_shape"], dtype=torch.uint8),
+            codebook=torch.empty(meta["codebook_shape"], dtype=torch.float16),
+            norms=torch.empty(meta["norms_shape"], dtype=torch.float16),
+            seed=meta["seed"],
+            rotation=meta["rotation"],
+            bias=torch.empty(meta["bias_shape"], dtype=torch.float16) if meta.get("has_bias", False) else None,
+            orig_dtype=_parse_dtype_str(meta["orig_dtype"]),
         )
 
     @torch.no_grad()
