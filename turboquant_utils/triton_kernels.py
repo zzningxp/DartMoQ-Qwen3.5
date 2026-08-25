@@ -795,3 +795,438 @@ def triton_fused_matmul_grouped_slice_in_features(
         group_idx_in_slice += 1
 
     return output
+
+
+# ============================================================================
+# P5-1: Group-First 布局 kernel
+#
+# 传统布局: indices_packed (N, total_packed_K), norms (N, num_groups)
+#   - 行切片(gate_up): stride = total_packed_K (大), memory coalescing 差
+#   - 列切片(down):  用 packed_col_start 偏移, 宽 stride 读
+#
+# Group-First 布局: indices_packed (num_groups, N, packed_per_group), norms (num_groups, N)
+#   - 行切片: indices_packed[:, row_start:row_end, :] → 行 stride = packed_per_group (小)
+#   - 列切片: indices_packed[g_start:g_end, :, :] → 整块连续, packed_col_start = 0
+#   - 两种切片下 memory coalescing 均显著提升
+# ============================================================================
+
+
+@triton.jit
+def _turboquant_fused_matmul_kernel_grouped_gf(
+    # Input
+    input_ptr,        # (B, K_total) 拼接后的旋转输入（连续存储）
+    # Quantized weight (group-first 布局)
+    indices_ptr,      # (NUM_GROUPS_TOTAL, N, PACKED_PER_GROUP) packed uint8
+    codebook_ptr,     # (n_levels,) float16
+    norms_ptr,        # (NUM_GROUPS_TOTAL, N) float16 — per-group norms (pre-scaled)
+    # Output
+    output_ptr,       # (B, N)
+    # Shape
+    B, N,
+    K_total,              # 总 K = num_groups * group_size
+    INDICES_G0_STRIDE,    # indices 第 0 维 stride (bytes) = N * PACKED_PER_GROUP
+    NORMS_G0_STRIDE,      # norms 第 0 维 stride (bytes) = N
+    # Constexpr config
+    GROUP_SIZE: tl.constexpr,     # 每个 group 的 K 大小
+    NUM_GROUPS: tl.constexpr,     # 本次处理的 group 数量
+    BIT_WIDTH: tl.constexpr,
+    N_LEVELS: tl.constexpr,
+    BLOCK_B: tl.constexpr = 16,
+    BLOCK_N: tl.constexpr = 64,
+    BLOCK_K: tl.constexpr = 64,
+):
+    """Multi-group fused dequant + matmul kernel (Group-First 布局版本).
+
+    权重以 (num_groups, N, packed_per_group) 的 group-first 布局存储，
+    行切片和列切片下 memory coalescing 均优于传统布局。
+
+    注意: indices_ptr 指向切片后的起始位置 (即第 0 个待处理 group 的起点),
+    norms_ptr 同理。kernel 内 g 从 0 到 NUM_GROUPS-1, 通过 INDICES_G0_STRIDE
+    计算每个 group 的基址。
+    """
+    pid_b = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    rb = pid_b * BLOCK_B + tl.arange(0, BLOCK_B)
+    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_b = rb < B
+    mask_n = rn < N
+
+    total_acc = tl.zeros((BLOCK_B, BLOCK_N), dtype=tl.float16)
+
+    ELEMENTS_PER_BYTE = 8 // BIT_WIDTH
+    PACKED_PER_GROUP = GROUP_SIZE // ELEMENTS_PER_BYTE
+
+    # 预计算行内偏移基 (每个 group 内行 n 的基址 = rn * PACKED_PER_GROUP)
+    row_base = rn * PACKED_PER_GROUP  # (BLOCK_N,)
+
+    for g in range(NUM_GROUPS):
+        g_start = g * GROUP_SIZE
+
+        # 第 g 个 group 的权重基址 = g * INDICES_G0_STRIDE
+        g_base = g * INDICES_G0_STRIDE
+
+        # 加载当前 group 的 norms: (BLOCK_N,)
+        # norms 布局 (num_groups, N), 第 g 个 group 第 rn 个 = g * NORMS_G0_STRIDE + rn
+        norm_off = g * NORMS_G0_STRIDE + rn
+        norm_g = tl.load(norms_ptr + norm_off, mask=mask_n, other=1.0)
+
+        acc_g = tl.zeros((BLOCK_B, BLOCK_N), dtype=tl.float16)
+
+        for k_start in range(0, GROUP_SIZE, BLOCK_K):
+            rk = k_start + tl.arange(0, BLOCK_K)
+            mask_k = rk < GROUP_SIZE
+
+            # Load input tile (with group offset in K dimension)
+            inp_k = g_start + rk
+            inp_off = rb[:, None] * K_total + inp_k[None, :]
+            inp_mask = mask_b[:, None] & mask_k[None, :]
+            inp_tile = tl.load(input_ptr + inp_off, mask=inp_mask, other=0.0)
+
+            if BIT_WIDTH == 8:
+                byte_col = rk
+                byte_off = g_base + row_base[:, None] + byte_col[None, :]
+                w_mask = mask_n[:, None] & mask_k[None, :]
+                idx = tl.load(indices_ptr + byte_off, mask=w_mask, other=0).to(tl.int32)
+                w_quant = tl.load(codebook_ptr + idx, mask=w_mask, other=0.0)
+            else:
+                BIT_MASK = (1 << BIT_WIDTH) - 1
+                byte_col = rk // ELEMENTS_PER_BYTE
+                pos_in_byte = rk % ELEMENTS_PER_BYTE
+                pbc = row_base[:, None] + byte_col[None, :]
+                byte_off = g_base + pbc
+                w_mask = mask_n[:, None] & mask_k[None, :]
+                packed = tl.load(indices_ptr + byte_off, mask=w_mask, other=0).to(tl.uint8)
+                shift = pos_in_byte * BIT_WIDTH
+                idx = (packed >> shift[None, :]) & BIT_MASK
+                idx = idx.to(tl.int32)
+                w_quant = tl.load(codebook_ptr + idx, mask=w_mask, other=0.0)
+
+            acc_g += tl.dot(inp_tile, tl.trans(w_quant), out_dtype=tl.float16)
+
+        # 乘 norms 后加到总累加器
+        total_acc += acc_g * norm_g[None, :]
+
+    tl.store(
+        output_ptr + rb[:, None] * N + rn[None, :],
+        total_acc.to(output_ptr.dtype.element_ty),
+        mask=mask_b[:, None] & mask_n[None, :],
+    )
+
+
+def _triton_fused_matmul_grouped_gf(
+    x_rot_concat, indices_packed_gf, codebook, norms_gf,
+    group_size, num_groups, bit_width,
+):
+    """内部函数：调用 group-first 布局的 fused grouped kernel。
+
+    Args:
+        x_rot_concat: (B, K_total) 拼接后的旋转输入，连续存储
+        indices_packed_gf: (num_groups, N, packed_per_group) group-first 布局的 packed 权重
+        codebook: (n_levels,)
+        norms_gf: (num_groups, N) group-first 布局的 pre-scaled norms
+        group_size: 每个 group 的 K 大小
+        num_groups: 本次处理的 group 数量
+        bit_width: 1/2/4/8
+
+    Returns:
+        output: (B, N)
+    """
+    B = x_rot_concat.shape[0]
+    N = indices_packed_gf.shape[1]
+    K_total = x_rot_concat.shape[1]
+
+    # group-first 布局的 stride（单位: 元素数, uint8）
+    indices_g0_stride = indices_packed_gf.stride(0)
+    norms_g0_stride = norms_gf.stride(0)
+
+    output = torch.empty(B, N, dtype=x_rot_concat.dtype, device=x_rot_concat.device)
+
+    BLOCK_B, BLOCK_N, BLOCK_K, num_warps, num_stages = _get_fused_grouped_config(bit_width)
+
+    grid = (triton.cdiv(B, BLOCK_B), triton.cdiv(N, BLOCK_N))
+
+    _turboquant_fused_matmul_kernel_grouped_gf[grid](
+        x_rot_concat, indices_packed_gf, codebook, norms_gf, output,
+        B, N, K_total,
+        indices_g0_stride, norms_g0_stride,
+        GROUP_SIZE=group_size, NUM_GROUPS=num_groups,
+        BIT_WIDTH=bit_width, N_LEVELS=codebook.shape[0],
+        BLOCK_B=BLOCK_B, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        num_warps=num_warps, num_stages=num_stages,
+    )
+
+    return output
+
+
+def convert_to_group_first(indices_packed, norms, group_size, bit_width):
+    """将传统布局的 packed 权重和 norms 转换为 group-first 布局。
+
+    Args:
+        indices_packed: (N, total_packed_K) uint8, 传统布局
+        norms: (N, num_groups) float16, 传统布局
+        group_size: 每个 group 的 K 大小
+        bit_width: 1/2/4/8
+
+    Returns:
+        indices_packed_gf: (num_groups, N, packed_per_group) uint8, contiguous
+        norms_gf: (num_groups, N) float16, contiguous
+    """
+    ELEMENTS_PER_BYTE = 8 // bit_width
+    packed_per_group = group_size // ELEMENTS_PER_BYTE
+    N = indices_packed.shape[0]
+    total_packed_K = indices_packed.shape[1]
+    num_groups = total_packed_K // packed_per_group
+
+    # reshape + permute + contiguous:
+    # (N, total_packed_K) → (N, num_groups, packed_per_group) → (num_groups, N, packed_per_group)
+    indices_reshaped = indices_packed.reshape(N, num_groups, packed_per_group)
+    indices_packed_gf = indices_reshaped.permute(1, 0, 2).contiguous()
+
+    # norms: (N, num_groups) → (num_groups, N)
+    norms_gf = norms.t().contiguous()
+
+    return indices_packed_gf, norms_gf
+
+
+def triton_fused_matmul_grouped_gf(
+    x, indices_packed_gf, codebook, norms_gf, seed, group_size, in_features, bit_width: int = 4
+):
+    """Group-First 布局的 grouped fused matmul（完整输入，无切片）。
+
+    Args:
+        x: (B, in_features)
+        indices_packed_gf: (num_groups, N, packed_per_group) group-first 布局
+        codebook: (n_levels,)
+        norms_gf: (num_groups, N) group-first 布局
+        seed: 旋转种子
+        group_size: 分组大小
+        in_features: 输入特征维度
+        bit_width: 1/2/4/8
+
+    Returns:
+        output: (B, N)
+    """
+    if bit_width not in {1, 2, 4, 8}:
+        raise ValueError(f"bit_width must be 1/2/4/8, got {bit_width}")
+
+    if isinstance(seed, torch.Tensor):
+        seed = int(seed.item())
+
+    batch_size = x.shape[0]
+    N = indices_packed_gf.shape[1]
+
+    if in_features % group_size == 0:
+        num_groups = in_features // group_size
+        if num_groups >= 2:
+            orig_dtype = x.dtype
+            if orig_dtype != torch.float16:
+                codebook = codebook.half()
+                norms_gf = norms_gf.half()
+                x_rot = batch_rotate_input(x.half(), group_size, seed)
+            else:
+                x_rot = batch_rotate_input(x, group_size, seed)
+
+            scale = math.sqrt(group_size)
+            norms_scaled = norms_gf / scale
+
+            output_fp16 = _triton_fused_matmul_grouped_gf(
+                x_rot, indices_packed_gf, codebook, norms_scaled,
+                group_size, num_groups, bit_width,
+            )
+
+            if orig_dtype != torch.float16:
+                return output_fp16.to(orig_dtype)
+            return output_fp16
+
+        # num_groups == 1 的 fast path
+        else:
+            # 退回到单 group kernel（gf 布局转回传统布局）
+            indices_2d = indices_packed_gf[0]  # (N, packed_per_group)
+            norms_1d = norms_gf[0]  # (N,)
+            Pi = generate_rotation_matrix(group_size, seed, device=x.device).to(x.dtype)
+            x_rot = x @ Pi.T
+            return triton_fused_matmul(x_rot, indices_2d, codebook, norms_1d, in_features, bit_width)
+
+    # Fallback: 非对齐情况暂不支持 gf 布局优化，转回传统布局调用
+    # （真实场景 in_features 通常对齐 group_size，此路径极少触发）
+    ELEMENTS_PER_BYTE = 8 // bit_width
+    packed_per_group = group_size // ELEMENTS_PER_BYTE
+    num_groups_full = indices_packed_gf.shape[0]
+    indices_trad = indices_packed_gf.permute(1, 0, 2).reshape(N, num_groups_full * packed_per_group)
+    norms_trad = norms_gf.t()
+    return triton_fused_matmul_grouped(
+        x, indices_trad, codebook, norms_trad, seed, group_size, in_features, bit_width
+    )
+
+
+def triton_fused_matmul_grouped_slice_rows_gf(
+    x, indices_packed_gf, codebook, norms_gf, seed, group_size,
+    in_features, row_start, row_end, bit_width: int = 4
+):
+    """Group-First 布局的 grouped fused matmul（行切片，gate_up 路径）。
+
+    取 indices_packed_gf[:, row_start:row_end, :] 和 norms_gf[:, row_start:row_end]
+    作为权重切片，传给 group-first kernel。切片后行 stride = packed_per_group (小)，
+    memory coalescing 显著优于传统布局的行切片。
+
+    Args:
+        x: (B, in_features)
+        indices_packed_gf: (num_groups, N_total, packed_per_group)
+        codebook: (n_levels,)
+        norms_gf: (num_groups, N_total)
+        seed: 旋转种子
+        group_size: 分组大小
+        in_features: 输入特征维度
+        row_start, row_end: 行切片范围（输出维度切片）
+        bit_width: 1/2/4/8
+
+    Returns:
+        output: (B, slice_N)
+    """
+    if bit_width not in {1, 2, 4, 8}:
+        raise ValueError(f"bit_width must be 1/2/4/8, got {bit_width}")
+
+    if isinstance(seed, torch.Tensor):
+        seed = int(seed.item())
+
+    batch_size = x.shape[0]
+    slice_N = row_end - row_start
+
+    # 行切片: (num_groups, N_total, packed_per_group) → (num_groups, slice_N, packed_per_group)
+    indices_slice = indices_packed_gf[:, row_start:row_end, :]
+    # norms 行切片: (num_groups, N_total) → (num_groups, slice_N)
+    norms_slice = norms_gf[:, row_start:row_end]
+
+    if in_features % group_size == 0:
+        num_groups = in_features // group_size
+        if num_groups >= 2:
+            orig_dtype = x.dtype
+            if orig_dtype != torch.float16:
+                codebook = codebook.half()
+                norms_slice = norms_slice.half()
+                x_rot = batch_rotate_input(x.half(), group_size, seed)
+            else:
+                x_rot = batch_rotate_input(x, group_size, seed)
+
+            scale = math.sqrt(group_size)
+            norms_scaled = norms_slice / scale
+
+            output_fp16 = _triton_fused_matmul_grouped_gf(
+                x_rot, indices_slice, codebook, norms_scaled,
+                group_size, num_groups, bit_width,
+            )
+
+            if orig_dtype != torch.float16:
+                return output_fp16.to(orig_dtype)
+            return output_fp16
+
+        # num_groups == 1
+        else:
+            # 退回到单 group kernel
+            indices_2d = indices_slice[0]  # (slice_N, packed_per_group)
+            norms_1d = norms_slice[0]  # (slice_N,)
+            Pi = generate_rotation_matrix(group_size, seed, device=x.device).to(x.dtype)
+            x_rot = x @ Pi.T
+            return triton_fused_matmul(x_rot, indices_2d, codebook, norms_1d, in_features, bit_width)
+
+    # Fallback: 非对齐情况转回传统布局
+    ELEMENTS_PER_BYTE = 8 // bit_width
+    packed_per_group = group_size // ELEMENTS_PER_BYTE
+    num_groups_full = indices_packed_gf.shape[0]
+    indices_trad = indices_packed_gf.permute(1, 0, 2).reshape(
+        indices_packed_gf.shape[1], num_groups_full * packed_per_group
+    )
+    norms_trad = norms_gf.t()
+    return triton_fused_matmul_grouped_slice_rows(
+        x, indices_trad, codebook, norms_trad, seed, group_size,
+        in_features, row_start, row_end, bit_width
+    )
+
+
+def triton_fused_matmul_grouped_slice_in_features_gf(
+    x, indices_packed_gf, codebook, norms_gf, seed, group_size,
+    original_start, original_end, full_in_features, bit_width: int = 4
+):
+    """Group-First 布局的 grouped fused matmul（in_features 切片，down 路径）。
+
+    取 indices_packed_gf[g_start:g_end, :, :] 和 norms_gf[g_start:g_end, :]
+    作为权重切片，整块连续，packed_col_start = 0，memory coalescing 最优。
+
+    Args:
+        x: (B, slice_in_features) 已经是切片后的输入
+        indices_packed_gf: (num_groups_total, N, packed_per_group)
+        codebook: (n_levels,)
+        norms_gf: (num_groups_total, N)
+        seed: 旋转种子（完整权重的基准 seed）
+        group_size: 分组大小
+        original_start, original_end: 原始全权重的 in_features 切片范围
+        full_in_features: 完整权重的 in_features
+        bit_width: 1/2/4/8
+
+    Returns:
+        output: (B, N)
+    """
+    if bit_width not in {1, 2, 4, 8}:
+        raise ValueError(f"bit_width must be 1/2/4/8, got {bit_width}")
+
+    if original_start % group_size != 0:
+        raise ValueError(f"original_start ({original_start}) must be aligned to group_size ({group_size})")
+
+    if isinstance(seed, torch.Tensor):
+        seed = int(seed.item())
+
+    batch_size = x.shape[0]
+    N = indices_packed_gf.shape[1]
+    slice_in_features = original_end - original_start
+
+    g_start = original_start // group_size
+    g_end = original_end // group_size
+    num_groups_in_slice = g_end - g_start
+
+    # group 切片: (num_groups_total, N, packed_per_group) → (num_groups_in_slice, N, packed_per_group)
+    indices_slice = indices_packed_gf[g_start:g_end]
+    # norms group 切片: (num_groups_total, N) → (num_groups_in_slice, N)
+    norms_slice = norms_gf[g_start:g_end]
+
+    if slice_in_features % group_size == 0:
+        if num_groups_in_slice >= 2:
+            orig_dtype = x.dtype
+            seed_base = seed + original_start
+            if orig_dtype != torch.float16:
+                codebook = codebook.half()
+                norms_slice = norms_slice.half()
+                x_rot = batch_rotate_input(x.half(), group_size, seed_base)
+            else:
+                x_rot = batch_rotate_input(x, group_size, seed_base)
+
+            scale = math.sqrt(group_size)
+            norms_scaled = norms_slice / scale
+
+            output_fp16 = _triton_fused_matmul_grouped_gf(
+                x_rot, indices_slice, codebook, norms_scaled,
+                group_size, num_groups_in_slice, bit_width,
+            )
+
+            if orig_dtype != torch.float16:
+                return output_fp16.to(orig_dtype)
+            return output_fp16
+
+        # num_groups_in_slice == 1
+        else:
+            seed_base = seed + original_start
+            indices_2d = indices_slice[0]  # (N, packed_per_group)
+            norms_1d = norms_slice[0]  # (N,)
+            Pi = generate_rotation_matrix(group_size, seed_base, device=x.device).to(x.dtype)
+            x_rot = x @ Pi.T
+            return triton_fused_matmul(x_rot, indices_2d, codebook, norms_1d, group_size, bit_width)
+
+    # Fallback: 非对齐情况转回传统布局
+    ELEMENTS_PER_BYTE = 8 // bit_width
+    packed_per_group = group_size // ELEMENTS_PER_BYTE
+    num_groups_full = indices_packed_gf.shape[0]
+    indices_trad = indices_packed_gf.permute(1, 0, 2).reshape(N, num_groups_full * packed_per_group)
+    norms_trad = norms_gf.t()
+    return triton_fused_matmul_grouped_slice_in_features(
+        x, indices_trad, codebook, norms_trad, seed, group_size,
+        original_start, original_end, full_in_features, bit_width
+    )

@@ -14,7 +14,10 @@ from wxa16_linear import WxA16Linear
 from turboquant_utils.quantize import turboquant_quantize_packed_full
 from turboquant_utils.triton_kernels import (
     triton_fused_matmul_grouped_slice_rows,
-    triton_fused_matmul_grouped_slice_in_features
+    triton_fused_matmul_grouped_slice_in_features,
+    triton_fused_matmul_grouped_slice_rows_gf,
+    triton_fused_matmul_grouped_slice_in_features_gf,
+    convert_to_group_first,
 )
 
 
@@ -114,6 +117,9 @@ class WxA16Weights(nn.Module):
     def set_packed_data(self, gate_up_packed, down_packed):
         """
         设置 packed 数据并注册为 buffer，以便 state_dict 保存。
+
+        注意：group-first 布局由 property getter 惰性生成（首次访问时），
+        不注册为 buffer，不影响 state_dict 格式。
         """
         # Register gate_up packed data
         if gate_up_packed is not None:
@@ -142,6 +148,58 @@ class WxA16Weights(nn.Module):
             self._down_bit_width = down_packed.get('bit_width')
             self._down_rotation = down_packed.get('rotation')
             self._down_orig_dtype = down_packed.get('orig_dtype')
+
+    def _build_group_first(self, which: str = "both", offload_original_to_cpu: bool = True):
+        """P5-1: 生成 group-first 布局的权重（惰性，首次 forward 前调用）。
+
+        不注册为 buffer，仅作为运行时优化产物存在字典中，
+        不影响 state_dict 格式和 checkpoint 兼容性。
+
+        若 _packed 字典为 None（from_metadata 路径下），先通过 property 触发重建。
+
+        Args:
+            which: "gate_up" / "down" / "both"
+            offload_original_to_cpu: 构建完 gf 后将原始 indices_packed/norms 移到 CPU，
+                释放 GPU 显存（gf 与原始数据元素总数相同，显存净占用不变）。
+        """
+        if which in ("gate_up", "both"):
+            packed = self.gate_up_packed  # 触发惰性重建
+            if "indices_packed_gf" not in packed:
+                gu_indices_gf, gu_norms_gf = convert_to_group_first(
+                    packed["indices_packed"],
+                    packed["norms"],
+                    packed["group_size"],
+                    packed["bit_width"],
+                )
+                packed["indices_packed_gf"] = gu_indices_gf
+                packed["norms_gf"] = gu_norms_gf
+
+                if offload_original_to_cpu:
+                    # 原始 buffer 移到 CPU，释放 GPU 显存
+                    # state_dict() 仍能正确保存（buffer 还是 module 的一部分）
+                    # forward 只走 gf 路径，不再访问原始布局
+                    self.gate_up_indices_packed = self.gate_up_indices_packed.cpu()
+                    self.gate_up_norms = self.gate_up_norms.cpu()
+                    # 同步更新字典引用
+                    packed["indices_packed"] = self.gate_up_indices_packed
+                    packed["norms"] = self.gate_up_norms
+        if which in ("down", "both"):
+            packed = self.down_packed  # 触发惰性重建
+            if "indices_packed_gf" not in packed:
+                dn_indices_gf, dn_norms_gf = convert_to_group_first(
+                    packed["indices_packed"],
+                    packed["norms"],
+                    packed["group_size"],
+                    packed["bit_width"],
+                )
+                packed["indices_packed_gf"] = dn_indices_gf
+                packed["norms_gf"] = dn_norms_gf
+
+                if offload_original_to_cpu:
+                    self.down_indices_packed = self.down_indices_packed.cpu()
+                    self.down_norms = self.down_norms.cpu()
+                    packed["indices_packed"] = self.down_indices_packed
+                    packed["norms"] = self.down_norms
 
 
     @classmethod
@@ -382,6 +440,16 @@ class WxA16BitPartitionedGroupMoE(nn.Module):
             for bit_str, offsets in self.expert_offsets.items():
                 self._expert_offsets_cpu[bit_str] = offsets.cpu().tolist()
 
+        # P5-1: 懒构建 group-first 布局（首次 forward 时一次性转换）
+        # 不修改 state_dict 格式，纯运行时优化，内存占用与原布局相同（只是排列不同）
+        if not hasattr(self, '_gf_built'):
+            self._gf_built = True
+            for w in self.bit_weights.values():
+                # 先触发 property 重建（from_metadata 路径下 _packed 为 None）
+                _ = w.gate_up_packed
+                _ = w.down_packed
+                w._build_group_first("both")
+
         t1 = time.time()
 
         # Shared expert
@@ -470,17 +538,31 @@ class WxA16BitPartitionedGroupMoE(nn.Module):
 
                 # 使用 Triton Fused Kernel 处理 gate_up
                 gate_up_packed = wxa16_weights.gate_up_packed
-                gate_up_out = triton_fused_matmul_grouped_slice_rows(
-                    expert_tokens,
-                    gate_up_packed["indices_packed"],
-                    gate_up_packed["codebook"].to(x.device),
-                    gate_up_packed["norms"],
-                    gate_up_packed["seed"],
-                    gate_up_packed["group_size"],
-                    gate_up_packed["shape"][1],  # in_features = hidden_size
-                    2*start, 2*end,  # row slice
-                    bit
-                )
+                if "indices_packed_gf" in gate_up_packed:
+                    # P5-1: Group-First 布局，memory coalescing 更优
+                    gate_up_out = triton_fused_matmul_grouped_slice_rows_gf(
+                        expert_tokens,
+                        gate_up_packed["indices_packed_gf"],
+                        gate_up_packed["codebook"].to(x.device),
+                        gate_up_packed["norms_gf"],
+                        gate_up_packed["seed"],
+                        gate_up_packed["group_size"],
+                        gate_up_packed["shape"][1],  # in_features = hidden_size
+                        2*start, 2*end,  # row slice
+                        bit
+                    )
+                else:
+                    gate_up_out = triton_fused_matmul_grouped_slice_rows(
+                        expert_tokens,
+                        gate_up_packed["indices_packed"],
+                        gate_up_packed["codebook"].to(x.device),
+                        gate_up_packed["norms"],
+                        gate_up_packed["seed"],
+                        gate_up_packed["group_size"],
+                        gate_up_packed["shape"][1],  # in_features = hidden_size
+                        2*start, 2*end,  # row slice
+                        bit
+                    )
 
                 gate_out = gate_up_out[:, :actual_inter_size]
                 up_out = gate_up_out[:, actual_inter_size:]
@@ -491,17 +573,31 @@ class WxA16BitPartitionedGroupMoE(nn.Module):
 
                 # 使用 Triton Fused Kernel 处理 down (in_features slicing)
                 down_packed = wxa16_weights.down_packed
-                down_out = triton_fused_matmul_grouped_slice_in_features(
-                    act_out,
-                    down_packed["indices_packed"],
-                    down_packed["codebook"].to(x.device),
-                    down_packed["norms"],
-                    down_packed["seed"],
-                    down_packed["group_size"],
-                    start, end,  # original_start, original_end
-                    down_packed["shape"][1],  # full_in_features
-                    bit
-                )
+                if "indices_packed_gf" in down_packed:
+                    # P5-1: Group-First 布局，in_features 切片整块连续
+                    down_out = triton_fused_matmul_grouped_slice_in_features_gf(
+                        act_out,
+                        down_packed["indices_packed_gf"],
+                        down_packed["codebook"].to(x.device),
+                        down_packed["norms_gf"],
+                        down_packed["seed"],
+                        down_packed["group_size"],
+                        start, end,  # original_start, original_end
+                        down_packed["shape"][1],  # full_in_features
+                        bit
+                    )
+                else:
+                    down_out = triton_fused_matmul_grouped_slice_in_features(
+                        act_out,
+                        down_packed["indices_packed"],
+                        down_packed["codebook"].to(x.device),
+                        down_packed["norms"],
+                        down_packed["seed"],
+                        down_packed["group_size"],
+                        start, end,  # original_start, original_end
+                        down_packed["shape"][1],  # full_in_features
+                        bit
+                    )
                 del act_out
 
                 expert_out += down_out
