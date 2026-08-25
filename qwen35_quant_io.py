@@ -389,7 +389,16 @@ def load_quantized_model(base_model_path: str = None, quant_dir: str = None,
         seqlen: 模型序列长度（与原加载路径一致，固定 2048）
     """
     if base_model_path is None:
-        base_model_path = quant_dir
+        # 优先从 meta.json 读 base_model 路径（旧 checkpoint 没拷 tokenizer 时也能用）
+        meta_path_tmp = os.path.join(quant_dir, "meta.json")
+        if os.path.isfile(meta_path_tmp):
+            with open(meta_path_tmp, "r", encoding="utf-8") as f:
+                meta_tmp = json.load(f)
+            saved_base = meta_tmp.get("base_model")
+            if saved_base and os.path.isdir(saved_base):
+                base_model_path = saved_base
+        if base_model_path is None:
+            base_model_path = quant_dir
     print(f"Loading quantized checkpoint from: {quant_dir}")
     print(f"Base model path (config/tokenizer/remote code): {base_model_path}")
     tick0 = time.time()

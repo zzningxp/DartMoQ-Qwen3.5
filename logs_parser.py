@@ -45,6 +45,7 @@ LAYER_TIME_RE = re.compile(r"Layer (?P<layer>\d+) total reconstruct and quantiza
 EVAL_DATASETS_RE = re.compile(r"^Datasets:\s+(?P<datasets>.+)")
 EVAL_SEQUENTIAL_RE = re.compile(r"^Sequential eval:\s+(?P<sequential>\S+)")
 EVAL_STANDBY_CPU_RE = re.compile(r"^Standby CPU:\s+(?P<standby_cpu>\S+)")
+EVAL_LOAD_QUANTIZED_RE = re.compile(r"^Load quantized checkpoint:\s+(?P<path>\S+)")
 
 # Old log format patterns (for backward compatibility)
 LOADING_RE = re.compile(r"Loading model:\s*\(ppl\)\s*(?P<path>\S+)")
@@ -309,6 +310,16 @@ def parse_log(path: str) -> list[RunRecord]:
                 eval_standby_cpu_match = EVAL_STANDBY_CPU_RE.search(line)
                 if eval_standby_cpu_match:
                     current.standby_layer_cpu = eval_standby_cpu_match.group("standby_cpu")
+                    continue
+
+                # 量化 checkpoint 直接 eval（--load-quantized）
+                eval_quant_match = EVAL_LOAD_QUANTIZED_RE.search(line)
+                if eval_quant_match:
+                    qpath = eval_quant_match.group("path")
+                    current.model_path = qpath
+                    current.model_name = _last_path_component(qpath)
+                    current.wxa16_real_quant = "Yes"
+                    current.quantmode = "wxa16_load"
                     continue
 
                 # Eval uses the same PPL format

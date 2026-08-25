@@ -29,6 +29,7 @@ def main():
     parser.add_argument("--quant-layers", type=str, default=None, help="Only quantize specific layers (e.g., '0-5,8,10' for layers 0-5, 8, and 10; default: all layers)")
     parser.add_argument("--wxa16", action="store_true", default=False, help="Use WxA16 real quantization (stored packed format, not fake quant)")
     parser.add_argument("--save-quantized", type=str, default=None, help="Save quantized checkpoint (packed format) to this directory after quantization")
+    parser.add_argument("--eval-batch-size", type=int, default=32, help="Batch size for normal (non-sequential) PPL evaluation")
     parser.add_argument("--load-quantized", type=str, default=None, help="Load quantized checkpoint from this directory, skip calibration & quantization, directly run PPL eval")
 
     args = parser.parse_args()
@@ -44,8 +45,11 @@ def main():
     print("DartMoQ for Qwen3.5 MoE (Hybrid Mode Only)")
     git_hash = get_git_hash()
     print(f"Git HEAD: {git_hash}")
-    print(f"Model: {args.model}")
-    print(f"Calibration dataset: {args.dataset}")
+    if args.load_quantized:
+        print(f"Quantized checkpoint: {args.load_quantized}")
+    else:
+        print(f"Model: {args.model}")
+        print(f"Calibration dataset: {args.dataset}")
     print(f"Quant scheme: {args.quant_scheme}")
     print(f"Rank mode: {args.rank_mode}")
     print(f"Slices per expert: {args.slices}")

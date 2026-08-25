@@ -5,6 +5,7 @@ Phase 1: Original FP16 perplexity evaluation with CPU standby mode support.
 """
 
 import gc
+import os
 import time
 import torch
 import torch.nn as nn
@@ -378,21 +379,51 @@ def qwen35_ppl_eval(model, testloader, eval_set, args):
     nsamples = testenc.shape[1] // model.seqlen
     print(f'ppl evaluation samples: {nsamples}')
 
+    # 全模型在 GPU 上的 batch 化 eval：
+    #   transformer 层用较大 batch（隐状态小，~16MB/sample），
+    #   lm_head 分批算（logits 巨大，~600MB/sample 会 OOM）。
+    # 直接调用 model.model(input_ids)，不传 attention_mask/position_ids，
+    # 让内部自动生成，与 model(batch) 行为完全一致，保证 PPL 正确。
+    # 输入是规整的 batch × seqlen（无 padding），不需要 mask。
+    batch_size = getattr(args, 'eval_batch_size', 32)
+    lm_head_batch_size = 4
     nlls = []
+    loss_fct = nn.CrossEntropyLoss(reduction='none')
 
-    for i in range(nsamples):
-        batch = testenc[:, (i * model.seqlen):((i + 1) * model.seqlen)].to(DEV)
-        target_ids = batch.clone()
+    for batch_start in range(0, nsamples, batch_size):
+        batch_end = min(batch_start + batch_size, nsamples)
+        actual_bs = batch_end - batch_start
+        if batch_start % 10 == 0 or batch_start == 0:
+            print(f"  sample {batch_start}/{nsamples} (bs={actual_bs})...", flush=True)
+
+        # [1, B*seqlen] → [B, seqlen]
+        batch = testenc[:, (batch_start * model.seqlen):(batch_end * model.seqlen)].to(DEV)
+        batch = batch.view(actual_bs, model.seqlen)
 
         with torch.no_grad():
-            outputs = model(batch)
-            shift_logits = outputs.logits[:, :-1, :].contiguous()
-            shift_labels = target_ids[:, 1:].contiguous()
+            # 走 model.model（不含 lm_head），mask 和 pos_emb 内部自动生成
+            transformer_out = model.model(batch)
+            hidden = transformer_out[0] if isinstance(transformer_out, tuple) else transformer_out.last_hidden_state
 
-            loss_fct = nn.CrossEntropyLoss()
-            loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-            neg_log_likelihood = loss.float() * model.seqlen
-            nlls.append(neg_log_likelihood)
+            # lm_head 分批算 loss，避免 logits OOM
+            shift_labels_all = batch[:, 1:].contiguous()
+            for lm_start in range(0, actual_bs, lm_head_batch_size):
+                lm_end = min(lm_start + lm_head_batch_size, actual_bs)
+                h = hidden[lm_start:lm_end, :-1, :].contiguous()
+                logits = model.lm_head(h)
+                shift_labels = shift_labels_all[lm_start:lm_end, :].contiguous()
+                loss = loss_fct(
+                    logits.view(-1, logits.size(-1)),
+                    shift_labels.view(-1),
+                )
+                loss = loss.view(lm_end - lm_start, model.seqlen - 1)
+                neg_log_likelihood = loss.float().sum(dim=1)
+                nlls.extend(neg_log_likelihood.unbind())
+                del logits, h
+
+            del hidden, transformer_out
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     ppl = torch.exp(torch.stack(nlls).sum() / (nsamples * model.seqlen))
     tick1 = time.time()
@@ -427,7 +458,8 @@ def run_ppl_evaluation(model, tokenizer, args):
     for dataset in ['wikitext2', 'c4']:
         print(f"\nEvaluating on {dataset}")
         _, testloader = get_loaders(
-            dataset, seed=args.seed, tokenizer=tokenizer, seqlen=model.seqlen
+            dataset, seed=args.seed, tokenizer=tokenizer, seqlen=model.seqlen,
+            eval_only=True,
         )
 
         if use_sequential:
@@ -447,6 +479,14 @@ def run_ppl_evaluation(model, tokenizer, args):
     return ppl_results
 
 
+def _is_quant_dir(path: str) -> bool:
+    """判断一个目录是否为量化 checkpoint 目录（含 meta.json + model.safetensors）。"""
+    if not path or not os.path.isdir(path):
+        return False
+    return (os.path.isfile(os.path.join(path, "meta.json"))
+            and os.path.isfile(os.path.join(path, "model.safetensors")))
+
+
 def main():
     parser = argparse.ArgumentParser(description="Evaluate Qwen3.5 MoE perplexity")
     parser.add_argument('model', type=str, nargs='?', default=None,
@@ -461,8 +501,15 @@ def main():
                         help='Load quantized checkpoint from this directory (skip fp16 model loading)')
     parser.add_argument('--datasets', type=str, nargs='+',
                         default=['wikitext2', 'c4'], help="Datasets to evaluate on")
+    parser.add_argument('--eval-batch-size', type=int, default=32,
+                        help="Batch size for normal (non-sequential) PPL evaluation")
 
     args = parser.parse_args()
+
+    # 自动判断：单位置参数若为量化目录，则等价于 --load-quantized
+    if args.model and not args.load_quantized and _is_quant_dir(args.model):
+        args.load_quantized = args.model
+        args.model = None
 
     if not args.load_quantized and not args.model:
         parser.error("model path is required when not using --load-quantized")
@@ -470,12 +517,15 @@ def main():
     print("Qwen3.5 MoE Evaluation")
     git_hash = get_git_hash()
     print(f"Git HEAD: {git_hash}")
-    print(f"Model: {args.model}")
+    if args.load_quantized:
+        print(f"Quantized checkpoint: {args.load_quantized}")
+        if args.model:
+            print(f"Base model (config/tokenizer): {args.model}")
+    else:
+        print(f"Model: {args.model}")
     print(f"Datasets: {args.datasets}")
     print(f"Sequential eval: {args.sequential_eval}")
     print(f"Standby CPU: {args.standby_cpu}")
-    if args.load_quantized:
-        print(f"Load quantized checkpoint: {args.load_quantized}")
 
     # Load model（fp16 原模型 或 量化 checkpoint，加载逻辑复用 qwen35_quant_io）
     if args.load_quantized:
@@ -501,9 +551,9 @@ def main():
 
         print(f"Loading {dataset} dataset... (this may take a while)")
         tick_data = time.time()
-        dataloader, testloader = get_loaders(
+        _, testloader = get_loaders(
             dataset, nsamples=args.val_samples, seed=args.seed,
-            tokenizer=tokenizer, seqlen=model.seqlen
+            tokenizer=tokenizer, seqlen=model.seqlen, eval_only=True,
         )
         print(f"Dataset loaded in {time.time() - tick_data:.2f}s")
         print(f"Test data shape: {testloader.input_ids.shape}")
