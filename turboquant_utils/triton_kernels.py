@@ -1138,7 +1138,8 @@ def triton_fused_matmul_grouped_gf(
 
 def triton_fused_matmul_grouped_slice_rows_gf(
     x, indices_packed_gf, codebook, norms_gf, seed, group_size,
-    in_features, row_start, row_end, bit_width: int = 4
+    in_features, row_start, row_end, bit_width: int = 4,
+    x_is_rotated: bool = False, norms_prescaled: bool = False,
 ):
     """Group-First 布局的 grouped fused matmul（行切片，gate_up 路径）。
 
@@ -1156,6 +1157,13 @@ def triton_fused_matmul_grouped_slice_rows_gf(
         in_features: 输入特征维度
         row_start, row_end: 行切片范围（输出维度切片）
         bit_width: 1/2/4/8
+        x_is_rotated: (P6-1) x 是否已经在外部做过分组旋转。
+            gate_up 的旋转矩阵只依赖 (group_size, seed)，与 row_start/row_end 无关，
+            因此调用方可以对全量 token 旋转一次再按 expert 切片，省掉重复旋转。
+            仅在 num_groups >= 2 的主路径支持；其他路径会直接报错而不是静默算错。
+        norms_prescaled: (P6-2) norms_gf 是否已经预除过 sqrt(group_size)。
+            该缩放是常量，可在建 group-first 布局时一次性乘进去，
+            省掉每次调用一个微 kernel。
 
     Returns:
         output: (B, slice_N)
@@ -1174,6 +1182,8 @@ def triton_fused_matmul_grouped_slice_rows_gf(
     # norms 行切片: (num_groups, N_total) → (num_groups, slice_N)
     norms_slice = norms_gf[:, row_start:row_end]
 
+    scale = math.sqrt(group_size)
+
     if in_features % group_size == 0:
         num_groups = in_features // group_size
         if num_groups >= 2:
@@ -1181,12 +1191,13 @@ def triton_fused_matmul_grouped_slice_rows_gf(
             if orig_dtype != torch.float16:
                 codebook = codebook.half()
                 norms_slice = norms_slice.half()
-                x_rot = batch_rotate_input(x.half(), group_size, seed)
+                # P6-1: 已预旋转时不再重复旋转
+                x_rot = x.half() if x_is_rotated else batch_rotate_input(x.half(), group_size, seed)
             else:
-                x_rot = batch_rotate_input(x, group_size, seed)
+                x_rot = x if x_is_rotated else batch_rotate_input(x, group_size, seed)
 
-            scale = math.sqrt(group_size)
-            norms_scaled = norms_slice / scale
+            # P6-2: norms 的 1/sqrt(group_size) 是常量，可在建 gf 布局时预乘
+            norms_scaled = norms_slice if norms_prescaled else norms_slice / scale
 
             output_fp16 = _triton_fused_matmul_grouped_gf(
                 x_rot, indices_slice, codebook, norms_scaled,
@@ -1200,14 +1211,27 @@ def triton_fused_matmul_grouped_slice_rows_gf(
 
         # num_groups == 1
         else:
+            if x_is_rotated:
+                raise ValueError(
+                    "x_is_rotated=True 只在 num_groups >= 2 的主路径支持，"
+                    f"当前 in_features={in_features}, group_size={group_size} → num_groups=1"
+                )
             # 退回到单 group kernel
             indices_2d = indices_slice[0]  # (slice_N, packed_per_group)
             norms_1d = norms_slice[0]  # (slice_N,)
+            # 该路径由 triton_fused_matmul 内部处理缩放，需还原预乘
+            if norms_prescaled:
+                norms_1d = norms_1d * scale
             Pi = generate_rotation_matrix(group_size, seed, device=x.device).to(x.dtype)
             x_rot = x @ Pi.T
             return triton_fused_matmul(x_rot, indices_2d, codebook, norms_1d, in_features, bit_width)
 
     # Fallback: 非对齐情况转回传统布局
+    if x_is_rotated:
+        raise ValueError(
+            "x_is_rotated=True 只在 in_features 对齐 group_size 的主路径支持，"
+            f"当前 in_features={in_features}, group_size={group_size}"
+        )
     ELEMENTS_PER_BYTE = 8 // bit_width
     packed_per_group = group_size // ELEMENTS_PER_BYTE
     num_groups_full = indices_packed_gf.shape[0]
@@ -1215,6 +1239,8 @@ def triton_fused_matmul_grouped_slice_rows_gf(
         indices_packed_gf.shape[1], num_groups_full * packed_per_group
     )
     norms_trad = norms_gf.t()
+    if norms_prescaled:
+        norms_trad = norms_trad * scale
     return triton_fused_matmul_grouped_slice_rows(
         x, indices_trad, codebook, norms_trad, seed, group_size,
         in_features, row_start, row_end, bit_width
@@ -1223,7 +1249,8 @@ def triton_fused_matmul_grouped_slice_rows_gf(
 
 def triton_fused_matmul_grouped_slice_in_features_gf(
     x, indices_packed_gf, codebook, norms_gf, seed, group_size,
-    original_start, original_end, full_in_features, bit_width: int = 4
+    original_start, original_end, full_in_features, bit_width: int = 4,
+    norms_prescaled: bool = False,
 ):
     """Group-First 布局的 grouped fused matmul（in_features 切片，down 路径）。
 
@@ -1240,6 +1267,11 @@ def triton_fused_matmul_grouped_slice_in_features_gf(
         original_start, original_end: 原始全权重的 in_features 切片范围
         full_in_features: 完整权重的 in_features
         bit_width: 1/2/4/8
+        norms_prescaled: (P6-2) norms_gf 是否已经预除过 sqrt(group_size)。
+
+    注：down 方向的 seed_base 含 expert 偏移（seed + original_start），且输入
+        act_out 本身就是 per-expert 数据，不存在跨 expert 的旋转冗余，
+        因此没有对应的 x_is_rotated 参数。
 
     Returns:
         output: (B, N)
@@ -1266,6 +1298,8 @@ def triton_fused_matmul_grouped_slice_in_features_gf(
     # norms group 切片: (num_groups_total, N) → (num_groups_in_slice, N)
     norms_slice = norms_gf[g_start:g_end]
 
+    scale = math.sqrt(group_size)
+
     if slice_in_features % group_size == 0:
         if num_groups_in_slice >= 2:
             orig_dtype = x.dtype
@@ -1277,8 +1311,8 @@ def triton_fused_matmul_grouped_slice_in_features_gf(
             else:
                 x_rot = batch_rotate_input(x, group_size, seed_base)
 
-            scale = math.sqrt(group_size)
-            norms_scaled = norms_slice / scale
+            # P6-2: 常量缩放可在建 gf 布局时预乘
+            norms_scaled = norms_slice if norms_prescaled else norms_slice / scale
 
             output_fp16 = _triton_fused_matmul_grouped_gf(
                 x_rot, indices_slice, codebook, norms_scaled,
@@ -1295,6 +1329,9 @@ def triton_fused_matmul_grouped_slice_in_features_gf(
             seed_base = seed + original_start
             indices_2d = indices_slice[0]  # (N, packed_per_group)
             norms_1d = norms_slice[0]  # (N,)
+            # 该路径由 triton_fused_matmul 内部处理缩放，需还原预乘
+            if norms_prescaled:
+                norms_1d = norms_1d * scale
             Pi = generate_rotation_matrix(group_size, seed_base, device=x.device).to(x.dtype)
             x_rot = x @ Pi.T
             return triton_fused_matmul(x_rot, indices_2d, codebook, norms_1d, group_size, bit_width)
@@ -1305,6 +1342,8 @@ def triton_fused_matmul_grouped_slice_in_features_gf(
     num_groups_full = indices_packed_gf.shape[0]
     indices_trad = indices_packed_gf.permute(1, 0, 2).reshape(N, num_groups_full * packed_per_group)
     norms_trad = norms_gf.t()
+    if norms_prescaled:
+        norms_trad = norms_trad * scale
     return triton_fused_matmul_grouped_slice_in_features(
         x, indices_trad, codebook, norms_trad, seed, group_size,
         original_start, original_end, full_in_features, bit_width

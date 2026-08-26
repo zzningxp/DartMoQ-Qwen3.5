@@ -7,8 +7,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from collections import defaultdict
+import math
 import time
 import gc
+
+import numpy as np
 
 from wxa16_linear import WxA16Linear
 from turboquant_utils.quantize import turboquant_quantize_packed_full
@@ -19,6 +22,8 @@ from turboquant_utils.triton_kernels import (
     triton_fused_matmul_grouped_slice_in_features_gf,
     convert_to_group_first,
 )
+from turboquant_utils.cuda_profiler import CudaStageProfiler
+from turboquant_utils.rotation import batch_rotate_input
 
 
 class WxA16Weights(nn.Module):
@@ -172,7 +177,11 @@ class WxA16Weights(nn.Module):
                     packed["bit_width"],
                 )
                 packed["indices_packed_gf"] = gu_indices_gf
-                packed["norms_gf"] = gu_norms_gf
+                # P6-2: 把常量缩放 1/sqrt(group_size) 预乘进 norms_gf，
+                # 省掉 kernel wrapper 里每次调用一个微 kernel（每层约 512 次）。
+                # 原始 packed["norms"] 保持未缩放，state_dict 格式不受影响。
+                packed["norms_gf"] = gu_norms_gf / math.sqrt(packed["group_size"])
+                packed["norms_gf_prescaled"] = True
 
                 if offload_original_to_cpu:
                     # 原始 buffer 移到 CPU，释放 GPU 显存
@@ -193,7 +202,9 @@ class WxA16Weights(nn.Module):
                     packed["bit_width"],
                 )
                 packed["indices_packed_gf"] = dn_indices_gf
-                packed["norms_gf"] = dn_norms_gf
+                # P6-2: 同 gate_up，预乘常量缩放
+                packed["norms_gf"] = dn_norms_gf / math.sqrt(packed["group_size"])
+                packed["norms_gf_prescaled"] = True
 
                 if offload_original_to_cpu:
                     self.down_indices_packed = self.down_indices_packed.cpu()
@@ -267,6 +278,23 @@ class WxA16BitPartitionedGroupMoE(nn.Module):
         # 关闭时跳过所有计时采样和 print，零额外开销
         self.enable_timing = True
         self.last_timings = {}
+
+        # P6-0: CUDA event 分阶段计时（与上面的 wall-clock 计时并存，互不影响）
+        # wall-clock 计时测的是 CPU launch 时间，异步执行下会把耗时记错段；
+        # 这里用 event 测真实 GPU 执行时间。默认关闭，测量时由外部置 True。
+        self.enable_cuda_profile = False
+        self._cuda_prof = CudaStageProfiler(enabled=False)
+        self.last_cuda_stats = {}
+
+        # P6-1: gate_up 旋转预提升开关。
+        # gate_up 的旋转矩阵只依赖 (group_size, seed)，与 expert 无关，
+        # 而 top_k=8 导致每个 token 在 per-expert 循环里被重复旋转 top_k 次。
+        # 开启后按 bit 判定收益（见 forward 内的判据），划算才预旋转。
+        self.enable_rotation_hoist = True
+        # 预旋转收益门限：该 bit 下所有 expert 的 token 行数之和 > T * 该系数 才预旋转。
+        # 取 1.0 即"预旋转的额外成本(旋转 T 行) 小于省下的重复旋转"这一盈亏平衡点，
+        # 留一点余量避免边界抖动。
+        self.rotation_hoist_threshold = 1.5
 
         # 按 bit 分组的权重
         self.bit_weights = nn.ModuleDict()  # "8" -> WxA16Weights, "4" -> ...
@@ -422,6 +450,154 @@ class WxA16BitPartitionedGroupMoE(nn.Module):
         moe.enable_timing = meta.get("enable_timing", True)
         return moe
 
+    def _ensure_active_bits(self):
+        """P6-2: 预计算每个 expert 真正活跃的 bit 列表。
+
+        原先 forward 内层是 `for bit_str in self.bit_weights.keys()` 全遍历，
+        再靠 `if actual_inter_size == 0: continue` 跳过。实测本模型 bit 是在
+        expert 之间划分的（每个 expert 基本只用一个 bit），256 experts × 3 bits
+        里约 512 次是纯空转。
+
+        只依赖 expert_offsets（加载后固定），算一次复用。
+        """
+        if getattr(self, "_active_bits_cache_valid", False):
+            return
+
+        table = []
+        for e in range(self.num_experts):
+            entries = []
+            for bit_str in self.bit_weights.keys():
+                offs = self._expert_offsets_cpu[bit_str]
+                s, t = offs[e], offs[e + 1]
+                if t > s:
+                    entries.append((bit_str, int(bit_str), s, t))
+            table.append(entries)
+        self._active_bits_by_expert = table
+
+        # 每个 bit 下哪些 expert 活跃（P6-1 的收益判据要用）
+        masks = {}
+        for bit_str in self.bit_weights.keys():
+            arr = np.asarray(self._expert_offsets_cpu[bit_str])
+            masks[bit_str] = (arr[1:] - arr[:-1]) > 0
+        self._expert_mask_by_bit = masks
+
+        self._active_bits_cache_valid = True
+
+    def _get_bit_context(self, device):
+        """P6-2: 缓存每个 bit 的常量，避免在 per-expert × per-bit 循环里重复取。
+
+        原先每层约 512 次重复做：dict 查找、`codebook.to(device)`、
+        以及 kernel wrapper 内部的 `seed.item()`（若 seed 是 tensor，这是 D2H 同步）。
+        这些量在一层内是常量，缓存一次即可。
+        """
+        cache = getattr(self, "_bit_ctx_cache", None)
+        if cache is not None and getattr(self, "_bit_ctx_device", None) == device:
+            return cache
+
+        def _as_int(v):
+            return int(v.item()) if torch.is_tensor(v) else int(v)
+
+        ctx = {}
+        for bit_str, w in self.bit_weights.items():
+            gu = w.gate_up_packed
+            dn = w.down_packed
+            ctx[bit_str] = {
+                "gate_up": gu,
+                "down": dn,
+                # gate_up / down 的 gf 布局是各自独立构建的，分别判断（保持原语义）
+                "gf_gate_up": "indices_packed_gf" in gu,
+                "gf_down": "indices_packed_gf" in dn,
+                "gate_up_codebook": gu["codebook"].to(device),
+                "down_codebook": dn["codebook"].to(device),
+                "gate_up_seed": _as_int(gu["seed"]),
+                "down_seed": _as_int(dn["seed"]),
+                "gate_up_group_size": int(gu["group_size"]),
+                "down_group_size": int(dn["group_size"]),
+                "gate_up_in_features": int(gu["shape"][1]),   # = hidden_size
+                "down_in_features": int(dn["shape"][1]),      # = full_in_features
+                "gate_up_norms_prescaled": bool(gu.get("norms_gf_prescaled", False)),
+                "down_norms_prescaled": bool(dn.get("norms_gf_prescaled", False)),
+            }
+
+        self._bit_ctx_cache = ctx
+        self._bit_ctx_device = device
+        return ctx
+
+    def _build_hoisted_rotations(self, x, bit_ctx, tokens_per_expert):
+        """P6-1: 对收益为正的 bit，把 gate_up 的分组旋转提到 expert 循环外做一次。
+
+        依据：gate_up 的旋转矩阵只依赖 (group_size, seed)，与 expert 无关
+        （见 triton_kernels.triton_fused_matmul_grouped_slice_rows_gf，row_start/row_end
+        只切权重不进旋转）。而旋转按 K 维分组、逐行独立，因此
+        `rotate(x[idx]) ≡ rotate(x)[idx]` —— 数学严格等价。
+
+        收益判据：设 T 为本次 forward 的 token 数，某 bit 下所有 expert 的
+        token 行数之和为 R。逐 expert 旋转要转 R 行，预旋转要转 T 行。
+        因为 top_k > 1，主力 bit 的 R ≈ T × top_k ≫ T，收益接近 top_k 倍；
+        但长尾 bit（只有几个 expert）的 R < T，预旋转反而亏，必须跳过。
+
+        Returns:
+            {bit_str: x_rot}，只包含判定为划算的 bit。
+        """
+        # 旋转前统一 cast 到 fp16：kernel wrapper 的 fast path 对非 fp16 输入
+        # 本来就做 x.half() 后再旋转（per-expert 路径每 expert cast 一次），
+        # 提升只是把这步提到循环外做一次，数学等价。
+        # 本模型真实运行时输入是 bf16（qwen35_utils.py:22），旋转与 matmul 均在 fp16 完成。
+        x_rot_src = x if x.dtype == torch.float16 else x.half()
+
+        T = x.shape[0]
+        cum = np.asarray(tokens_per_expert)
+        counts = np.diff(np.concatenate(([0], cum)))  # 每个 expert 的 token 数
+
+        out = {}
+        for bit_str, ctx in bit_ctx.items():
+            # 只有 gf 主路径（num_groups >= 2 且对齐）支持 x_is_rotated
+            if not ctx["gf_gate_up"]:
+                continue
+            gs = ctx["gate_up_group_size"]
+            in_f = ctx["gate_up_in_features"]
+            if in_f % gs != 0 or in_f // gs < 2:
+                continue
+
+            rows = int(counts[self._expert_mask_by_bit[bit_str]].sum())
+            if rows <= T * self.rotation_hoist_threshold:
+                continue  # 预旋转不划算（长尾 bit）
+
+            out[bit_str] = batch_rotate_input(x_rot_src, gs, ctx["gate_up_seed"])
+
+        T = x.shape[0]
+        cum = np.asarray(tokens_per_expert)
+        counts = np.diff(np.concatenate(([0], cum)))  # 每个 expert 的 token 数
+
+        out = {}
+        for bit_str, ctx in bit_ctx.items():
+            # 只有 gf 主路径（num_groups >= 2 且对齐）支持 x_is_rotated
+            if not ctx["gf_gate_up"]:
+                continue
+            gs = ctx["gate_up_group_size"]
+            in_f = ctx["gate_up_in_features"]
+            if in_f % gs != 0 or in_f // gs < 2:
+                continue
+
+            rows = int(counts[self._expert_mask_by_bit[bit_str]].sum())
+            if rows <= T * self.rotation_hoist_threshold:
+                continue  # 预旋转不划算（长尾 bit）
+
+            out[bit_str] = batch_rotate_input(x, gs, ctx["gate_up_seed"])
+
+        return out
+
+    def set_cuda_profile(self, enabled: bool = True):
+        """开关 P6-0 的 CUDA event 分阶段计时。
+
+        开启后每次 forward 会在开头和结尾各 synchronize 一次（这会串行化
+        与上下层的重叠），所以**只用于测量，不要在正式跑 eval 时开**。
+        结果存在 self.last_cuda_stats，可用 CudaStageProfiler.format_stats 打印。
+        """
+        self.enable_cuda_profile = bool(enabled)
+        self._cuda_prof = CudaStageProfiler(enabled=bool(enabled))
+        return self
+
     @torch.no_grad()
     def warmup_kernels(self, seq_len: int = 2048, batch_size: int = 1):
         """预编译 Triton kernel，消除第一次 forward 的 JIT 编译冷启动开销。
@@ -435,8 +611,11 @@ class WxA16BitPartitionedGroupMoE(nn.Module):
             batch_size: 模拟的 batch size（默认 1）
         """
         device = next(self.gate.parameters()).device
-        dummy = torch.randn(batch_size, seq_len, self.hidden_dim,
-                           device=device, dtype=torch.float16)
+        # dummy 的 dtype 必须与真实运行时输入一致（本模型是 bf16，见 qwen35_utils.py:22）。
+        # 之前写死 fp16，与 bf16 的 shared_expert_gate 权重 dtype 不匹配，直接 RuntimeError。
+        dtype = self.gate.weight.dtype
+        dummy = torch.randn(batch_size, seq_len, self.hidden_size,
+                           device=device, dtype=dtype)
         # 跑一次 forward（忽略输出），触发所有 kernel 编译
         _ = self.forward(dummy)
         torch.cuda.synchronize()
@@ -446,6 +625,9 @@ class WxA16BitPartitionedGroupMoE(nn.Module):
         """
         前向推理：按 expert 处理，对每个 bit 分别反量化 + GEMM。
         """
+        prof = self._cuda_prof
+        prof.begin_round()
+
         t0 = time.time()
 
         batch_size, seq_len, hidden_dim = hidden_states.shape
@@ -468,46 +650,54 @@ class WxA16BitPartitionedGroupMoE(nn.Module):
                 _ = w.gate_up_packed
                 _ = w.down_packed
                 w._build_group_first("both")
+            # gf 布局重建后 packed 字典内容变了，bit context 缓存需失效
+            self._bit_ctx_cache = None
+
+        # P6-2: 预计算每 expert 的活跃 bit 列表（依赖上面的 _expert_offsets_cpu）
+        self._ensure_active_bits()
 
         t1 = time.time()
 
         # Shared expert
         t_shared_start = time.time()
         if self.shared_expert is not None and self.shared_expert_gate is not None:
-            shared_out = self.shared_expert(x)
-            shared_gate_val = torch.sigmoid(self.shared_expert_gate(x))
-            final_hidden_states.add_(shared_out * shared_gate_val)
-            del shared_out, shared_gate_val
+            with prof.stage("shared_expert"):
+                shared_out = self.shared_expert(x)
+                shared_gate_val = torch.sigmoid(self.shared_expert_gate(x))
+                final_hidden_states.add_(shared_out * shared_gate_val)
+                del shared_out, shared_gate_val
         t_shared_end = time.time()
         t2 = t_shared_end
 
         # Router
         t_router_start = time.time()
-        gate_output = self.gate(x)
-        if isinstance(gate_output, tuple):
-            _, topk_weights, topk_indices = gate_output
-        else:
-            router_logits = gate_output.softmax(dim=-1)
-            topk_weights, topk_indices = router_logits.topk(self.top_k, dim=-1)
-            del router_logits
-        del gate_output
+        with prof.stage("router"):
+            gate_output = self.gate(x)
+            if isinstance(gate_output, tuple):
+                _, topk_weights, topk_indices = gate_output
+            else:
+                router_logits = gate_output.softmax(dim=-1)
+                topk_weights, topk_indices = router_logits.topk(self.top_k, dim=-1)
+                del router_logits
+            del gate_output
         t_router_end = time.time()
         t3 = t_router_end
 
         # 优化结构：expert -> bit
-        # Flatten: (N, top_k) -> (N * top_k,)
-        flat_expert_indices = topk_indices.flatten()
-        flat_expert_weights = topk_weights.flatten()
-        flat_token_indices = torch.arange(x.shape[0], device=x.device).repeat_interleave(self.top_k)
+        with prof.stage("sort_prep"):
+            # Flatten: (N, top_k) -> (N * top_k,)
+            flat_expert_indices = topk_indices.flatten()
+            flat_expert_weights = topk_weights.flatten()
+            flat_token_indices = torch.arange(x.shape[0], device=x.device).repeat_interleave(self.top_k)
 
-        # 按 expert 排序
-        idxs = flat_expert_indices.argsort()
-        sorted_experts = flat_expert_indices[idxs]
-        sorted_weights = flat_expert_weights[idxs]
-        sorted_tokens = flat_token_indices[idxs]
+            # 按 expert 排序
+            idxs = flat_expert_indices.argsort()
+            sorted_experts = flat_expert_indices[idxs]
+            sorted_weights = flat_expert_weights[idxs]
+            sorted_tokens = flat_token_indices[idxs]
 
-        # 统计每个 expert 的 token 数
-        tokens_per_expert = sorted_experts.bincount(minlength=self.num_experts).cpu().numpy().cumsum(0)
+            # 统计每个 expert 的 token 数
+            tokens_per_expert = sorted_experts.bincount(minlength=self.num_experts).cpu().numpy().cumsum(0)
 
         # 对每个 expert 处理
         t_compute_start = time.time()
@@ -518,6 +708,22 @@ class WxA16BitPartitionedGroupMoE(nn.Module):
         time_triton_total = 0.0
         active_experts_count = 0
         active_bits_count = 0
+
+        # ---- P6-2: 每 bit 的常量准备（每层每 bit 做一次，不进 expert 循环）----
+        # 原先 codebook.to(device) / 字典查找 每层要重复约 512 次。
+        bit_ctx = self._get_bit_context(x.device)
+
+        # ---- P6-1: gate_up 旋转预提升 ----
+        # gate_up 的旋转矩阵只依赖 (group_size, seed)，与 expert 无关；
+        # 而 top_k 导致同一 token 在 per-expert 循环里被重复旋转 top_k 次。
+        # 这里对"该 bit 下总行数 > T * 阈值"的 bit 预先整体旋转一次，
+        # 循环内直接按 token 索引切片。数学严格等价（旋转逐行独立）。
+        x_rot_by_bit = {}
+        if self.enable_rotation_hoist:
+            with prof.stage("rotation_hoisted"):
+                x_rot_by_bit = self._build_hoisted_rotations(
+                    x, bit_ctx, tokens_per_expert,
+                )
 
         for expert_idx in range(self.num_experts):
             # print(f"  [DEBUG] expert_idx: {expert_idx}", flush=True)
@@ -532,105 +738,135 @@ class WxA16BitPartitionedGroupMoE(nn.Module):
 
             # 取当前 expert 的所有 token
             exp_token_idx = sorted_tokens[start_idx:end_idx]
-            expert_tokens = x[exp_token_idx]
             expert_weights = sorted_weights[start_idx:end_idx].unsqueeze(1)
 
-            # 对同一个 expert 的所有 token，处理所有 bit
-            expert_out = torch.zeros_like(expert_tokens)
+            # P6-2: expert_tokens 改为懒 gather —— 只有存在"未预旋转"的 bit 时才需要原始 x 切片。
+            # 全部 bit 都走预旋转时（本模型的主力场景），这次 gather 完全省掉。
+            expert_tokens = None
+            # P6-2: 去掉 torch.zeros_like(expert_tokens)（每层 256 次 8MB 分配）。
+            # 每个 expert 实际只有一个活跃 bit，首个 bit 的结果直接接管，后续 bit 才累加。
+            expert_out = None
 
-            for bit_str in self.bit_weights.keys():
+            # P6-2: 只遍历该 expert 真正活跃的 bit（预计算），
+            # 原先每层空转约 512 次 `actual_inter_size == 0` 的 continue。
+            for bit_str, bit, start, end in self._active_bits_by_expert[expert_idx]:
                 t_triton_start = time.time()
-                bit = int(bit_str)
                 active_bits_count += 1
 
-                wxa16_weights = self.bit_weights[bit_str]
-                offsets_cpu = self._expert_offsets_cpu[bit_str]
-
-                start = offsets_cpu[expert_idx]
-                end = offsets_cpu[expert_idx + 1]
                 actual_inter_size = end - start
-
-                if actual_inter_size == 0:
-                    continue
+                ctx = bit_ctx[bit_str]
 
                 # ========== WxA16: Triton Fused + 部分反量化 ==========
 
                 # 使用 Triton Fused Kernel 处理 gate_up
-                gate_up_packed = wxa16_weights.gate_up_packed
-                if "indices_packed_gf" in gate_up_packed:
+                gate_up_packed = ctx["gate_up"]
+                if ctx["gf_gate_up"]:
                     # P5-1: Group-First 布局，memory coalescing 更优
-                    gate_up_out = triton_fused_matmul_grouped_slice_rows_gf(
-                        expert_tokens,
-                        gate_up_packed["indices_packed_gf"],
-                        gate_up_packed["codebook"].to(x.device),
-                        gate_up_packed["norms_gf"],
-                        gate_up_packed["seed"],
-                        gate_up_packed["group_size"],
-                        gate_up_packed["shape"][1],  # in_features = hidden_size
-                        2*start, 2*end,  # row slice
-                        bit
-                    )
+                    # P6-1: 该 bit 若已整体预旋转，直接按 token 索引切片，kernel 内跳过旋转
+                    x_rot_b = x_rot_by_bit.get(bit_str)
+                    if x_rot_b is not None:
+                        with prof.stage("gather_rotated"):
+                            gate_up_inp = x_rot_b[exp_token_idx]
+                    else:
+                        if expert_tokens is None:
+                            with prof.stage("gather_x"):
+                                expert_tokens = x[exp_token_idx]
+                        gate_up_inp = expert_tokens
+
+                    with prof.stage("gate_up_kernel"):
+                        gate_up_out = triton_fused_matmul_grouped_slice_rows_gf(
+                            gate_up_inp,
+                            gate_up_packed["indices_packed_gf"],
+                            ctx["gate_up_codebook"],
+                            gate_up_packed["norms_gf"],
+                            ctx["gate_up_seed"],
+                            ctx["gate_up_group_size"],
+                            ctx["gate_up_in_features"],
+                            2*start, 2*end,  # row slice
+                            bit,
+                            x_is_rotated=(x_rot_b is not None),
+                            norms_prescaled=ctx["gate_up_norms_prescaled"],
+                        )
+                    del gate_up_inp
                 else:
-                    gate_up_out = triton_fused_matmul_grouped_slice_rows(
-                        expert_tokens,
-                        gate_up_packed["indices_packed"],
-                        gate_up_packed["codebook"].to(x.device),
-                        gate_up_packed["norms"],
-                        gate_up_packed["seed"],
-                        gate_up_packed["group_size"],
-                        gate_up_packed["shape"][1],  # in_features = hidden_size
-                        2*start, 2*end,  # row slice
-                        bit
-                    )
+                    if expert_tokens is None:
+                        with prof.stage("gather_x"):
+                            expert_tokens = x[exp_token_idx]
+                    with prof.stage("gate_up_kernel"):
+                        gate_up_out = triton_fused_matmul_grouped_slice_rows(
+                            expert_tokens,
+                            gate_up_packed["indices_packed"],
+                            ctx["gate_up_codebook"],
+                            gate_up_packed["norms"],
+                            ctx["gate_up_seed"],
+                            ctx["gate_up_group_size"],
+                            ctx["gate_up_in_features"],
+                            2*start, 2*end,  # row slice
+                            bit
+                        )
 
-                gate_out = gate_up_out[:, :actual_inter_size]
-                up_out = gate_up_out[:, actual_inter_size:]
-                del gate_up_out
+                with prof.stage("silu_mul"):
+                    gate_out = gate_up_out[:, :actual_inter_size]
+                    up_out = gate_up_out[:, actual_inter_size:]
+                    del gate_up_out
 
-                act_out = F.silu(gate_out) * up_out
-                del gate_out, up_out
+                    act_out = F.silu(gate_out) * up_out
+                    del gate_out, up_out
 
                 # 使用 Triton Fused Kernel 处理 down (in_features slicing)
-                down_packed = wxa16_weights.down_packed
-                if "indices_packed_gf" in down_packed:
-                    # P5-1: Group-First 布局，in_features 切片整块连续
-                    down_out = triton_fused_matmul_grouped_slice_in_features_gf(
-                        act_out,
-                        down_packed["indices_packed_gf"],
-                        down_packed["codebook"].to(x.device),
-                        down_packed["norms_gf"],
-                        down_packed["seed"],
-                        down_packed["group_size"],
-                        start, end,  # original_start, original_end
-                        down_packed["shape"][1],  # full_in_features
-                        bit
-                    )
-                else:
-                    down_out = triton_fused_matmul_grouped_slice_in_features(
-                        act_out,
-                        down_packed["indices_packed"],
-                        down_packed["codebook"].to(x.device),
-                        down_packed["norms"],
-                        down_packed["seed"],
-                        down_packed["group_size"],
-                        start, end,  # original_start, original_end
-                        down_packed["shape"][1],  # full_in_features
-                        bit
-                    )
+                down_packed = ctx["down"]
+                with prof.stage("down_kernel"):
+                    if ctx["gf_down"]:
+                        # P5-1: Group-First 布局，in_features 切片整块连续
+                        down_out = triton_fused_matmul_grouped_slice_in_features_gf(
+                            act_out,
+                            down_packed["indices_packed_gf"],
+                            ctx["down_codebook"],
+                            down_packed["norms_gf"],
+                            ctx["down_seed"],
+                            ctx["down_group_size"],
+                            start, end,  # original_start, original_end
+                            ctx["down_in_features"],
+                            bit,
+                            norms_prescaled=ctx["down_norms_prescaled"],
+                        )
+                    else:
+                        down_out = triton_fused_matmul_grouped_slice_in_features(
+                            act_out,
+                            down_packed["indices_packed"],
+                            ctx["down_codebook"],
+                            down_packed["norms"],
+                            ctx["down_seed"],
+                            ctx["down_group_size"],
+                            start, end,  # original_start, original_end
+                            ctx["down_in_features"],
+                            bit
+                        )
                 del act_out
 
-                expert_out += down_out
+                # P6-2: 首个活跃 bit 直接接管输出，避免 zeros_like 预分配
+                if expert_out is None:
+                    expert_out = down_out
+                else:
+                    expert_out += down_out
+                    del down_out
                 t_triton_end = time.time()
                 time_triton_total += t_triton_end - t_triton_start
                 # print(f"    [DEBUG] bit: {bit}, time: {t_triton_end - t_triton_start:.4f}s", flush=True)
                 # ==========================================
 
+            # 该 expert 无任何活跃 bit（理论上不会发生，防御性跳过）
+            if expert_out is None:
+                del expert_weights, exp_token_idx
+                continue
+
             # 累加回最终结果
             # 用 index_add_ 替代 scatter_reduce_(sum)：
             #   - 无需把 index 从 (M,) expand/repeat 到 (M, H)，省一次大张量分配+拷贝
             #   - 语义完全等价（按行累加，dim=0）
-            expert_out.mul_(expert_weights)
-            final_hidden_states.index_add_(0, exp_token_idx, expert_out)
+            with prof.stage("scatter"):
+                expert_out.mul_(expert_weights)
+                final_hidden_states.index_add_(0, exp_token_idx, expert_out)
 
             del expert_out, expert_tokens, expert_weights, exp_token_idx
             # t1 = time.time()
@@ -639,11 +875,18 @@ class WxA16BitPartitionedGroupMoE(nn.Module):
         # Cleanup
         del flat_expert_indices, flat_expert_weights, flat_token_indices
         del idxs, sorted_experts, sorted_weights, sorted_tokens, tokens_per_expert
+        # P6-1: 及时释放预旋转缓存（每 bit 一块 (T, hidden) fp16，本模型约 256MB）
+        x_rot_by_bit.clear()
+        del x_rot_by_bit
 
         t_compute_end = time.time()
         t4 = t_compute_end
 
         result = final_hidden_states.reshape(batch_size, seq_len, hidden_dim)
+
+        # P6-0: 取本轮 CUDA event 统计（这里做本 forward 唯一的一次 synchronize）
+        if self.enable_cuda_profile:
+            self.last_cuda_stats = prof.end_round()
 
         if self.enable_timing:
             t5 = time.time()
@@ -670,5 +913,9 @@ class WxA16BitPartitionedGroupMoE(nn.Module):
                 print(f"    init: {lt['init']:.4f}s, shared: {lt['shared']:.4f}s, router: {lt['router']:.4f}s", flush=True)
                 print(f"    compute: {lt['compute']:.4f}s (triton: {lt['triton']:.4f}s, dequant: {lt['dequant']:.4f}s, gemm: {lt['gemm']:.4f}s)", flush=True)
                 print(f"    reshape+cleanup: {lt['cleanup_reshape']:.4f}s, active_experts: {lt['active_experts']}, active_bits: {lt['active_bits']}", flush=True)
+                # P6-0: wall-clock 拆分不可信（无 sync，异步下会把耗时记错段），
+                # 开了 CUDA profile 时以下面这份 GPU 时间为准。
+                if self.enable_cuda_profile:
+                    print(CudaStageProfiler.format_stats(self.last_cuda_stats), flush=True)
 
         return result

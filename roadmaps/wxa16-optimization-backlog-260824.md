@@ -22,7 +22,33 @@
 | 去 `.item()` D2H 同步（P3-c） | `wxa16_bit_partitioned_moe.py:187/277/310-314` `_expert_offsets_cpu` | 256exp ~1.6%（大 H 下稀释） |
 | `index_add_` 替代 `scatter_reduce_`（P3-d） | `wxa16_bit_partitioned_moe.py:449` | 零风险、数值一致 |
 
-**当前端到端状态**：WxA16 量化层 forward 已从早期 ~19.7s 量级压到 ~3.5s 量级（Layer0，约 **2.4~5.6x** 累计），但相对 dense 层（~1.9s）仍有明显差距，真实 10 倍差距已被啃掉大半但**未完全消除**。
+**当前端到端状态（2026-08-26 更新，P5-3 落地后）**：量化 overhead 已被完全抹掉并反超 FP16。
+全模型 eval（Qwen3.5-35B-A3B, `models/qwen3.5-2bpw-260824/`, sequential mode, RTX 5090，
+见 `logs/0822.4.wxa16.p5-3.log`）：
+
+| 数据集 | FP16 | W2A16（P5-3 后） | W2A16（P6 后，2026-08-26） | 差距 |
+|---|---|---|---|---|
+| wikitext2（145 samples） | 90.05 s | **76.32 s** | **68.96 s** | 比 FP16 快 23.4%，比 P5-3 再 -9.6% |
+| c4（256 samples） | 114.7 s | **110.85 s** | **107.28 s** | 比 FP16 快 6.5%，比 P5-3 再 -3.2% |
+
+ppl：wikitext2 7.7925 → **7.7942**（P6 后）；c4 11.2680 → **11.2683**（P6 后）。
+两者变化都在正常波动量级，bf16 旋转提升路径无 ppl 损失。
+
+MoE 层 warm 稳态 forward：0.145 s → **~0.105 s（约 -28%）**（layer 10/20/30 实测）。
+P6-0 轮实测拆分（wall-clock，仍有异步归因噪声，仅供参考）：
+- compute 0.054 s → 0.042 s（triton 0.042 s → 0.036 s），init 0.080 s → 0.065 s
+- layer0 冷启动（含 JIT）：2.98 s → 0.91 s（`warmup_kernels` 修复后首次真正生效）
+
+**p6-0 轮的完整 eval 拆解**（`logs/0822.5.wxa16.p6-0.log`，c4）：总 107.28 s 里
+attention 是最大头——linear_attn 层每层 ~0.65 s × 约 32 层，MoE forward 只有 ~0.105 s。
+**后续优化的最大杠杆已不在 MoE 内部**，而在 linear attention 与其他层间开销
+（后续按 P6-0 的方法对 attention 也做 event 拆分可确认）。
+> ⚠️ 该 0.145s 的**内部拆分不可信**：现有计时全是 `time.time()` 且无一次 `cuda.synchronize()`，
+> 日志里 `init` 占 55% 是 allocator 阻塞吸收上一层异步队列的假象，不是真实工作量。
+> 精确拆分需先做 **P6-0**（CUDA event 计时）。
+
+**目标转变**：早期目标「追平 dense/FP16」已达成，后续优化的参照系不再是 FP16，
+而是 A16 路线本身的天花板（受限于 fp16 tensor core 吞吐）——参见 P8-0（WxA8/WxA4）。
 
 ---
 
@@ -46,7 +72,7 @@
 - **验证**：`test/test_eval_shape_bench.py`（新路径应 ≤ clone 旧路径）+ 数值一致性 + 本人手动 `run.q.sh` 复测。
 - **来源**：profile-wxa16-bottleneck.md §十 记录 4 方案 A。
 
-#### P5-2：多 expert 合并（MoE grouped GEMM）：同一 bit 所有 expert 一次 kernel ✅ 高优先
+#### P5-2：多 expert 合并（MoE grouped GEMM）：同一 bit 所有 expert 一次 kernel ⚠️ 已实现未采纳
 - **问题**：`wxa16_bit_partitioned_moe.py:366/385` 仍是 `for expert_idx` × `for bit_str` 的逐 expert 循环，每 expert 单独 launch。expert 多但每 expert token 少时 GPU 利用率极低，且 Python 循环体开销被放大。
 - **方案**：参考 false-grouped 的 gather/scatter + bad-triton 的 3D grid 思路，但用 grouped GEMM 方式——把同一 bit 的所有 expert 权重打包好（已是 bit-partitioned 布局），一个 kernel 内用 `expert_info_ptr` 索引各 expert 的 token_start/token_count/weight_range，每个 SM 动态分配给某个 expert 避免负载不均衡。
 - **预期收益**：MoE 部分 launch 从 `O(experts × bits × groups)` 降到 `O(bits × groups)`，并显著降低 Python 循环占比（约 70% 的差距来源）。
@@ -56,6 +82,11 @@
   2. 再优化负载均衡 + down 路径 in_feature-slice 适配。
 - **来源**：new-wxa16-plan-260818.md §1.2。
 **效果不好**：wxa16 load eval 速度下降从 269.4 到 288.6s。
+
+> **状态补充（2026-08-26）**：实现存在于分支 `opt-p5-2`（commit `2564a87`，kernel
+> `moe_gate_up_grouped_gf_v2` / `moe_down_grouped_gf_v2`），**未并入 main**；
+> main 上该路径已完全移除，逐 expert 循环是唯一路径。
+> 已决定**不重测**（见 §4.3），否决记录与 SM 填充度佐证保留备查。
 
 #### P5-3：BLOCK_B / BLOCK_N / BLOCK_K / num_warps / num_stages 联合调优 ✅ 已完成
 - **问题**：P4-2 单维离线调优（+9.5%）的结果是局部最优。五个 tile 参数之间强耦合，单维扫无法找到全局最优。
@@ -82,9 +113,188 @@
 
 ---
 
-### P6 — 跨 bit 融合 & Kernel 深化（中优先级，P5 之后或并行推进）
+### P6 — 旋转去冗余 & per-expert 开销消除（P5 之后，2026-08-26 重排）
 
-#### P6-1：旋转结果跨 bit 复用 + 接线 `triton_fused_dual_matmul`
+> **重排说明（2026-08-26）**：P5 完成后，用 `models/qwen3.5-2bpw-260824/meta.json` 与
+> `logs/0822.4.wxa16.p5-3.log` 复核了 P6 原四项的前提，发现**其中三项的前提不成立**。
+> 原 P6-1~P6-4 的正文全部保留在下方（标题已标记「已废弃」，附裁决与证据），
+> 新的执行项为 **P6-0 / P6-1 / P6-2 / P6-3**（P6-1~P6-4 编号复用给新内容，
+> 旧的已标记「已废弃（旧）」加以区分）。
+
+#### 复核依据（三条实测证据）
+
+**证据 1：本模型每个 expert 只用一个 bit，bit 是在 expert 之间「划分」而非在 expert 内「混合」**
+
+`meta.json` 全 40 层 `active_experts_per_bit` 统计：
+
+| 层数 | bit-1 | bit-2 | bit-4 | 合计 |
+|---|---|---|---|---|
+| 17 | 4 | 250 | 2 | 256 |
+| 13 | 2 | 253 | 1 | 256 |
+| 7 | 6 | 247 | 3 | 256 |
+| 1 | 8 | 244 | 4 | 256 |
+| 1 | 0 | 256 | 0 | 256 |
+
+三个 bit 的 active expert 数**正好加起来 = 256**。bit-2 覆盖 95.3%~100% 的 neuron。
+
+> 注：日志里的 `active_bits: 768` 是**循环进入次数**，不是 kernel 发射次数——计数器
+> `active_bits_count += 1` 在 `wxa16_bit_partitioned_moe.py:544`，而
+> `if actual_inter_size == 0: continue` 在 `:553`。真实 (expert, bit) 活跃对 ≈ **257**。
+
+**证据 2：gate_up 的旋转与 expert 无关，真正的冗余是跨 expert 而非跨 bit**
+
+`triton_kernels.py:1184`：`x_rot = batch_rotate_input(x, group_size, seed)`——`seed` 是 packed 里的常量，
+`row_start/row_end` 只切权重、不进旋转。256 个 expert 用的是**同一个旋转矩阵**，只是作用在不同 token 子集。
+top_k=8 ⇒ 每个 token 被重复旋转 8 次：每层旋转 256×2048 = 524288 行，而 unique token 只有 65536 行。
+
+**证据 3：seed 已烧进 checkpoint，「统一 seed」= 重新量化整个模型**
+
+`quantize.py:338/435` 把 `seed` 写进 pack dict，加载时校验
+（日志：`[OK] safetensors qmeta seeds match meta.json (547 keys)`）。
+
+#### 原 P6-1~P6-4 裁决表
+
+| 项 | 裁决 | 依据 |
+|---|---|---|
+| P6-1 跨 bit 旋转复用 + dual_matmul 接线 | ⛔ **理由作废，换方向复活为新的 P6-1（见下）** | 证据 1（无跨 bit 冗余）+ 证据 3（需重量化） |
+| P6-2 混合 bit fusion | ❌ **删除** | 证据 1：expert 内没有多个 bit 段可合并 |
+| P6-3 块对角 R + 大 K matmul | ❌ **删除** | 块对角 2048×2048 稠密乘比现有 16×(128×128) bmm 多做 **16 倍 FLOPs**，严格劣于现状；且 P5-3 实测 gate_up 最优 BLOCK_K=**32** 而非 128，「大 K 提升 Tensor Core 利用率」已被自身扫描否证 |
+| P6-4 dual_matmul grouped 版 | ❌ **删除** | 依赖 P6-1 的 SAME_INPUT（已不成立）；且唯一调用点 `module.py:757` 从**本仓库不存在的 `turboquant_model` 包**导入，`_HAS_TRITON_DUAL` 恒为 False，该路径从未执行过 |
+
+顺带清理 P5-3 遗留：
+- **冷启动预编译**：`warmup_kernels` 的调用点已接线（`eval_qwen35.py:209`），但函数体里写的是
+  `self.hidden_dim`（类上只有 `hidden_size`），**从 `b7ce480` 起就一直 AttributeError**，
+  即该预编译**从未真正执行过**。已于 2026-08-26 修正为 `self.hidden_size`。
+  修正前该项不能算完成——`logs/0822.4.wxa16.p5-3.log` 里 layer 0 的 2.98s（含 JIT）
+  正是因为当时跑的 HEAD（`e794fb7+`）还没有 warmup_kernels，冷启动开销仍在。
+  **修好后的真实收益需重新测量。**
+- **1/4/8-bit 重搜配置**：价值低（仅覆盖 0.6%~3% neuron），四 bit 共用 2-bit 配置可接受。
+
+---
+
+#### P6-0：分阶段 CUDA event 计时（前置条件，必须先做）
+
+- **问题**：当前 forward 内所有计时都是 `time.time()`，**全程没有一次 `torch.cuda.synchronize()`**
+  （`wxa16_bit_partitioned_moe.py:449-672`）。warm 层日志 `init: 0.080s / compute: 0.054s (triton: 0.042s)`
+  中，`init` 段实际只有一个 `reshape` + `zeros_like`，却占 55%——这是 CPU 首次在 allocator 上阻塞、
+  把上一层排队的 GPU 工作全部吸收进来的假象。现有 `triton` 子项测的是 **CPU launch 时间**，不是 GPU 执行时间。
+- **方案**：在 rotation / gate_up / silu / down / scatter 上打 CUDA event 对，forward 末尾统一 sync 取 elapsed。
+  沉淀为可复用的 `turboquant_utils/cuda_profiler.py`，MoE 侧用独立开关接入，**不删除现有 wall-clock 计时路径**。
+- **为什么是前置**：在测出旋转到底占 10% 还是 50% 之前，无法给 P6-1/P6-2 排序，也无法验证收益。
+- **难度**：低。**风险**：零（仅新增开关，默认关闭时不改变执行路径）。
+- **状态**：✅ 已落地。`turboquant_utils/cuda_profiler.py`（`CudaStageProfiler` +
+  `sm_occupancy_report`），MoE 侧开关 `moe.set_cuda_profile(True)`，结果存 `moe.last_cuda_stats`。
+
+**实测分阶段拆分**（`test/test_p6_rotation_hoist.py`，32 experts / T=8192 /
+per-expert B=2048，等比缩小但保持真实 per-expert B）：
+
+| stage | 提升前 ms | 占比 | 提升后 ms | 占比 |
+|---|---|---|---|---|
+| gate_up_kernel（含旋转） | 3.174 | 47.2% | 2.286 | 38.7% |
+| down_kernel | 1.629 | 24.2% | 1.626 | 27.5% |
+| **scatter (index_add_)** | 1.072 | **15.9%** | 1.035 | **17.5%** |
+| silu_mul | 0.317 | 4.7% | 0.328 | 5.6% |
+| gather | 0.269 | 4.0% | 0.235 | 4.0% |
+| sort_prep | 0.201 | 3.0% | 0.212 | 3.6% |
+| rotation_hoisted | — | — | 0.127 | 2.1% |
+| router | 0.059 | 0.9% | 0.062 | 1.0% |
+| 合计 | 6.719 | | 5.911 | |
+
+**两条重要结论**：
+1. **`init` 根本不是一个 GPU 阶段**——CUDA event 拆分里它压根不存在，
+   证实了原 wall-clock 日志里「init 占 55%」是分配器阻塞吸收异步队列的假象。
+2. **scatter（per-expert `index_add_`）已经是第二大开销**（~16%），
+   仅次于 gate_up kernel。这是原 backlog 完全没有提到的项，值得单列后续优化。
+
+#### P6-1：gate_up 旋转提到 expert 循环外（原「已废弃 P6-1」的正确形式）
+
+- **依据**：证据 2。旋转按 K 维分组线性、逐行独立 ⇒ `rotate(x[idx]) ≡ rotate(x)[idx]`，
+  **数学严格等价，不动量化侧，不改 ppl，不需重量化**。
+- **收益**：每层 gate_up 旋转 FLOPs 与访存**均降 8 倍**（= top_k），bmm launch 从 256 次降到 1 次。
+  注意 `batch_rotate_input` 每次调用做 **2 次全量 (B,K) 拷贝 + 1 次 bmm**（`rotation.py:203-209`），
+  所以访存收益与 FLOPs 收益同量级：4.3GB → 537MB。
+- **收益判据（重要）**：预旋转对某个 bit 只有在
+  `该 bit 下所有 expert 的 token 行数之和 > T` 时才划算。bit-2：250×2048 = 512000 ≫ 65536 ⇒ 提升 8x；
+  bit-1：4×2048 = 8192 < 65536 ⇒ **预旋转反而是 8 倍亏损**，必须跳过。故按 bit 逐一判定，不能无脑全提。
+- **代价**：为被提升的 bit 保留一块 (65536, 2048) fp16 ≈ **256MB**；
+  `batch_rotate_input` 内部瞬时峰值约 768MB（两次 contiguous 拷贝）。当前 layer30 显存 10.4GB / 32GB，有余量。
+- **down 方向不可提**：`seed_base = seed + original_start` 含 expert 偏移（`triton_kernels.py:1272`），
+  且其输入 `act_out` 本就是 per-expert 数据，不存在跨 expert 冗余。
+- **后续可继续**：`batch_rotate_input` 末尾的 `transpose(0,1).contiguous()` 是为了还原 (B, K) 布局；
+  若让 group-first kernel 直接吃 (G, B, gs) 布局的激活，可再省一次全量拷贝。本轮先做等价提升，便于隔离验证。
+- **状态**：✅ 已落地。开关 `moe.enable_rotation_hoist`（默认 True）、
+  判据阈值 `moe.rotation_hoist_threshold`（默认 1.5）。
+  kernel 侧新增 `x_is_rotated` 参数（`triton_fused_matmul_grouped_slice_rows_gf`），
+  非主路径传 True 会直接报错而不是静默算错。
+
+**实测**（`test/test_p6_rotation_hoist.py`）：
+
+| 项 | 结果 |
+|---|---|
+| 数值等价（3 种 bit 配置） | **max_abs = 0.000e+00，逐位相同** |
+| 收益判据 | bit-2 (30 experts, rows/T=7.50x) → 提升；bit-1/bit-4 (1 expert, 0.25x) → 跳过 ✓ |
+| 旋转本体（缩小规模 T=8192） | 0.856 ms → 0.112 ms，**7.64x** |
+| 旋转本体（**真实规模** T=65536, 256 experts） | 6.819 ms → 1.209 ms，**5.64x** |
+| MoE forward 整体（缩小规模） | 6.503 ms → 5.678 ms，**1.15x** |
+
+> ⚠️ **注意 micro≠real**：缩小规模下旋转提升 7.64x，真实规模只有 5.64x
+> ——单次大 bmm 在 T=65536 时已经转为带宽受限，优势会衰减。
+> 按真实规模算，旋转从占 MoE GPU 时间约 13% 降到约 2%，**净省约 10% 的 MoE GPU 时间**；
+> 换算到端到端 eval 的收益取决于该层有多大比例真的是 GPU-bound，需本人跑真实 eval 确认。
+> 真实规模下提升路径峰值显存 **1042 MB**（`batch_rotate_input` 内两次 contiguous 拷贝所致）。
+
+**真实 eval 结果（2026-08-26，`logs/0822.5.wxa16.p6-0.log` + wiki 补测）**：
+- c4 总时间 110.85 → **107.28 s（-3.2%）**，ppl 11.2680 → **11.2683**。
+- wikitext2 总时间 76.32 → **68.96 s（-9.6%）**，ppl 7.7925 → **7.7942**。
+  两者 ppl 变化均在正常波动量级，bf16 提升路径的 ~1e-2 舍入噪声未伤及 ppl。
+- 收益来自三部分：warmup 预编译首次生效（layer0 2.98s→0.91s）+ 旋转提升 +
+  P6-2 的 Python 层清理。MoE warm forward 0.145 → ~0.105 s（约 -28%）。
+- **关键发现**：端到端里 attention 才是大头（linear_attn 层每层 ~0.65s × 32 层），
+  MoE forward 只剩 ~0.105s/层。**后续最大杠杆已不在 MoE 内部**。
+
+#### P6-2：消除 per-expert 的重复常量计算与冗余分配
+
+> **注意：原设想的「一次 gather + 一次 index_add_ 全向量化」不可行**——需要
+> (T·top_k, H) = 524288×2048 fp16 ≈ **2.1GB** 缓冲区。当前逐 expert (2048, 2048) = 8MB 的分块反而是对的。
+> 记录于此避免重复踩坑。可做的是下面四项：
+
+1. **预计算 active (expert, bit) 对**：现在每层跑 256×3 = 768 次内层迭代，其中约 512 次在
+   `:553` 命中 `continue` 空转。改为一次性算出 ~257 条活跃列表。
+2. **`norms_scaled` 预乘**：`norms_slice / sqrt(group_size)` 在
+   `triton_kernels.py:1189` / `:1282` 每次调用重算，每层约 512 次微 kernel。scale 是常量，
+   应在 `_build_group_first` 时预乘进 `norms_gf`。
+3. **codebook 设备缓存**：`codebook.to(x.device)`（`wxa16_bit_partitioned_moe.py:565/577/600/612`）
+   每层调用约 512 次。
+4. **去掉 per-expert `torch.zeros_like(expert_tokens)`**（`:539`）：每层 256 次 8MB 分配。
+   因每个 expert 实际只有一个活跃 bit，改为首个 bit 直接接管、后续 bit 累加。
+
+- **难度**：低。**风险**：低（2 需与 kernel 侧对齐，其余为纯 Python 层）。
+- **状态**：✅ 四项均已落地。
+  1. `_ensure_active_bits()` → `_active_bits_by_expert`（实测内层迭代 96 → 32，省 67% 空转）
+  2. `_build_group_first` 里预乘 `norms_gf`，kernel 侧新增 `norms_prescaled` 参数
+     （两个 gf wrapper 都支持；非主路径会还原缩放，保证各分支都正确）
+  3. `_get_bit_context(device)` 缓存 codebook/seed/group_size/shape
+     （顺带把 `seed.item()` 的潜在 D2H 同步从每层 ~512 次降到 1 次）
+  4. `expert_out` 首个活跃 bit 直接接管，去掉 `torch.zeros_like`
+- **实测**：norms 预乘数值 **逐位相同**（max_abs = 0.000e+00）。
+
+#### P6-3（新增候选，由 P6-0 实测发现）：per-expert `index_add_` scatter
+
+P6-0 的分阶段拆分显示 **scatter 已是第二大开销（~16%）**，每层 256 次
+`final_hidden_states.index_add_(0, exp_token_idx, expert_out)`，每次是一整块
+(B, hidden) 的带原子累加写回。原 backlog 未覆盖此项。
+
+> **已排除的做法**：一次性 gather/scatter 全向量化需要 (T·top_k, hidden) 缓冲区
+> = 524288×2048 fp16 ≈ **2.1GB**，不可行（见 P6-2 开头的注记）。
+> 可探索方向：分块批量 scatter（每 K 个 expert 合并一次）、
+> 或利用 sorted_tokens 已排序的性质改用 segment-reduce。**待评估，未实现。**
+
+---
+
+#### 已废弃 P6-1（旧）：旋转结果跨 bit 复用 + 接线 `triton_fused_dual_matmul`
+
+> ⛔ **已裁决：理由作废**（见上方裁决表）。以下为原始记录，保留备查。
+> 编号已复用于新 P6-1（gate_up 旋转提到 expert 循环外）。
 - **问题**：
   - 旋转作用在输入 x 上，仅依赖 `g_dim/group_size/g_start`（跨 bit 相同），但当前每 bit 用**不同 seed**（`seed=42+bit`/`42+bit+1000`），导致旋转矩阵随 bit 不同而不同，无跨 bit 复用（profile §8.4 已验证）。
   - `triton_fused_dual_matmul` 已实现（`triton_kernels.py`），但**主 MoE 路径完全未调用**（唯一调用在 `turboquant_utils/module.py:757` 的单 Linear 路径），属死代码。
@@ -94,20 +304,32 @@
 - **前置依赖**：先做消融实验，验证统一 seed 后 perplexity 变化，确认精度可接受再推进。
 - **来源**：profile §8.4、§十 遗留待办；new-wax16-plan-260820 P4-4 未做项。
 
-#### P6-2：混合 bit-width 场景的 fusion
+#### 已废弃 P6-2（旧）：混合 bit-width 场景的 fusion
+
+> ❌ **已裁决：删除**（见上方裁决表）。以下为原始记录，保留备查。
+> 编号已复用于新 P6-2（per-expert 重复常量/冗余分配消除）。
+
 - 2-bit 段 + 4-bit 段分别 fused 后，再加一次加法（目前逐 bit 各自 fused 再 Python 累加）。
 - **难度**：低-中，**收益中等**。
 - **与 P5-2 协同**：多 expert 合并后再做 bit 间 fusion，kernel 结构更清晰。
 - **来源**：new-wax16-plan-260820 P4-4 未做项。
 
-#### P6-3：方案 D：旋转矩阵 fusion + 大 K matmul（理论收益最大）
+#### 已废弃 P6-3（旧）：方案 D：旋转矩阵 fusion + 大 K matmul（理论收益最大）
+
+> ❌ **已裁决：删除**（见上方裁决表）。以下为原始记录，保留备查。
+> 编号已复用于新 P6-3（per-expert `index_add_` scatter 优化，由 P6-0 实测发现）。
+
 - **思路**：多个 group 的旋转矩阵合并成块对角 `R = diag(R0, R1, ..., Rn)`，则 `x_rot = x @ R^T` 整个 K 维度一次旋转完成，之后用完整 K 的 dequant + matmul，Tensor Core 利用率大幅提升。
 - **预期收益**：理论 30-50%+（取决于利用率提升），但 packed indices 需确认 K 维连续性。
 - **难度**：高（算法层面支持 + 内核改动）。
 - **建议**：先做小范围 PoC 验证 Tensor Core 利用率提升上限，再决定是否全面推进。
 - **来源**：new-wax16-plan-260820 P4-4 未做项 / 方案 D。
 
-#### P6-4：`triton_fused_dual_matmul` 的 grouped 版本 fusion
+#### 已废弃 P6-4（旧）：`triton_fused_dual_matmul` 的 grouped 版本 fusion
+
+> ❌ **已裁决：删除**（见上方裁决表）。以下为原始记录，保留备查。
+> 编号未被复用。
+
 - 主路径未使用 dual_matmul；若接线（依赖 P6-1 统一 seed），可进一步合并。
 - **难度**：中，**优先级低**（主路径未使用）。
 - **来源**：new-wax16-plan-260820 P4-4 未做项。
@@ -124,6 +346,12 @@
 - **来源**：new-wxa16-plan-260818.md §1。
 
 #### P7-2：Split-K 优化
+
+> ⚠️ **2026-08-26 复核：对 eval 场景前提不成立**。原假设「单 expert 仅几十 token」，
+> 但实测 per-expert B = 65536×8/256 = **2048**，B 维并行度充足。
+> 仅在 **decode（batch=1 逐 token 生成，per-expert B≈1）** 场景下才重新成立。
+> 若项目只关心 ppl eval 吞吐，建议移出 backlog；若要做生成延迟，另立场景重新评估。
+
 - 当 M 很小（单 expert 仅几十 token）但 K 很大时 GEMM 并行度不够；对 K 维 split-K，多 block 算同一输出 tile 不同 K 段，最后原子加。
 - **适用**：MoE token 数少的 expert 场景。
 - **来源**：new-wxa16-plan-260818.md §6。
@@ -133,6 +361,11 @@
 - **来源**：new-wxa16-plan-260818.md §8。
 
 #### P7-4：权重预排序（codebook lookup 友好）
+
+> ⚠️ **2026-08-26 复核：前提基本失效**。2-bit 码本只有 **4 个 fp16**（`codebook` shape (4,)），
+> 早已常驻寄存器/L1，不存在「相邻访问提升 L1 命中率」的空间。与已否决的 shared-mem-codebook 同理。
+> 建议移出 backlog，除非将来出现大码本（VQ / 多维码本）方案。
+
 - 按激活数值排序权重行/列，使相邻位置访问相近码本条目，提升 L1 命中率。需配合量化算法改。
 - **来源**：new-wxa16-plan-260818.md §10。
 
@@ -186,15 +419,36 @@
 
 ---
 
-## 四、建议的迭代顺序（基于以上梳理）
+## 四、建议的迭代顺序
 
-1. **P5-1（group-first 重排）**：低难度、不降级、修复真实 eval 净回归，立即见效。
-2. **P5-3（BLOCK 联合调优）**：可与 P5-1 并行，零风险稳定收益。
-3. **P5-2（多 expert grouped GEMM）**：啃掉 ~70% 差距来源的逐 expert Python 循环，P5 阶段最大的结构性 win。分两阶段推进。
-4. **P6-1（跨 bit 旋转复用 + dual_matmul 接线）**：需先做 seed 统一的精度消融实验，确认精度可接受再推进。
-5. **P6-2（混合 bit fusion） + P6-4（dual_matmul grouped 版）**：与 P5-2 / P6-1 有协同，放其后。
-6. **P6-3（方案 D 大 K 融合）**：PoC 先行，验证 Tensor Core 利用率提升上限。
-7. **P7（cuTile / Split-K / Bit-packing / 权重预排序 / Flash Attention）**：探索性验证，逐个试、有收益再上主流程。
-8. **P8（Machete/Marlin / QwenMultiLinear）**：独立技术路线，作为 Triton 路线的备选或长期替代。
+### 4.1 原顺序（2026-08-24，已执行完 P5，保留备查）
+
+1. ~~**P5-1（group-first 重排）**~~ ✅ 已完成
+2. ~~**P5-3（BLOCK 联合调优）**~~ ✅ 已完成（+25% 总时间）
+3. ~~**P5-2（多 expert grouped GEMM）**~~ ⚠️ 已实现但 eval 变慢（269.4→288.6s），未并入 main；已决定不重测
+4. ~~**P6-1（跨 bit 旋转复用 + dual_matmul 接线）**~~ ⛔ 前提作废（对应「已废弃 P6-1（旧）」）
+5. ~~**P6-2 + P6-4**~~ ❌ 删除（对应「已废弃 P6-2/P6-4（旧）」）
+6. ~~**P6-3（方案 D 大 K 融合）**~~ ❌ 删除（对应「已废弃 P6-3（旧）」）
+7. **P7**：见下方 4.2 的调整
+8. **P8**：见下方 4.2 的调整
+
+### 4.2 当前顺序（2026-08-26 重排）
+
+1. **P6-0（CUDA event 分阶段计时）** — ✅ 已落地。前置条件，不做这个后面无法排序也无法验证收益。
+2. **P6-1（gate_up 旋转提到 expert 循环外）** — ✅ 已落地，数学严格等价，旋转 FLOPs 与访存均降 8 倍。
+3. **P6-2（per-expert 重复常量 / 冗余分配消除）** — ✅ 已落地，低风险 Python 层清理。
+4. **P6-3（per-expert `index_add_` scatter）** — P6-0 实测发现的第二大开销（~16%），待做。
+5. **依 P6-0 的实测结果决定下一步**：
+   - 若 kernel 已是访存 bound → **P7-3（bit-packing 32/128-bit 向量化加载）**
+   - 若仍是计算 bound → **P7-1（cuTile 后端单 kernel 对比）**
+6. **P8-0（WxA8 / WxA4）** — 战略优先级已上调。A16 的天花板是 fp16 tensor core 吞吐，
+   而 W2A16 现在已经比 FP16 快 18%，P6/P7 的增量空间有限；输入侧也量化后走整数乘法才是下一个数量级。
+7. **P8-1（Machete/Marlin） / P8-2（QwenMultiLinear）** — 独立技术路线，长期备选。
+
+### 4.3 待定 / 需本人决策
+
+- **P5-2**：已决定**不重测**（2026-08-26）。否决记录（eval 269.4→288.6s）与
+  SM 填充度佐证数据保留在 P5-2 条目内备查，后续如硬件/形状变化可再评估。
+- **P7-2 / P7-4 是否移出 backlog**（前提已失效，见各自条目）。
 
 > 每一步改动都需配套：测试程序先对齐主流程逻辑（含 GPU 填充度 / 并行 SM 分析）+ 本人在真实 eval 形状下手动复测，避免再次落入 micro≠real 陷阱。
