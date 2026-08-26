@@ -55,11 +55,22 @@
   1. 先做同一 bit 内所有 expert 的合并（gate_up 一个 kernel + down 一个 kernel），bit 间保留外层循环。改动小，先吃到大部分 launch 减少收益。
   2. 再优化负载均衡 + down 路径 in_feature-slice 适配。
 - **来源**：new-wxa16-plan-260818.md §1.2。
+**效果不好**：wxa16 load eval 速度下降从 269.4 到 288.6s。
 
-#### P5-3：BLOCK_B / BLOCK_N / BLOCK_K / num_warps 联合调优
-- P4-2 已做单维离线调优（+9.5%）。可进一步联合搜索（尤其 1/2-bit 与 4/8-bit 配置差异大）。
-- **难度**：低，**收益中等（5-15%）**，零风险。
-- **注意**：不用 runtime autotune（首次编译开销太大），离线扫后硬编码。用 `test/test_eval_shape_bench.py` 在真实 eval 形状下扫，避免 micro≠real 陷阱。
+#### P5-3：BLOCK_B / BLOCK_N / BLOCK_K / num_warps / num_stages 联合调优
+- **问题**：P4-2 单维离线调优（+9.5%）的结果是局部最优。五个 tile 参数（BLOCK_B / BLOCK_N / BLOCK_K / num_warps / num_stages）之间强耦合——例如 BLOCK_B 变大后需要更多 warps 藏延迟，BLOCK_K 变大后需要更深的软件流水线——单维扫无法找到全局最优。
+- **方案**：离线全量网格搜索，在真实 eval 形状下对每 bit-width 找最优配置并硬编码到 `_FUSED_GROUPED_CONFIG`。
+  - 搜索空间：BLOCK_B∈{16,32,64}, BLOCK_N∈{16,32,64,128}, BLOCK_K∈{32,64,128}, num_warps∈{2,4,8}, num_stages∈{2,3,4}（过滤后约 150-200 组有效配置）。
+  - **gate_up / down 拆两套配置**：两者 K/N 维度互换，计算模式不同，最优 tile 大概率不同。
+  - **多 B 值鲁棒性测试**：在 B∈{8,16,32,64,128} 上分别搜索，验证最优配置的形状鲁棒性；若差异大则做 B 自适应配置表（launch 前查表，开销可忽略）。
+  - 单 kernel micro-bench 做搜索，e2e bench (`test_triton_mp_moe_e2e_bench.py`) 做最终验证。
+- **难度**：低，**收益中等（5-15%）**，零风险（纯配置参数，不改计算逻辑）。
+- **学术价值**：MoE 小批量量化 GEMM 的 tile size 性能特征分析、bit-width 与最优配置的关系规律、跨形状鲁棒性研究——公开文献中这类细粒度 empirical study 较少。
+- **注意**：
+  - 不用 runtime autotune（首次编译开销太大），离线扫后硬编码。
+  - 用真实 eval 形状扫，避免 micro≠real 陷阱。
+  - 每组配置多次测量取中位数，减少 GPU 功耗/温度波动干扰。
+- **详细方案**：`roadmaps/wxa16-p5-3-joint-kernel-autotuning.md`
 - **来源**：new-wax16-plan-260820 P4-2。
 
 ---
