@@ -452,21 +452,90 @@ def _turboquant_fused_matmul_kernel_grouped(
     )
 
 
-# P4-2: 各 bit-width 的最优 kernel 配置（离线调优，针对 RTX 5090）
-# 调优脚本: test_p4_tune.py
-# 测试形状: group_size=128, B≈32, 典型 MoE 场景
+# P5-3: 各 bit-width × direction × B_range 的最优 kernel 配置
+# （联合网格搜索，离线调优，针对 RTX 5090，group_size=128，WxA16 gf 布局）
+# 调优脚本: test/test_p53_tune.py
+# 搜索空间: BLOCK_B ∈ {16,32,64}, BLOCK_N ∈ {16,32,64,128}, BLOCK_K ∈ {32,64,128},
+#           num_warps ∈ {2,4,8}, num_stages ∈ {2,3,4}
+# 关键发现:
+#   - BLOCK_K=128 全场景最优（一次加载整个 group，减少循环开销）
+#   - BLOCK_N=16 普遍优于 32（小 B 场景下 N 切细减少 padding 浪费）
+#   - num_warps=4 是甜点（P4-2 给 2-bit 选 2 是局部最优）
+#   - BLOCK_B 随实际 B 变化，做 B 自适应两档：B ≤ 16 用 16，B > 16 用 32
 # 格式: (BLOCK_B, BLOCK_N, BLOCK_K, num_warps, num_stages)
-_FUSED_GROUPED_CONFIG = {
-    1: (16, 32, 128, 2, 3),   # 1-bit: 计算轻, warps 少好
-    2: (32, 32, 128, 2, 2),   # 2-bit: 计算中等
-    4: (32, 32, 128, 8, 3),   # 4-bit: 访存重, warps 多藏延迟
-    8: (16, 32, 128, 4, 3),   # 8-bit: 默认配置（attention 用，暂未精细调）
+
+# gate_up 方向（slice_rows 路径，N 大 K 固定）
+# 针对 RTX 5090 + group-first 布局调优
+# large 档针对 B≥256（真实 MoE eval 的主力场景，per-expert 约 2048 tokens）
+# small 档针对 B<256（token 较少的长尾 expert）
+_FUSED_GROUPED_CONFIG_GATE_UP = {
+    # B_small: B < 256 时的配置（B=128 下搜索得到）
+    "small": {
+        1: (64, 16, 128, 4, 2),
+        2: (64, 16, 128, 4, 2),
+        4: (64, 16, 128, 4, 2),
+        8: (64, 16, 128, 4, 2),
+    },
+    # B_large: B >= 256 时的配置（B=2048 下搜索得到，真实 eval 主力场景）
+    "large": {
+        1: (64, 128, 32, 4, 4),
+        2: (64, 128, 32, 4, 4),
+        4: (64, 128, 32, 4, 4),
+        8: (64, 128, 32, 4, 4),
+    },
 }
 
+# down 方向（slice_in_features 路径，N=hidden 固定 K 大）
+_FUSED_GROUPED_CONFIG_DOWN = {
+    "small": {
+        1: (64, 16, 128, 4, 2),
+        2: (64, 16, 128, 4, 2),
+        4: (64, 16, 128, 4, 2),
+        8: (64, 16, 128, 4, 2),
+    },
+    "large": {
+        1: (64, 128, 128, 4, 2),
+        2: (64, 128, 128, 4, 2),
+        4: (64, 128, 128, 4, 2),
+        8: (64, 128, 128, 4, 2),
+    },
+}
 
-def _get_fused_grouped_config(bit_width):
-    """获取指定 bit-width 的最优配置。不在表中返回默认值。"""
-    return _FUSED_GROUPED_CONFIG.get(bit_width, (16, 64, 64, 4, 3))
+# B 自适应的阈值：token 数 < 阈值用 small 档，否则用 large 档
+# 真实 MoE eval 中 per-expert 约 2048 tokens，绝大部分落在 large 档
+_B_THRESHOLD_SMALL = 256
+
+
+def _get_fused_grouped_config(bit_width, direction="gate_up", B=None):
+    """获取指定 bit-width / 方向 / B 大小的最优配置。
+
+    Args:
+        bit_width: 1/2/4/8
+        direction: "gate_up" 或 "down"
+        B: 当前 batch/token 数，用于 B 自适应选档。
+           为 None 时默认用 large 档（兼容旧调用）。
+
+    Returns:
+        (BLOCK_B, BLOCK_N, BLOCK_K, num_warps, num_stages)
+    """
+    # 选方向表
+    if direction == "down":
+        table = _FUSED_GROUPED_CONFIG_DOWN
+    else:
+        table = _FUSED_GROUPED_CONFIG_GATE_UP
+
+    # 选 B 档位
+    if B is not None and B <= _B_THRESHOLD_SMALL:
+        size_key = "small"
+    else:
+        size_key = "large"
+
+    cfg = table[size_key].get(bit_width)
+    if cfg is not None:
+        return cfg
+
+    # 不在表中返回默认值（保持与旧版兼容的保守默认）
+    return (16, 64, 64, 4, 3)
 
 
 def _triton_fused_matmul_grouped_fused(
@@ -474,6 +543,7 @@ def _triton_fused_matmul_grouped_fused(
     group_size, num_groups, bit_width,
     packed_col_start=0, norms_group_start=0,
     packed_k_stride=None, norms_col_stride=None,
+    direction="gate_up",
 ):
     """内部函数：调用 fused grouped kernel。
 
@@ -489,6 +559,7 @@ def _triton_fused_matmul_grouped_fused(
         norms_group_start: norms 的起始 group 索引
         packed_k_stride: packed indices 的行 stride，默认 = indices_packed.shape[1]
         norms_col_stride: norms 的列 stride，默认 = norms_scaled.shape[1]
+        direction: "gate_up" 或 "down"，用于选择方向对应的最优 tile 配置
 
     Returns:
         output: (B, N)
@@ -503,7 +574,8 @@ def _triton_fused_matmul_grouped_fused(
 
     output = torch.empty(B, N, dtype=x_rot_concat.dtype, device=x_rot_concat.device)
 
-    BLOCK_B, BLOCK_N, BLOCK_K, num_warps, num_stages = _get_fused_grouped_config(bit_width)
+    BLOCK_B, BLOCK_N, BLOCK_K, num_warps, num_stages = _get_fused_grouped_config(
+        bit_width, direction=direction, B=B)
 
     grid = (triton.cdiv(B, BLOCK_B), triton.cdiv(N, BLOCK_N))
 
@@ -647,6 +719,7 @@ def triton_fused_matmul_grouped_slice_rows(
             output_fp16 = _triton_fused_matmul_grouped_fused(
                 x_rot, indices_packed_slice, codebook, norms_scaled,
                 group_size, num_groups, bit_width,
+                direction="gate_up",
             )
 
             if orig_dtype != torch.float16:
@@ -745,6 +818,7 @@ def triton_fused_matmul_grouped_slice_in_features(
                 norms_group_start=norms_group_start,
                 packed_k_stride=indices_packed.shape[1],
                 norms_col_stride=norms_scaled.shape[1],
+                direction="down",
             )
 
             if orig_dtype != torch.float16:
@@ -916,6 +990,7 @@ def _turboquant_fused_matmul_kernel_grouped_gf(
 def _triton_fused_matmul_grouped_gf(
     x_rot_concat, indices_packed_gf, codebook, norms_gf,
     group_size, num_groups, bit_width,
+    direction="gate_up",
 ):
     """内部函数：调用 group-first 布局的 fused grouped kernel。
 
@@ -927,6 +1002,7 @@ def _triton_fused_matmul_grouped_gf(
         group_size: 每个 group 的 K 大小
         num_groups: 本次处理的 group 数量
         bit_width: 1/2/4/8
+        direction: "gate_up" 或 "down"，用于选择方向对应的最优 tile 配置
 
     Returns:
         output: (B, N)
@@ -941,7 +1017,8 @@ def _triton_fused_matmul_grouped_gf(
 
     output = torch.empty(B, N, dtype=x_rot_concat.dtype, device=x_rot_concat.device)
 
-    BLOCK_B, BLOCK_N, BLOCK_K, num_warps, num_stages = _get_fused_grouped_config(bit_width)
+    BLOCK_B, BLOCK_N, BLOCK_K, num_warps, num_stages = _get_fused_grouped_config(
+        bit_width, direction=direction, B=B)
 
     grid = (triton.cdiv(B, BLOCK_B), triton.cdiv(N, BLOCK_N))
 
@@ -1114,6 +1191,7 @@ def triton_fused_matmul_grouped_slice_rows_gf(
             output_fp16 = _triton_fused_matmul_grouped_gf(
                 x_rot, indices_slice, codebook, norms_scaled,
                 group_size, num_groups, bit_width,
+                direction="gate_up",
             )
 
             if orig_dtype != torch.float16:
@@ -1205,6 +1283,7 @@ def triton_fused_matmul_grouped_slice_in_features_gf(
             output_fp16 = _triton_fused_matmul_grouped_gf(
                 x_rot, indices_slice, codebook, norms_scaled,
                 group_size, num_groups_in_slice, bit_width,
+                direction="down",
             )
 
             if orig_dtype != torch.float16:

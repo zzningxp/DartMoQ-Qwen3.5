@@ -204,6 +204,15 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
         layer.mlp.forward = _make_timed_forward(_orig_mlp_forward, moe_accum)
         # --- End patch ---
 
+        # Triton kernel 预热（仅第一层做，编译缓存全局复用）
+        # 提前触发所有 MoE Triton kernel 的 JIT 编译，消除第一层的冷启动开销
+        if layer_idx == 0 and hasattr(layer.mlp, 'warmup_kernels'):
+            _t_warmup_start = time.time()
+            layer.mlp.warmup_kernels(seq_len=model.seqlen, batch_size=batch_size_transformer)
+            torch.cuda.synchronize()
+            _t_warmup = time.time() - _t_warmup_start
+            print(f"  [Warmup] MoE Triton kernel 预编译完成: {_t_warmup:.2f}s", flush=True)
+
         # Process samples in batches - hidden states stay on GPU
         new_hidden_states = torch.empty_like(hidden_states)
 

@@ -423,6 +423,25 @@ class WxA16BitPartitionedGroupMoE(nn.Module):
         return moe
 
     @torch.no_grad()
+    def warmup_kernels(self, seq_len: int = 2048, batch_size: int = 1):
+        """预编译 Triton kernel，消除第一次 forward 的 JIT 编译冷启动开销。
+
+        用典型形状的 dummy 输入跑一次 forward，触发所有会用到的 kernel 编译。
+        因为 Triton 编译缓存是全局的（同形状同配置复用），warmup 一次后
+        所有 layer 的第一次 forward 都是 warm 状态。
+
+        Args:
+            seq_len: 模拟的序列长度（默认 2048，匹配 eval 常见值）
+            batch_size: 模拟的 batch size（默认 1）
+        """
+        device = next(self.gate.parameters()).device
+        dummy = torch.randn(batch_size, seq_len, self.hidden_dim,
+                           device=device, dtype=torch.float16)
+        # 跑一次 forward（忽略输出），触发所有 kernel 编译
+        _ = self.forward(dummy)
+        torch.cuda.synchronize()
+
+    @torch.no_grad()
     def forward(self, hidden_states):
         """
         前向推理：按 expert 处理，对每个 bit 分别反量化 + GEMM。

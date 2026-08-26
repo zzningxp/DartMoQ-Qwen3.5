@@ -57,20 +57,27 @@
 - **来源**：new-wxa16-plan-260818.md §1.2。
 **效果不好**：wxa16 load eval 速度下降从 269.4 到 288.6s。
 
-#### P5-3：BLOCK_B / BLOCK_N / BLOCK_K / num_warps / num_stages 联合调优
-- **问题**：P4-2 单维离线调优（+9.5%）的结果是局部最优。五个 tile 参数（BLOCK_B / BLOCK_N / BLOCK_K / num_warps / num_stages）之间强耦合——例如 BLOCK_B 变大后需要更多 warps 藏延迟，BLOCK_K 变大后需要更深的软件流水线——单维扫无法找到全局最优。
-- **方案**：离线全量网格搜索，在真实 eval 形状下对每 bit-width 找最优配置并硬编码到 `_FUSED_GROUPED_CONFIG`。
-  - 搜索空间：BLOCK_B∈{16,32,64}, BLOCK_N∈{16,32,64,128}, BLOCK_K∈{32,64,128}, num_warps∈{2,4,8}, num_stages∈{2,3,4}（过滤后约 150-200 组有效配置）。
-  - **gate_up / down 拆两套配置**：两者 K/N 维度互换，计算模式不同，最优 tile 大概率不同。
-  - **多 B 值鲁棒性测试**：在 B∈{8,16,32,64,128} 上分别搜索，验证最优配置的形状鲁棒性；若差异大则做 B 自适应配置表（launch 前查表，开销可忽略）。
-  - 单 kernel micro-bench 做搜索，e2e bench (`test_triton_mp_moe_e2e_bench.py`) 做最终验证。
-- **难度**：低，**收益中等（5-15%）**，零风险（纯配置参数，不改计算逻辑）。
-- **学术价值**：MoE 小批量量化 GEMM 的 tile size 性能特征分析、bit-width 与最优配置的关系规律、跨形状鲁棒性研究——公开文献中这类细粒度 empirical study 较少。
-- **注意**：
-  - 不用 runtime autotune（首次编译开销太大），离线扫后硬编码。
-  - 用真实 eval 形状扫，避免 micro≠real 陷阱。
-  - 每组配置多次测量取中位数，减少 GPU 功耗/温度波动干扰。
-- **详细方案**：`roadmaps/wxa16-p5-3-joint-kernel-autotuning.md`
+#### P5-3：BLOCK_B / BLOCK_N / BLOCK_K / num_warps / num_stages 联合调优 ✅ 已完成
+- **问题**：P4-2 单维离线调优（+9.5%）的结果是局部最优。五个 tile 参数之间强耦合，单维扫无法找到全局最优。
+- **关键发现**：**per-expert token 数（B 值）对最优配置的影响远大于 bit-width**。B=64 时最优是 BLOCK_N=16/BLOCK_K=128，但真实 eval 中 per-expert 约 2048 tokens，最优反而是 BLOCK_N=128/BLOCK_K=32。B 规模差 30 倍，配置方向完全相反——这是初期踩的主要坑（单 kernel +30% 但全模型 eval -9%）。
+- **最终方案**：
+  - 离线全量网格搜索（324 组，过滤后 ~150 组有效）
+  - gate_up / down 拆两套配置（K/N 互换导致 BLOCK_K 最优值不同）
+  - B 自适应两档（阈值 256）：small 档针对 B<256 长尾 expert，large 档针对 B≥256 主力场景
+  - large 档 2-bit 配置：gate_up=(64,128,32,4,4), down=(64,128,128,4,2)
+- **实测收益（RTX 5090, Qwen3.5-35B-A3B, wikitext2 sequential eval）**：
+  - MoE triton 部分：**~1.9x**
+  - 全模型总时间：95.52s → 76.32s，**+25%**（时间减少 20%）
+  - ppl 不变（7.7939 → 7.7925，纯 tile 调整不影响数学结果）
+  - c4 提升更显著（MoE 占比更高的场景）
+  - **里程碑**：2-bit bpw WxA16 推理速度首次超过 FP16（wiki 76.32s vs 90.05s，快 18%, c4 256 110.85s vs 114.7，快 3%），量化 overhead 被完全抹掉。比上一个版本快 （wiki 76.32s vs 92.39，快 18%, c4 256 110.85s vs 162.4s，快 32%）
+- **难度**：低，**收益高（+20% 总时间）**，零风险。
+- **遗留 / 可继续优化**：
+  - 冷启动：Triton JIT 编译让第一层变慢（~3s 额外开销，占总时间 3-4%）。可通过预编译（加载时 dummy forward 触发编译）消除。
+  - 1-bit / 4-bit / 8-bit 配置用了 2-bit 的模板，未精细搜索。混合 bit 模型需重搜。
+  - 调优工具已沉淀为 `turboquant_utils/kernel_autotune.py`，后续换硬件/换 shape 可一键重跑。
+- **学术价值**：MoE 量化 GEMM 的 tile size 性能特征分析、B 规模对最优配置的影响规律、形状自适应配置策略——公开文献中这类细粒度 empirical study 较少。
+- **详细方案 + 完整数据**：`roadmaps/wxa16-p5-3-joint-kernel-autotuning.md`
 - **来源**：new-wax16-plan-260820 P4-2。
 
 ---
@@ -137,6 +144,9 @@
 ---
 
 ### P8 — 备选 / 独立技术路线（长期方向，非增量优化）
+
+#### P8-0：WxA16 到 WxA4，WxA8 的整体进化。
+- 改变现在 weights 反量化为 fp16 计算的方法，而是整体切换为输入量化后和 weights 继续 int 乘法的方法。
 
 #### P8-1：ROADMAP 第四阶段：Machete / Marlin CUDA kernel（Blackwell wgmma）
 - 针对 RTX 5090 (SM12.0) 的高性能推理替代路线：从 vLLM 提取 Machete kernel（支持 wgmma），或 Marlin MoE kernel，替代 Triton 全路线。

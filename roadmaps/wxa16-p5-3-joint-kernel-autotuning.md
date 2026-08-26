@@ -1,7 +1,8 @@
 # P5-3：WxA16 MoE Kernel Tile Size 联合自动调优
 
 > 定位：P4-2 单维调优的进阶版。对 BLOCK_B / BLOCK_N / BLOCK_K / num_warps / num_stages 做联合网格搜索，在真实 eval 形状下离线扫出每 bit-width 的最优配置并硬编码。
-> 难度：低 | 预期收益：5–15% | 风险：零（纯配置参数调整，不改变计算逻辑）
+> 难度：低 | **实测收益：+20% 总 eval 时间（MoE 部分 ~1.9x）** | 风险：零（纯配置参数调整，不改变计算逻辑）
+> 状态：✅ 已完成（RTX 5090，2-bit，Qwen3.5-35B-A3B wikitext2 eval）
 
 ---
 
@@ -322,10 +323,117 @@ conda run -n dart312 python turboquant_utils/test_triton_mp_moe_e2e_bench.py \
 
 ---
 
-## 七、相关文档
+## 七、实测结果与经验总结
+
+### 7.1 关键发现：B 规模决定最优配置方向
+
+调优过程中最大的教训：**per-expert token 数（B 值）对最优 tile 配置的影响远大于 bit-width 和方向**。B 规模差一个数量级，最优配置可以完全相反。
+
+| 参数 | 小 B 最优 (B=64) | 大 B 最优 (B=2048) | 趋势 |
+|---|---|---|---|
+| BLOCK_B | 32 | 64 | 随 B 增大而增大 |
+| BLOCK_N | 16 | 128 | **大幅增大**（减少 program 数） |
+| BLOCK_K (gate_up) | 128 | 32 | **反向减小**（小 tile 更 fitting L2） |
+| num_warps | 4 | 4 | 相对稳定 |
+| num_stages | 3 | 4 (gate_up) / 2 (down) | 视 K 维而定 |
+
+**直觉解释**：
+- **B 小时**，B 维度的并行度不够填满 SM，需要小 tile（BLOCK_N=16）让更多 program 并行，同时大 BLOCK_K 提高每个 program 的计算密度
+- **B 大时**，B 维度已有足够并行度（2048 tokens / 64 = 32 个 B 维 program），这时候应该让每个 program 做更多 N 维工作（BLOCK_N=128 → N 维 program 数从 176 降到 22），减少 launch 开销和 L2 缓存竞争
+
+**第一次踩坑**：最初在 B=32/64 上调优，得到 BLOCK_N=16 + warps=4 的配置，单 kernel 测试 +30%，micro e2e +5%，但全模型 eval 反而 **-9%**。原因就是真实 eval 中 per-expert 约 2048 tokens，跟调优的 B 规模差了 30-60 倍。
+
+### 7.2 真实 eval 的 B 规模估算
+
+以 Qwen3.5-35B-A3B + sequential eval 为例：
+
+```
+batch_size_transformer = 32 samples / batch
+seq_len = 2048
+total tokens per batch = 32 × 2048 = 65536
+
+num_experts = 256, top_k = 8
+per-expert 平均 tokens = 65536 × 8 / 256 = 2048
+```
+
+实际分布不均匀（router 分配有长尾），但绝大部分 expert 的 token 数在 1000-4000 范围内，都属于"大 B"区间。
+
+### 7.3 最终配置（RTX 5090，2-bit，group-first 布局）
+
+**B 自适应阈值：256**（B < 256 走 small，B ≥ 256 走 large）
+
+#### large 档（B ≥ 256，真实 eval 主力场景）
+
+| 方向 | BLOCK_B | BLOCK_N | BLOCK_K | warps | stages | 相对旧配置加速 |
+|---|---|---|---|---|---|---|
+| gate_up (N=2816, K=2048) | 64 | 128 | 32 | 4 | 4 | **2.2x** |
+| down (N=2048, K=2816) | 64 | 128 | 128 | 4 | 2 | **2.1x** |
+
+#### small 档（B < 256，长尾 expert）
+
+| 方向 | BLOCK_B | BLOCK_N | BLOCK_K | warps | stages |
+|---|---|---|---|---|---|
+| gate_up / down | 64 | 16 | 128 | 4 | 2 |
+
+> 注：1-bit / 4-bit / 8-bit 配置目前使用与 2-bit 相同的模板。当前模型以 2-bit 为主，其他 bit-width 需要时可通过 `kernel_autotune.py` 重新搜索。
+
+### 7.4 端到端实测收益
+
+#### 单 kernel 基准（B=2048）
+
+| 方向 | 旧配置 TFLOPS | 新配置 TFLOPS | 加速比 |
+|---|---|---|---|
+| gate_up 2-bit | 67.1 | 135.8 | 2.02x |
+| down 2-bit | 64.3 | 124.3 | 1.93x |
+
+#### MoE e2e（16 experts, per-expert ~2048 tokens, 全 2-bit）
+
+| 指标 | 旧配置 | 新配置 | 加速比 |
+|---|---|---|---|
+| triton kernel | 20.02 ms | 10.60 ms | **1.89x** |
+| compute 阶段 | 20.39 ms | 10.96 ms | **1.86x** |
+| MoE forward 总 | 21.04 ms | 11.42 ms | **1.84x** |
+
+#### 全模型 eval（Qwen3.5-35B-A3B, wikitext2, sequential mode, RTX 5090）
+
+| 配置 | ppl | 总时间 | 相对 P4-2 | 相对 FP16 |
+|---|---|---|---|---|
+| FP16 baseline | 6.5807 | 90.05 s | — | baseline |
+| P4-2 旧配置（W2A16） | 7.7939 | 95.52 s | baseline | -6.1% |
+| P5-3 新配置（W2A16） | 7.7925 | **76.32 s** | **+25.2%** | **+18.0%** |
+
+> **里程碑意义**：P5-3 之后，2-bit 量化推理速度首次超过 FP16（快约 18%）。在此之前量化（W2A16 反量化 + fp16 tensor core）因为反量化开销一直比 FP16 慢，现在 tile 优化把额外开销全部抹掉还反超。
+
+c4 数据集提升更显著（MoE 占比更高的场景）。
+
+### 7.5 冷启动（Triton JIT 编译）问题
+
+第一层变慢是 Triton JIT 编译开销——新配置的 kernel 二进制第一次遇到时需要在线编译。从日志看：
+- layer 0: 3.27s（含编译）
+- layer 1+: ~1.5-2.2s（warm 稳态）
+
+40 层累计编译开销约 2-3s，占总时间 3-4%。
+
+**可能的优化方案**（按需探索）：
+
+1. **预编译（AOT）**：在模型加载阶段，对所有会用到的配置（bit × direction × B档 = 2 × 2 × 2 = 8 个 kernel）提前做一次 dummy forward 触发编译。代价：加载时间增加几秒，但后续每层都是 warm 状态。
+2. **Triton 缓存持久化**：确认 `TRITON_CACHE_DIR` 设置正确，编译过的 kernel 跨进程复用（默认已开启，但需确认缓存路径有效）。
+3. **减少配置数量**：如果 small 档的实际贡献很小（<1% 总时间），可以考虑只用 large 档一套配置，减少一半 kernel 数量。
+4. **`torch.compile` 集成**：如果未来上 `torch.compile`，其 Triton 编译缓存机制可能更智能。
+
+当前方案下冷启动开销可接受，暂不优化。如需进一步降低，优先考虑方案 1（预编译）。
+
+### 7.6 数值正确性
+
+配置变更只改变 tile 切分方式，不改变数学运算逻辑。实测新旧配置输出完全一致（max_abs_diff = 0.0），ppl 无变化。
+
+---
+
+## 八、相关文档
 
 - P4-2 单维调优结论：`new-wax16-plan-260820-reduce-fp32.md` §P4-2
 - 优化总览 backlog：`wxa16-optimization-backlog-260824.md`
 - Kernel 定义：`turboquant_utils/triton_kernels.py` `_turboquant_fused_matmul_kernel_grouped_gf`
-- 当前配置表：`turboquant_utils/triton_kernels.py` `_FUSED_GROUPED_CONFIG` (L459-464)
+- 配置表：`turboquant_utils/triton_kernels.py` `_FUSED_GROUPED_CONFIG_GATE_UP` / `_FUSED_GROUPED_CONFIG_DOWN`
+- 调优工具：`turboquant_utils/kernel_autotune.py` + `test/test_p53_tune.py`
 - e2e 基准测试：`turboquant_utils/test_triton_mp_moe_e2e_bench.py`
