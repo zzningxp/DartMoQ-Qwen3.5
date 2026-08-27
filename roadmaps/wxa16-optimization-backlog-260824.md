@@ -28,15 +28,16 @@
 
 | 数据集 | FP16 | W2A16（P5-3 后） | W2A16（P6 后，2026-08-26） | W2A16（P8 后，2026-08-27） | 差距 |
 |---|---|---|---|---|---|
-| wikitext2（145 samples） | 90.05 s | **76.32 s** | **68.96 s** | 待测 | — |
-| c4（256 samples） | 114.7 s | **110.85 s** | **107.28 s** | **98.12 s** | 比 FP16 快 14.5%，比 P6 再 **-8.5%** |
+| wikitext2（145 samples） | 90.05 s | **76.32 s** | **68.96 s** | **60.43 s** | 比 FP16 快 **32.9%**，比 P6 再 -12.4% |
+| c4（256 samples） | 114.7 s | **110.85 s** | **107.28 s** | **95.43 s** | 比 FP16 快 **16.8%**，比 P6 再 -11.0% |
 
-ppl：c4 11.2680 → 11.2683 → **11.2679**（P8 后，无损失）。
+ppl：wikitext2 7.7942 → **7.7938**；c4 11.2683 → **11.2671**（均无损失）。
 
 > **2026-08-27 勘误闭环**：0822.8 轮（69.64/108.74）因 `patch_delta_rule` 未接线而无效；
-> 接线补上后重测（`logs/0822.8.wxa16.p8.log` 后续轮，git 77dbfe4+）：
-> **c4 107.28 → 98.12s（-9.16s）**，与 GPU 口径估算（delta rule -37ms × 32 层 × 8 batch ≈ 9.5s）
-> **几乎 1:1 兑现**——「eval 是 CPU bound」假说证伪，稳态下 wall 跟随 GPU。
+> 接线补上后（git 77dbfe4+）：c4 107.28 → 98.12s，与 GPU 口径估算几乎 1:1 兑现——
+> 「eval 是 CPU bound」假说证伪，稳态下 wall 跟随 GPU。
+> **P8-4 第一步（Triton chunk kernel，git 3265adc+）**：c4 98.12 → **95.43s（-2.69s，
+> 与预估 -2.9s 一致）**；wiki 首次含 Triton 版实测 **60.43s**。
 
 MoE 层 warm 稳态 forward：0.145 s → **~0.105 s（约 -28%）**（layer 10/20/30 实测）。
 P6-0 轮实测拆分（wall-clock，仍有异步归因噪声，仅供参考）：
@@ -44,7 +45,7 @@ P6-0 轮实测拆分（wall-clock，仍有异步归因噪声，仅供参考）�
 - layer0 冷启动（含 JIT）：2.98 s → 0.91 s（`warmup_kernels` 修复后首次真正生效）
 
 **p6-0 轮的完整 eval 拆解**（`logs/0822.5.wxa16.p6-0.log`，c4）：总 107.28 s 里
-attention 是最大头——linear_attn 层每层 ~0.65 s × 约 32 层，MoE forward 只有 ~0.105 s。
+attention 是最大头——linear_attn 层每层 ~0.65 s × 30 层（另 10 层 full attention 更快），MoE forward 只有 ~0.105 s。
 **后续优化的最大杠杆已不在 MoE 内部**，而在 linear attention 与其他层间开销
 （后续按 P6-0 的方法对 attention 也做 event 拆分可确认）。
 > ⚠️ 该 0.145s 的**内部拆分不可信**：现有计时全是 `time.time()` 且无一次 `cuda.synchronize()`，
@@ -255,7 +256,7 @@ per-expert B=2048，等比缩小但保持真实 per-expert B）：
   两者 ppl 变化均在正常波动量级，bf16 提升路径的 ~1e-2 舍入噪声未伤及 ppl。
 - 收益来自三部分：warmup 预编译首次生效（layer0 2.98s→0.91s）+ 旋转提升 +
   P6-2 的 Python 层清理。MoE warm forward 0.145 → ~0.105 s（约 -28%）。
-- **关键发现**：端到端里 attention 才是大头（linear_attn 层每层 ~0.65s × 32 层），
+- **关键发现**：端到端里 attention 才是大头（linear_attn 层每层 ~0.65s × 30 层），
   MoE forward 只剩 ~0.105s/层。**后续最大杠杆已不在 MoE 内部**。
 
 #### P6-2：消除 per-expert 的重复常量计算与冗余分配
@@ -349,7 +350,7 @@ P6-0 的分阶段拆分显示 **scatter 已是第二大开销（~16%）**，每�
 
 ### P8 - 整体优化 attention WxA16 加速方法
 
-> **背景（2026-08-27）**：P6 后实测 linear_attn 层每层 ~0.65s × 约 32 层，而 MoE forward
+> **背景（2026-08-27）**：P6 后实测 linear_attn 层每层 ~0.65s × 30 层（另 10 层 full attention），而 MoE forward
 > 只剩 ~0.105s/层（`logs/0822.5.wxa16.p6-0.log`），attention 是当前最大杠杆。
 > 关键现状：**FLA / causal-conv1d 未安装**（`modeling_qwen3_5_moe.py:216-218`），
 > `torch_chunk_gated_delta_rule`（:245）整体 fp32，内部有 Python 循环；
@@ -532,6 +533,36 @@ chunk_loop 23.9ms（47.8%）+ cast 9.0ms + wy_bmm/wy_solve 11.7ms 若再砍掉�
   状态递推（chunk 间串行）留在 kernel 外循环，每个 chunk 一次 launch（32 次/层）。
 - **难度**：中高。**风险**：数值对齐以 P8-2 的 fp32 路径为参考逐步逼近。
 - **前置**：P8-1 测量确认 delta rule 内部 matmul 占比够大。
+
+**第一步 ✅ 已落地（2026-08-27，`turboquant_utils/delta_rule.py` 的
+`_delta_chunk_kernel` + `_triton_chunk_loop`，`ENABLE_TRITON_CHUNK` 默认开）**：
+- 每块 5 个小 bmm + elementwise 融合成一个 kernel（每 program 一个 (batch, head)，
+  K×V 双层分块 32×32，状态在 kernel 外循环的缓冲间交换）。
+- 数值：vs torch 版 max_rel **3.9e-3**（tl.dot 与 cublas fp32 累加顺序噪声，
+  与 fast-torch 版对原函数的距离同量级）；vs transformers 原函数 3.9e-3 PASS；
+  模块级 forward 对拍 6.4e-3 PASS。
+- 收益（真实形状 B=32 seq=2048）：chunk_loop **23.9 → 11.6ms（2.06x）**，
+  delta rule 函数级 56.9 → 45.7ms；模块级 stage **95.6 → 46.7ms（2.05x vs 原函数）**。
+- SM 分析：grid=1024 / 170 SM = 6.02 波，整体利用率 86.1%。
+- 测试：`test/test_p84_triton_chunk.py`（5 项全过）。
+
+**fast 版当前内部拆分（38.6ms）**：chunk_loop 11.6（30.1%）、**cast 9.3（24.0%）**、
+wy_solve 5.4、wy_bmm 4.9、其余 7.5。
+
+**真实 eval 确认（2026-08-27，git 3265adc+，`logs/0822.8.wxa16.p8.log`）**：
+c4 98.12 → **95.43s（-2.69s）**，与预估 -2.9s 一致；wiki **60.43s**（比 P6 -12.4%）；
+ppl 7.7938 / 11.2671 无损失。**wall 跟随 GPU 再次验证**。
+
+**第二步 ✅ 已落地（2026-08-27，cast 缩减）**：q/k 保持 bf16 直通 Triton kernel
+（transpose 只搬一半字节、省掉 .to(fp32) 转换），scale 乘法移进 kernel 内以 fp32 完成
+（bf16→fp32 转换精确，数值与旧路径一致）。实测：cast **9.3 → 7.1ms**、
+函数级 45.7 → 42.9ms、模块级 stage **95.7 → 44.0ms（2.18x vs 原函数）**，
+对拍不变（3.9e-3 舍入噪声）。
+
+**fast 版当前内部拆分（37.2ms）**：chunk_loop 11.5（30.8%）、cast 7.1（19.1%）、
+wy_bmm 6.0（16.1%）、wy_solve 5.4（14.4%）、其余 7.2。
+**下一步候选**：wy_bmm（16384 个 64×64 小 GEMM 的 cublas 批量开销，Triton 化预计
+6.0 → ~2-3ms）；wy_solve 是 cuBLAS 批量 trsm 已较高效，优先级靠后。
 
 #### P8-5：causal conv1d torch fallback 优化（P4-7 方法）
 

@@ -35,6 +35,9 @@ from contextlib import nullcontext
 import torch
 import torch.nn.functional as F
 
+import triton
+import triton.language as tl
+
 # 优化开关（测试/消融用）
 ENABLE_PAD_SKIP = True
 # ⚠️ fp16 bmm 在 torch 层实测**无收益**（+9.5ms 回归，见 test_p82_delta_rule_fp16.py）：
@@ -54,6 +57,13 @@ ENABLE_WY_SOLVE = True
 # 与 fp16 同理：小批量 GEMM 的 launch 开销是主成本，合并概念留到 P8-4
 # 融合 Triton kernel 内部用。默认关闭，仅作消融参考。
 ENABLE_BMM_MERGE = False
+
+# P8-4: chunk 循环融合 Triton kernel。每块（64 token）的 5 个小 bmm +
+# elementwise 全塞进一个 kernel（一个 program 负责一个 (batch, head)），
+# 块间 32 次串行递推留在 Python 循环里，每块一次 launch（原 5 次 cublas +
+# 多次 elementwise）。tl.dot 无 cublas 小批量 GEMM 开销，后续可换 fp16。
+# 默认先开（数值对拍与性能见 test/test_p84_triton_chunk.py）。
+ENABLE_TRITON_CHUNK = True
 
 
 def _l2norm(x, dim=-1, eps=1e-6):
@@ -85,13 +95,26 @@ def fast_chunk_gated_delta_rule(
         return prof.stage(name) if prof is not None else nullcontext()
 
     initial_dtype = query.dtype
+    _qk_bf16 = False
     with _stage("cast"):
         if use_qk_l2norm_in_kernel:
             query = _l2norm(query, dim=-1, eps=1e-6)
             key = _l2norm(key, dim=-1, eps=1e-6)
-        query, key, value, beta, g = [
-            x.transpose(1, 2).contiguous().to(torch.float32) for x in (query, key, value, beta, g)
-        ]
+        # P8-4 第二步：q/k 保持 bf16 直通 Triton kernel（transpose 只搬一半字节，
+        # 省掉 .to(fp32) 转换）。bf16→fp32 转换是精确的，scale 乘法移进 kernel 内
+        # 以 fp32 完成，数值与旧路径一致。仅在 Triton 路径必然生效的形状下启用。
+        if (ENABLE_TRITON_CHUNK and chunk_size == 64
+                and query.shape[-1] == 128 and value.shape[-1] == 128):
+            query = query.transpose(1, 2).contiguous()  # bf16
+            key = key.transpose(1, 2).contiguous()      # bf16
+            value = value.transpose(1, 2).contiguous().to(torch.float32)
+            beta = beta.transpose(1, 2).contiguous().to(torch.float32)
+            g = g.transpose(1, 2).contiguous().to(torch.float32)
+            _qk_bf16 = True
+        else:
+            query, key, value, beta, g = [
+                x.transpose(1, 2).contiguous().to(torch.float32) for x in (query, key, value, beta, g)
+            ]
 
     batch_size, num_heads, sequence_length, k_head_dim = key.shape
     v_head_dim = value.shape[-1]
@@ -106,7 +129,8 @@ def fast_chunk_gated_delta_rule(
             g = F.pad(g, (0, pad_size))
     total_sequence_length = sequence_length + pad_size
     scale = 1 / (query.shape[-1] ** 0.5)
-    query = query * scale
+    if not _qk_bf16:
+        query = query * scale
 
     with _stage("beta_reshape"):
         v_beta = value * beta.unsqueeze(-1)
@@ -128,7 +152,9 @@ def fast_chunk_gated_delta_rule(
         if ENABLE_FP16_BMM:
             attn = -((k_beta.half() @ key.transpose(-1, -2).half()).float() * decay_mask).masked_fill(mask, 0)
         else:
-            attn = -((k_beta @ key.transpose(-1, -2)) * decay_mask).masked_fill(mask, 0)
+            # key 在 cast 缩减路径下是 bf16（k_beta 已因 beta fp32 提升为 fp32），
+            # bmm 要求同类型，显式转 fp32（bf16→fp32 精确，数值不变）
+            attn = -((k_beta @ key.transpose(-1, -2).to(torch.float32)) * decay_mask).masked_fill(mask, 0)
     if ENABLE_WY_SOLVE:
         with _stage("wy_solve"):
             # P8-3: 三角递归 L_new = L + L·L_new 的闭式解 L_new = (I−L)⁻¹L。
@@ -179,7 +205,8 @@ def fast_chunk_gated_delta_rule(
         last_recurrent_state, core_attn_out = _fast_chunk_loop(
             query, key, value, k_cumdecay, decay_mask, g,
             chunk_size=chunk_size, total_sequence_length=total_sequence_length,
-            core_attn_out=core_attn_out, last_recurrent_state=last_recurrent_state)
+            core_attn_out=core_attn_out, last_recurrent_state=last_recurrent_state,
+            scale=scale)
 
     with _stage("finalize"):
         if not output_final_state:
@@ -195,12 +222,149 @@ def fast_chunk_gated_delta_rule(
     return core_attn_out, last_recurrent_state
 
 
+@triton.jit
+def _delta_chunk_kernel(
+    q_ptr, k_ptr, v_ptr, kcd_ptr, dmask_ptr, g_ptr, g_last_ptr,
+    state_ptr, o_ptr, new_state_ptr,
+    q_rs, k_rs, v_rs, kcd_rs, dm_rs, g_rs, gl_rs, o_rs,
+    SCALE: tl.constexpr,
+    CS: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+    BLOCK_K: tl.constexpr, BLOCK_V: tl.constexpr,
+):
+    """P8-4: 单个 chunk 的 delta rule 融合 kernel。
+
+    每个 program 负责一个 (batch, head)（grid = B*H）：
+      attn        = q @ k^T * decay_mask          (CS, CS)
+      attn_inter  = (q * exp(g)) @ state          (CS, BLOCK_V)
+      v_prime     = k_cumdecay @ state            (CS, BLOCK_V)
+      o           = attn_inter + attn @ (v - v_prime)
+      new_state   = state * exp(g_last) + (k * exp(g_last - g))^T @ (v - v_prime)
+    K 与 V 维均分块（BLOCK_K × BLOCK_V）以控制共享内存与寄存器压力。
+    各张量是 (BH, NC, ...)[:, i] 的 strided 视图，行间 stride 由 *_rs 传入。
+    """
+    pid = tl.program_id(0)
+    offs_cs = tl.arange(0, CS)
+    offs_bk = tl.arange(0, BLOCK_K)
+
+    dmask_tile = tl.load(dmask_ptr + pid * dm_rs + offs_cs[:, None] * CS + offs_cs[None, :])
+    g_vec = tl.load(g_ptr + pid * g_rs + offs_cs)
+    g_last = tl.load(g_last_ptr + pid * gl_rs)
+    g_exp = tl.exp(g_vec)                      # (CS,)
+    decay_factor = tl.exp(g_last - g_vec)      # (CS,)
+    exp_g_last = tl.exp(g_last)
+
+    # attn = q @ k^T（K 分块累加）。q 可能为 bf16（cast 缩减路径）：
+    # bf16→fp32 转换精确，scale 在 fp32 下乘——与旧路径数值一致；k 不乘 scale
+    attn_acc = tl.zeros((CS, CS), dtype=tl.float32)
+    for k0 in range(0, K, BLOCK_K):
+        offs_k = k0 + offs_bk
+        qk = tl.load(q_ptr + pid * q_rs + offs_cs[:, None] * K + offs_k[None, :]).to(tl.float32) * SCALE
+        kk = tl.load(k_ptr + pid * k_rs + offs_cs[:, None] * K + offs_k[None, :]).to(tl.float32)
+        attn_acc += tl.dot(qk, tl.trans(kk), out_dtype=tl.float32)
+    attn = attn_acc * dmask_tile  # (CS, CS)
+
+    # 状态相关计算：K 分块累加 attn_inter / v_prime，再算输出与状态更新
+    for v0 in range(0, V, BLOCK_V):
+        offs_v = v0 + tl.arange(0, BLOCK_V)
+        v_tile = tl.load(v_ptr + pid * v_rs + offs_cs[:, None] * V + offs_v[None, :])
+
+        ai_acc = tl.zeros((CS, BLOCK_V), dtype=tl.float32)  # attn_inter
+        vp_acc = tl.zeros((CS, BLOCK_V), dtype=tl.float32)  # v_prime
+        for k0 in range(0, K, BLOCK_K):
+            offs_k = k0 + offs_bk
+            qk = tl.load(q_ptr + pid * q_rs + offs_cs[:, None] * K + offs_k[None, :]).to(tl.float32) * SCALE
+            kcdk = tl.load(kcd_ptr + pid * kcd_rs + offs_cs[:, None] * K + offs_k[None, :])
+            state_k = tl.load(state_ptr + pid * K * V + offs_k[:, None] * V + offs_v[None, :])
+            qg = qk * g_exp[:, None]                        # (CS, BLOCK_K)
+            ai_acc += tl.dot(qg, state_k, out_dtype=tl.float32)
+            vp_acc += tl.dot(kcdk, state_k, out_dtype=tl.float32)
+
+        v_new = v_tile - vp_acc
+        o_part = tl.dot(attn, v_new, out_dtype=tl.float32)  # (CS, BLOCK_V)
+        tl.store(o_ptr + pid * o_rs + offs_cs[:, None] * V + offs_v[None, :],
+                 ai_acc + o_part)
+
+        # 状态更新：new_state[k0 段] = state 段 * exp(g_last) + k_decay^T @ v_new
+        for k0 in range(0, K, BLOCK_K):
+            offs_k = k0 + offs_bk
+            kk = tl.load(k_ptr + pid * k_rs + offs_cs[:, None] * K + offs_k[None, :]).to(tl.float32)
+            state_k = tl.load(state_ptr + pid * K * V + offs_k[:, None] * V + offs_v[None, :])
+            k_decay_k = kk * decay_factor[:, None]          # (CS, BLOCK_K)
+            state_part = tl.dot(tl.trans(k_decay_k), v_new, out_dtype=tl.float32)  # (BK, BLOCK_V)
+            tl.store(new_state_ptr + pid * K * V + offs_k[:, None] * V + offs_v[None, :],
+                     state_k * exp_g_last + state_part)
+
+
+def _triton_chunk_loop(query, key, value, k_cumdecay, decay_mask, g,
+                       total_sequence_length, core_attn_out, last_recurrent_state,
+                       scale=None):
+    """P8-4: chunk 串行循环的 Triton 融合版。
+
+    与 _fast_chunk_loop 的 torch 版数学一致，块间递推留在 Python 循环，
+    每块一次 kernel launch（一个 program 负责一个 (batch, head)）。
+    形状要求（本模型满足）：CS=64, K=V=128 且为 2 的幂；不满足时回退 torch 版。
+    q/k 可为 bf16（cast 缩减路径），scale 在 kernel 内以 fp32 乘到 q 上。
+    """
+    B, H, NC, CS, K = query.shape
+    V = value.shape[-1]
+    if CS != 64 or K != V or (K & (K - 1)) != 0 or V % 32 != 0:
+        return False  # 形状不满足，回退 torch 版
+    if scale is None:
+        scale = 1.0 / (K ** 0.5)
+
+    BH = B * H
+    q2 = query.reshape(BH, NC, CS, K)
+    k2 = key.reshape(BH, NC, CS, K)
+    v2 = value.reshape(BH, NC, CS, V)
+    kcd2 = k_cumdecay.reshape(BH, NC, CS, K)
+    dm2 = decay_mask.reshape(BH, NC, CS, CS)
+    g2 = g.reshape(BH, NC, CS)
+    o2 = core_attn_out.reshape(BH, NC, CS, V)
+    state = last_recurrent_state.reshape(BH, K, V).contiguous()
+    new_state = torch.empty_like(state)
+    g_last_all = g2[:, :, -1].contiguous()  # (BH, NC)
+
+    BLOCK_K = 32
+    BLOCK_V = 32
+    for i in range(NC):
+        _delta_chunk_kernel[(BH,)](
+            q2[:, i], k2[:, i], v2[:, i], kcd2[:, i], dm2[:, i], g2[:, i],
+            g_last_all[:, i], state, o2[:, i], new_state,
+            q2[:, i].stride(0), k2[:, i].stride(0), v2[:, i].stride(0),
+            kcd2[:, i].stride(0), dm2[:, i].stride(0), g2[:, i].stride(0),
+            g_last_all[:, i].stride(0), o2[:, i].stride(0),
+            SCALE=scale,
+            CS=CS, K=K, V=V, BLOCK_K=BLOCK_K, BLOCK_V=BLOCK_V,
+            num_warps=8, num_stages=1,
+        )
+        state, new_state = new_state, state  # 交换缓冲，避免每块新分配
+
+    last_recurrent_state = state.reshape(B, H, K, V)
+    return last_recurrent_state, core_attn_out
+
+
 def _fast_chunk_loop(query, key, value, k_cumdecay, decay_mask, g, chunk_size,
                      total_sequence_length, core_attn_out, last_recurrent_state, **kwargs):
     """fast_chunk_gated_delta_rule 的 chunk 串行循环（独立函数便于消融）。
 
     返回更新后的 (last_recurrent_state, core_attn_out)。
     """
+    scale = kwargs.get("scale", None)
+    if ENABLE_TRITON_CHUNK:
+        res = _triton_chunk_loop(
+            query, key, value, k_cumdecay, decay_mask, g,
+            total_sequence_length, core_attn_out, last_recurrent_state,
+            scale=scale)
+        if res is not False:
+            return res
+        # 形状不满足（非常规配置）时回退 torch 版
+    # 回退路径：q/k 若还是 bf16（cast 缩减路径），先转 fp32 并补 scale，
+    # 保持与原 torch 版数值行为一致
+    if query.dtype == torch.bfloat16:
+        query = query.to(torch.float32)
+        key = key.to(torch.float32)
+        if scale is not None:
+            query = query * scale
     for i in range(0, total_sequence_length // chunk_size):
         q_i, k_i, v_i = query[:, :, i], key[:, :, i], value[:, :, i]
         # g 最后一项作 decay 基底。注意形状语义：
