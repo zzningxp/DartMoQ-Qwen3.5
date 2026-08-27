@@ -26,13 +26,17 @@
 全模型 eval（Qwen3.5-35B-A3B, `models/qwen3.5-2bpw-260824/`, sequential mode, RTX 5090，
 见 `logs/0822.4.wxa16.p5-3.log`）：
 
-| 数据集 | FP16 | W2A16（P5-3 后） | W2A16（P6 后，2026-08-26） | 差距 |
-|---|---|---|---|---|
-| wikitext2（145 samples） | 90.05 s | **76.32 s** | **68.96 s** | 比 FP16 快 23.4%，比 P5-3 再 -9.6% |
-| c4（256 samples） | 114.7 s | **110.85 s** | **107.28 s** | 比 FP16 快 6.5%，比 P5-3 再 -3.2% |
+| 数据集 | FP16 | W2A16（P5-3 后） | W2A16（P6 后，2026-08-26） | W2A16（P8 后，2026-08-27） | 差距 |
+|---|---|---|---|---|---|
+| wikitext2（145 samples） | 90.05 s | **76.32 s** | **68.96 s** | 待测 | — |
+| c4（256 samples） | 114.7 s | **110.85 s** | **107.28 s** | **98.12 s** | 比 FP16 快 14.5%，比 P6 再 **-8.5%** |
 
-ppl：wikitext2 7.7925 → **7.7942**（P6 后）；c4 11.2680 → **11.2683**（P6 后）。
-两者变化都在正常波动量级，bf16 旋转提升路径无 ppl 损失。
+ppl：c4 11.2680 → 11.2683 → **11.2679**（P8 后，无损失）。
+
+> **2026-08-27 勘误闭环**：0822.8 轮（69.64/108.74）因 `patch_delta_rule` 未接线而无效；
+> 接线补上后重测（`logs/0822.8.wxa16.p8.log` 后续轮，git 77dbfe4+）：
+> **c4 107.28 → 98.12s（-9.16s）**，与 GPU 口径估算（delta rule -37ms × 32 层 × 8 batch ≈ 9.5s）
+> **几乎 1:1 兑现**——「eval 是 CPU bound」假说证伪，稳态下 wall 跟随 GPU。
 
 MoE 层 warm 稳态 forward：0.145 s → **~0.105 s（约 -28%）**（layer 10/20/30 实测）。
 P6-0 轮实测拆分（wall-clock，仍有异步归因噪声，仅供参考）：
@@ -374,6 +378,54 @@ P6-0 的分阶段拆分显示 **scatter 已是第二大开销（~16%）**，每�
   （chunk 内 WY 递归 vs 32 chunk 串行循环 vs fp32 cast）各自占比。
 - **难度**：低。**风险**：零（测量开关）。
 
+**状态**：✅ 已落地。`turboquant_utils/attn_profile.py`（monkeypatch 包装，可逆、
+关闭时零开销，`patch_attn_profiling` / `unpatch_attn_profiling`），
+测试 `test/test_p81_attn_profile.py`（真实 config + batch=32/seq=2048 + bf16）。
+
+**实测结果（RTX 5090，真实 eval 形状，GatedDeltaNet 模块级，GPU 时间）**：
+
+| stage | ms | 占比 |
+|---|---|---|
+| **delta_rule_chunk** | **95.4** | **70.4%** |
+| norm（RMSNormGated，fp32） | 11.6 | 8.6% |
+| conv1d（torch fallback） | 9.6 | 7.1% |
+| in_proj_qkv | 9.2 | 6.8% |
+| out_proj | 4.7 | 3.4% |
+| in_proj_z | 4.6 | 3.4% |
+| in_proj_b / a | 0.4 | 0.3% |
+| 合计 | **135.4** | 100% |
+
+**delta rule 内部拆解**（逐行复制版插 stage，与原函数逐位一致 max_abs=0，
+复制版总耗时 94.1ms ≈ 模块级 95.4ms，拆解可信）：
+
+| 内部 stage | ms | 占比 |
+|---|---|---|
+| **d_in_wy_prep**（k_beta@k^T 等 3 个大 bmm + 63 次 WY 循环） | **48.1** | **51.1%** |
+| **d_in_chunk_loop**（32 chunk 串行递推 + 小 matmul） | **23.8** | **25.3%** |
+| d_in_pad（F.pad × 5，**pad_size=0 时仍做 5 次全量拷贝**） | 5.7 | 6.0% |
+| d_in_cast（bf16→fp32 transpose+contiguous × 5） | 5.5 | 5.9% |
+| d_in_l2norm | 3.5 | 3.8% |
+| d_in_beta / d_in_decay_mask / d_out_finalize | 7.5 | 7.9% |
+
+**由此修正对 P8 子项的排序**：
+
+1. **P8-2（fp16 化）收益最大**：wy_prep 的三个 bmm（约 29ms）+ chunk loop 内 bmm
+   （约 20ms）全部 fp32，转 fp16 直接吃 Tensor Core。原 P8-3/P8-4 都排在它后面。
+2. **新零风险项（P8-2 前置顺手做）**：seq=2048 整除 chunk=64 时 `pad_size=0`，
+   F.pad 是 5 次纯浪费的全量拷贝（5.7ms/层 ≈ 模块 4%）——加一行 `if pad_size:` 即可。
+3. P8-3（WY 63 次循环向量化）≈ 19ms 上限；P8-4（chunk 循环融合 kernel）
+   目标 23.8ms 的 launch 开销与访存。
+4. **重要口径修正**：eval 日志的 `attn: ~0.65s/层` 是 wall-clock（CPU 侧排队/
+   分配器膨胀），实测 GPU 时间只有 **~135ms/层**（P6-0 教训在 attention 侧复现）。
+   折算 attention GPU 约占总 eval GPU 时间 ~32%（MoE 约 ~15%），仍是最大单项杠杆，
+   但 0.65s 的量级被夸大了 ~4.6 倍，后续收益预期按 GPU 口径算。
+
+**实施载体待定（需本人决定）**：主流程实际执行 transformers 内置版的
+`torch_chunk_gated_delta_rule`（仓库根副本与内置版逐字节相同）。P8-2~P8-6 的
+改动要么（a）在仓库内实现优化版并在模型加载时 monkeypatch 替换（与 MoE wrapper
+同模式，不碰 site-packages）；要么（b）直接改 site-packages 内置文件。
+建议 (a)，与项目现有架构一致。
+
 #### P8-2：delta rule / conv1d 全链路 fp16 化（P2 方法）
 
 - **问题**：`torch_chunk_gated_delta_rule` 把 q/k/v/beta/g 全部 `.to(torch.float32)`
@@ -389,6 +441,25 @@ P6-0 的分阶段拆分显示 **scatter 已是第二大开销（~16%）**，每�
   视 P8-1 测量占比折算。
 - **难度**：中。**风险**：精度——以 ppl 为准，不行就局部回退 fp32（不整体回退）。
 
+**状态（2026-08-27 实测，`test/test_p82_delta_rule_fp16.py`）**：
+实现载体已落定 (a)——`turboquant_utils/delta_rule.py`（fast 版 + `patch_delta_rule`
+monkeypatch，不碰 site-packages），拆成两个子项分别验证：
+
+- **P8-2a pad 跳过 ✅ 已落地**：seq 整除 chunk 时 `pad_size=0`，跳过 5 次 F.pad 全量拷贝。
+  与原函数**逐位一致**（含 seq 不整除时仍走 pad 的路径）。实测 delta_rule 94.3→90.1ms
+  （函数级）、stage 95.5→91.3ms（模块级），≈ **-3% 模块 forward**。默认开启。
+- **P8-2b fp16 bmm ❌ 实测无收益，重定向到 P8-4**：真实 g（恒负）下误差 3.9e-3 相对
+  （可接受），但 torch 层 fp16 反而 **+9.5ms 回归**。原因：这些 bmm 的成本是
+  **16384 个 64×64 小 GEMM 的 cublas 批量 launch 开销，不是 FLOPs**——fp16 只省
+  FLOPs 不省 launch，还要付 cast。**fp16 的正解位置在 P8-4 融合 kernel 内部**
+  （tl.dot fp16 无 cublas 批量开销）。`ENABLE_FP16_BMM` 保留作消融开关，默认关闭。
+- P8-2c（scale 并入 beta）暂缓，收益过小。
+
+**排序调整**：P8-1 实测后原「fp16 化收益最大」的判断修正——delta rule 的瓶颈
+不是精度类型而是**批量小 GEMM 的 launch 开销 + Python 循环**（wy_prep 48ms +
+chunk 循环 24ms 里 FLOPs 只占零头）。**P8-4（融合 kernel）与 P8-3（WY 向量化）
+的优先级提升，成为 delta rule 的主攻方向**。
+
 #### P8-3：消除 chunk 内 Python 循环（P6-2 / P5-2 方法）
 
 - **问题**：`torch_chunk_gated_delta_rule:290-293` 的
@@ -400,7 +471,59 @@ P6-0 的分阶段拆分显示 **scatter 已是第二大开销（~16%）**，每�
   （见 P8-4），先做前者成本低。
 - **难度**：中。**风险**：低（纯重写，逐位可对拍验证）。
 
+**状态（2026-08-27）**：✅ 已落地。发现该递归有闭式解——三角递归
+`L_new = L + L·L_new` ⟺ `L_new = (I−L)⁻¹L`（单位下三角批量 solve_triangular
+一次完成，cuBLAS trsm）。实测（`test/test_p83_wy_solve.py`，B=32 seq=2048）：
+- 数值：solve vs 63 次循环 max_rel **5.5e-5**（fp32 trsm 舍入，远低于已上线的
+  1e-2 噪声量级）；模块级 forward 对拍 3.2e-3 PASS
+- 收益：delta rule 94.1 → **56.9 ms（函数级 -33ms）**；模块级 stage 95.3 → **58.1 ms（1.64x）**
+
 #### P8-4：chunk delta rule 融合 Triton kernel（P4-4 / P4-7 方法）
+
+- **问题**：delta rule 内是大量 64×64×128 级的小 bmm/einsum
+  （`attn @ v_beta`、`q_i @ k_i^T`、`k_i^T @ v_new`……），单个体量小、launch 多。
+- **方案**：把 chunk 内计算（qk^T + decay + WY + @v）写成一个 Triton kernel，
+  参考 P4-4 的「多 group 融合单 kernel」和 P4-7 的「小 matmul 合并 bmm」思路。
+  状态递推（chunk 间串行）留在 kernel 外循环，每个 chunk 一次 launch（32 次/层）。
+- **难度**：中高。**风险**：数值对齐以 P8-2 的 fp32 路径为参考逐步逼近。
+- **前置**：P8-1 测量确认 delta rule 内部 matmul 占比够大。
+
+**状态（2026-08-27）**：范围已按 P8-2b/P8-4a 的实测修正。两项 torch 层预演都证明
+**小批量 GEMM 的成本在 cublas launch 开销而非 FLOPs**（fp16 化 +9.5ms、bmm 合并
++7.5ms 双双回归），正确载体是 Triton kernel 内部的 tl.dot。P8-4a 已实测
+（数值逐位一致，性能回归默认关闭，概念并入本项）。
+
+**P8-3 落地后的 fast 版内部 stage 实测（49.9ms，P8-4 的目标清单）**：
+
+| stage | ms | 占比 | P8-4 可吃掉的量 |
+|---|---|---|---|
+| **chunk_loop（32 次串行 × 5 个小 bmm）** | **23.9** | **47.8%** | 大部分（launch + 访存） |
+| cast（bf16→fp32 transpose × 5） | 9.0 | 18.1% | 部分（kernel 直接吃 bf16/fp16） |
+| wy_bmm（k_beta@key^T） | 4.8 | 9.6% | 全部 |
+| wy_solve（批量 trsm） | 4.7 | 9.5% | 全部（kernel 内 WY 递推） |
+| decay / beta_reshape / finalize | 7.5 | 14.9% | 大部分 |
+| pad | 0.0 | 0% | —（P8-2a 已消） |
+
+**当前累计**：P8-2a + P8-3 已把 delta rule 从 95.4ms 压到 58.1ms（1.64x），
+attention 模块 forward 从 135.4ms 降到 ~98ms（约 -28% GPU）。
+
+**真实 eval 结果（2026-08-27，`logs/0822.8.wxa16.p8.log`，git 77dbfe4+，接线生效后）**：
+
+| 数据集 | P6 基线 | P8 后 | 变化 |
+|---|---|---|---|
+| c4 | 107.28 s | **98.12 s** | **-8.5%（-9.16s）** |
+| ppl | 11.2683 | **11.2679** | 无损失 ✓ |
+
+**关键结论（勘误后的定案）**：GPU 侧 delta rule 1.64x 在端到端上**几乎 1:1 兑现**
+（-9.16s ≈ GPU 口径估算 -9.5s）。「eval 是 CPU bound」假说**证伪**——之前的判断
+全部建立在 0822.8 未接线的无效数据上。稳态下 wall 跟随 GPU，GPU 加速会直接转化为
+eval 时间。
+
+**由此恢复 P8-4 的吸引力**：既然 wall 跟随 GPU，fast 版内部剩余的
+chunk_loop 23.9ms（47.8%）+ cast 9.0ms + wy_bmm/wy_solve 11.7ms 若再砍掉一半，
+端到端还能再拿 ~4-6%。P8-4（融合 Triton kernel）**重新排队，待本人确认开工**。
+
+**原方案（保留备查）**：
 
 - **问题**：delta rule 内是大量 64×64×128 级的小 bmm/einsum
   （`attn @ v_beta`、`q_i @ k_i^T`、`k_i^T @ v_new`……），单个体量小、launch 多。
@@ -530,10 +653,26 @@ P6-0 的分阶段拆分显示 **scatter 已是第二大开销（~16%）**，每�
 3. **P6-2（per-expert 重复常量 / 冗余分配消除）** — ✅ 已落地，低风险 Python 层清理。
 4. **P6-3（per-expert `index_add_` scatter）** — P6-0 实测发现的第二大开销（~16%），待做。
    注：attention 已成更大杠杆（见 §〇），本项相对优先级下调。
-5. **P8-1（attention 分阶段 CUDA event 测量）** — P8 方向的第一步，P6-0 方法移植到
-   `Qwen3_5MoeGatedDeltaNet` / `Qwen3_5MoeAttention`，先测后改。
-6. **P8-2 ~ P8-6（fp16 化 / 循环消除 / 融合 kernel / conv1d / tile 调优）** —
-   按 P8-1 测量结果排序执行；每条都引用 P2/P4/P5/P6 的对应经验（见 P8 节）。
+5. ~~**P8-1（attention 分阶段 CUDA event 测量）**~~ ✅ 已落地（`turboquant_utils/attn_profile.py`
+   + `test/test_p81_attn_profile.py`，实测见 P8 节）。
+6. **P8-2（pad 跳过 + fp16 化）** — ✅ P8-2a 已落地（逐位一致，-3% 模块 forward）；
+   P8-2b 实测无收益已重定向到 P8-4。
+7. **P8-3（WY 循环向量化）** — ✅ 已落地（1.64x GPU），但真实 eval 无兑现
+   （见 P8 节结论）。**P8-4 ~ P8-6。**
+8. **新方向（进行中）：定位 eval 的 CPU 侧开销**。⚠️ 注意：本项最初的动机
+   （P8「零兑现」）已勘误撤销——0822.8 轮 P8 未接线，需重测后才能知道端到端
+   到底有没有 CPU 差额。本地探针（`test/test_cpu_bound_probe.py`，
+   真实形状 attn+MoE 背靠背 40 层）先排除三个嫌疑：
+   - **层内无 CPU 瓶颈**：wall 163.0ms ≈ GPU 164.3ms（差额 -1.3ms）——
+     模块级 forward 的 Python/launch/同步都不构成瓶颈；
+   - D2H 同步（bincount().cpu()）代价随 GPU 队列长度线性增长
+     （0.07→1.72ms @ 16 个排队 GEMM），但层内量级 <2ms，非主嫌；
+   - 本地 JIT 缓存全命中（+0 编译），eval 首 batch 的 ~2s/层 属 JIT/冷启动类
+     一次性成本，本地无法复现。
+   结论：差额（若有）在 **eval 侧机制**（sequential 层搬运 ~0.04s/层、
+   per-batch kwargs 构造、分配器）。已给 `eval_qwen35.py` 加
+   `--cpu-profile` 插桩（逐层 wall/gpu/move/kwargs/forward/attn/moe 拆分，
+   测量模式才 sync）。**待本人跑一轮 `--cpu-profile` 后按数据定位。**
 7. **P9-1（WxA8 / WxA4）** — 战略优先级已上调。A16 的天花板是 fp16 tensor core 吞吐，
    而 W2A16 现在已经比 FP16 快 18%，P6 之后的增量空间有限；输入侧也量化后走整数乘法才是下一个数量级。
 8. **P9-2（Machete/Marlin） / P9-3（cuTile） / P9-4（QwenMultiLinear）** — 独立技术路线，长期备选。

@@ -36,6 +36,12 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
 
     # Save original device for each layer
     layers = model.model.layers
+
+    # P8 接线：把 chunk gated delta rule 换成仓库内 fast 版
+    # （P8-2a pad 跳过 + P8-3 WY 闭式解，详见 roadmaps/wxa16-optimization-backlog-260824.md P8 节）
+    from turboquant_utils.delta_rule import patch_delta_rule
+    patch_delta_rule(model)
+
     original_devices = []
     for layer in layers:
         if hasattr(layer, 'parameters') and len(list(layer.parameters())) > 0:
@@ -216,6 +222,14 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
         # Process samples in batches - hidden states stay on GPU
         new_hidden_states = torch.empty_like(hidden_states)
 
+        # --- CPU 侧瓶颈定位插桩（--cpu-profile 时启用）---
+        _cpu_prof = getattr(args, 'cpu_profile', False)
+        _t_kwargs_accum = 0.0
+        if _cpu_prof:
+            _ev0 = torch.cuda.Event(enable_timing=True)
+            _ev1 = torch.cuda.Event(enable_timing=True)
+            _ev0.record()
+
         t_forward_start = time.time()
 
         for batch_start in range(0, nsamples, batch_size_transformer):
@@ -226,6 +240,8 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
             batch_hidden = hidden_states[batch_start:batch_end]
 
             # Prepare kwargs for this batch size - create on demand to save memory
+            if _cpu_prof:
+                _t_kw = time.time()
             layer_kwargs = {}
             forward_signature = inspect.signature(layer.forward)
 
@@ -251,6 +267,9 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
                     )
                 else:
                     layer_kwargs['position_embeddings'] = position_embeddings.repeat(actual_batch_size, 1, 1)
+
+            if _cpu_prof:
+                _t_kwargs_accum += time.time() - _t_kw
 
             # Forward pass
             with torch.no_grad():
@@ -289,6 +308,19 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
         del hidden_states
         hidden_states = new_hidden_states
         del new_hidden_states
+
+        # --- CPU 侧瓶颈定位插桩：逐层打印 ---
+        if _cpu_prof:
+            _ev1.record()
+            torch.cuda.synchronize()  # 测量模式才 sync，正式 eval 不要开此 flag
+            _gpu_ms = _ev0.elapsed_time(_ev1)
+            _wall_ms = (time.time() - tick_layer) * 1000
+            print(f"  [CPU-PROF] layer {layer_idx}: wall {_wall_ms:7.1f} ms | "
+                  f"gpu {_gpu_ms:7.1f} ms | gap {_wall_ms - _gpu_ms:7.1f} ms | "
+                  f"move {time_move * 1000:6.1f} ms | kwargs {_t_kwargs_accum * 1000:6.1f} ms | "
+                  f"forward {time_forward * 1000:7.1f} ms | "
+                  f"attn {time_attn * 1000:6.1f} ms | moe {time_moe * 1000:6.1f} ms",
+                  flush=True)
 
         # Move layer back to CPU to free GPU memory (in-place, modifies layers[layer_idx])
         layer = layer.to('cpu')
@@ -512,6 +544,9 @@ def main():
                         default=['wikitext2', 'c4'], help="Datasets to evaluate on")
     parser.add_argument('--eval-batch-size', type=int, default=32,
                         help="Batch size for normal (non-sequential) PPL evaluation")
+    parser.add_argument('--cpu-profile', action='store_true', default=False,
+                        help="CPU 侧瓶颈定位：逐层打印 wall/GPU/kwargs/move 拆分"
+                             "（会在每层末尾 synchronize，只用于测量，别开它跑正式 eval）")
 
     args = parser.parse_args()
 
