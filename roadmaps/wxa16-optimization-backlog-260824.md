@@ -48,13 +48,15 @@ attention 是最大头——linear_attn 层每层 ~0.65 s × 约 32 层，MoE fo
 > 精确拆分需先做 **P6-0**（CUDA event 计时）。
 
 **目标转变**：早期目标「追平 dense/FP16」已达成，后续优化的参照系不再是 FP16，
-而是 A16 路线本身的天花板（受限于 fp16 tensor core 吞吐）——参见 P8-0（WxA8/WxA4）。
+而是 A16 路线本身的天花板（受限于 fp16 tensor core 吞吐）——参见 P9-1（WxA8/WxA4）。
 
 ---
 
 ## 一、当前仍可优化的点（按 P 阶段排序）
 
 > P5 最先做，P6/P7/P8 依次往后。同一 P 阶段内的子项主题相关、可并行或顺序灵活。
+> （2026-08-27 更新：P7 阶段已整体清零，见下方 P7 节；P8 为 attention 优化，
+> P9 为长期方向。）
 > P2 / P3 / P4 为已完成阶段，见 `new-wax16-plan-260820-reduce-fp32.md`。
 
 ---
@@ -335,58 +337,115 @@ P6-0 的分阶段拆分显示 **scatter 已是第二大开销（~16%）**，每�
 - **来源**：new-wax16-plan-260820 P4-4 未做项。
 
 ---
+### P7
 
-### P7 — 探索性优化（高风险高回报，逐个验证）
+- MoE 这条线——量化 + kernel + 布局 + 调优 + 旋转 + Python 层——探索性空间已经吃干净了，P7 之前规划的方法已经没有优化空间。
 
-#### P7-1：cuTile 后端集成到 WxA16 MoE 推理路径 ✅ 探索
+---
+
+### P8 - 整体优化 attention WxA16 加速方法
+
+> **背景（2026-08-27）**：P6 后实测 linear_attn 层每层 ~0.65s × 约 32 层，而 MoE forward
+> 只剩 ~0.105s/层（`logs/0822.5.wxa16.p6-0.log`），attention 是当前最大杠杆。
+> 关键现状：**FLA / causal-conv1d 未安装**（`modeling_qwen3_5_moe.py:216-218`），
+> `torch_chunk_gated_delta_rule`（:245）整体 fp32，内部有 Python 循环；
+> causal conv1d 走 `F.silu(self.conv1d(...))` torch 原生 fallback（:497-498）。
+> **路线决定（本人）**：不换 FlashAttention / 不依赖 FLA 安装，先按 P4/P5/P6 经验
+> 优化 kernel 细节（fp16 化、循环消除、融合、调优），P8-0 暂缓。
+
+#### P8-0：Flash Attention 风格在线反量化 Attention（KV cache 量化）⏸ 暂缓
+
+> 本人倾向不换 FlashAttention，先做 kernel 细节优化；本项保留待将来重新评估。
+
+- **问题**：Attention 的 Q/K/V 投影被量化了，但 attention 计算本身全精度；若 K/V cache 也做 TurboQuant 量化，在 Flash Attention kernel 内部实时反量化，可大幅减少 KV cache 带宽。
+- **难度**：很高（深度修改 Flash Attention kernel）。
+- **来源**：new-wxa16-plan-260818.md §9。
+
+#### P8-1：attention 分阶段 CUDA event 测量（P6-0 方法移植）
+
+- **为什么是第一步**：和 MoE 侧一样，`[Layer N] time` 是 wall-clock，无一次 synchronize，
+  各子段真实 GPU 占比未知。P6-0 的经验证明不先测量就排序会踩错方向的坑。
+- **方案**：复用 `turboquant_utils/cuda_profiler.py` 的 `CudaStageProfiler`，
+  在 `Qwen3_5MoeGatedDeltaNet.forward`（:438）接 in_proj_qkv / in_proj_z / in_proj_b /
+  in_proj_a / conv1d / delta_rule / norm / out_proj 八个 stage，
+  `Qwen3_5MoeAttention.forward`（:675）接 qkv 投影 / RoPE / attn / o_proj。
+  开关默认关闭，不影响主流程。
+- **判据输出**：决定 P8-2 ~ P8-6 的优先级排序，以及 delta rule 内部
+  （chunk 内 WY 递归 vs 32 chunk 串行循环 vs fp32 cast）各自占比。
+- **难度**：低。**风险**：零（测量开关）。
+
+#### P8-2：delta rule / conv1d 全链路 fp16 化（P2 方法）
+
+- **问题**：`torch_chunk_gated_delta_rule` 把 q/k/v/beta/g 全部 `.to(torch.float32)`
+  （`modeling_qwen3_5_moe.py:261-263`），整个 delta rule 在 fp32 下跑。MoE 侧 P2 已经
+  证明「输出/码本/norms 全 fp16 + 关键处保留 fp32」路线可行，attention 侧还没有做。
+- **精度敏感点（必须先验证再落）**：
+  - `g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)`（:519）——
+    注释已警告 fp16 下 A 可能 -inf，g 的 cumsum/exp 链是数值重灾区；
+  - l2norm、decay_mask 的 exp、状态递推的乘法链。
+- **方案**：q/k/v 在 fp16 下做 bmm/einsum，g/decay/状态递推保留 fp32 或 fp32 计算后
+  写回 fp16（分点验证 ppl）。
+- **预期收益**：delta rule 的 matmul 部分 2x（fp32→fp16 Tensor Core），
+  视 P8-1 测量占比折算。
+- **难度**：中。**风险**：精度——以 ppl 为准，不行就局部回退 fp32（不整体回退）。
+
+#### P8-3：消除 chunk 内 Python 循环（P6-2 / P5-2 方法）
+
+- **问题**：`torch_chunk_gated_delta_rule:290-293` 的
+  `for i in range(1, chunk_size)`（63 次迭代，每次 2 个 `.clone()` + 小张量乘加）
+  以及 :306-316 的 32 chunk 串行循环——和 MoE 逐 expert 循环同一类病：
+  Python 循环体开销 + 小形状 kernel launch 放大。
+- **方案**：chunk 内 WY 递归用 cumsum / associatve-scan 向量化重写（消除 63 次迭代）；
+  chunk 串行循环因递推依赖不能并，但可以搬进单个 Triton kernel 内做
+  （见 P8-4），先做前者成本低。
+- **难度**：中。**风险**：低（纯重写，逐位可对拍验证）。
+
+#### P8-4：chunk delta rule 融合 Triton kernel（P4-4 / P4-7 方法）
+
+- **问题**：delta rule 内是大量 64×64×128 级的小 bmm/einsum
+  （`attn @ v_beta`、`q_i @ k_i^T`、`k_i^T @ v_new`……），单个体量小、launch 多。
+- **方案**：把 chunk 内计算（qk^T + decay + WY + @v）写成一个 Triton kernel，
+  参考 P4-4 的「多 group 融合单 kernel」和 P4-7 的「小 matmul 合并 bmm」思路。
+  状态递推（chunk 间串行）留在 kernel 外循环，每个 chunk 一次 launch（32 次/层）。
+- **难度**：中高。**风险**：数值对齐以 P8-2 的 fp32 路径为参考逐步逼近。
+- **前置**：P8-1 测量确认 delta rule 内部 matmul 占比够大。
+
+#### P8-5：causal conv1d torch fallback 优化（P4-7 方法）
+
+- **问题**：`F.silu(self.conv1d(mixed_qkv))` 走 torch 原生 Conv1d（:498），
+  groups=conv_dim 的深度卷积，torch 实现对小 kernel 未必最优。
+- **方案**：Triton 分组深度卷积（或 shift+scale 实现）；若 P8-1 测出 conv1d 占比小
+  则降优先级。
+- **难度**：中。**风险**：低（数值可对拍）。
+
+#### P8-6：新 kernel 的 tile 联合调优（P5-3 方法）
+
+- **方案**：P8-2~P8-5 落地后，对每个新 Triton kernel 用
+  `turboquant_utils/kernel_autotune.py` 做 BLOCK/warps/stages 联合搜索。
+  教训照搬：**先确认真实 eval 形状再搜**（P5-3 的 B=2048 vs B=32 反方向教训），
+  delta rule 的 chunk 形状 (64, 64, 128) 与 MoE 完全不同，旧配置不可复用。
+- **难度**：低。**收益**：稳定 +5~20%（参照 P5-3）。
+
+---
+
+### P9 — 备选 / 独立技术路线（长期方向，非增量优化）
+
+#### P9-1：WxA16 到 WxA4，WxA8 的整体进化。
+- 改变现在 weights 反量化为 fp16 计算的方法，而是整体切换为输入量化后和 weights 继续 int 乘法的方法。
+
+#### P9-2：ROADMAP 第四阶段：Machete / Marlin CUDA kernel（Blackwell wgmma）
+- 针对 RTX 5090 (SM12.0) 的高性能推理替代路线：从 vLLM 提取 Machete kernel（支持 wgmma），或 Marlin MoE kernel，替代 Triton 全路线。
+- **难度**：高（CUDA/C++ 扩展 + 集成）。
+- **来源**：ROADMAP.md 第四阶段。
+
+#### P9-3：cuTile 后端集成到 WxA16 MoE 推理路径 ✅ 探索
 - **现状**：`turboquant_utils/cutile_kernels.py` 已实现 `cutile_fused_matmul` / `cutile_fused_matmul_autotuned` / `cutile_fused_dual_matmul`，但**未接入 WxA16 MoE forward**（MoE 文件无 `use_cutile`/`cutile` 引用）。CLI 有 `--disable-gpu-fused` 开关但面向 Metal/macOS。
 - **方案**：给 `WxA16BitPartitionedGroupMoE` 加 cuTile 后端选项，实测对比 Triton vs cuTile（cuTile 的 MMA 可能比 Triton `tl.dot` 更高效，尤其 TF32/FP16 Tensor Core 利用率）。
 - **难度**：中，**预期收益不确定（需实测）**。
 - **建议**：先做单 kernel 对比（测试程序对比 cutile vs triton 在真实形状下性能），有明显收益再接入主流程。
 - **来源**：new-wxa16-plan-260818.md §1。
 
-#### P7-2：Split-K 优化
-
-> ⚠️ **2026-08-26 复核：对 eval 场景前提不成立**。原假设「单 expert 仅几十 token」，
-> 但实测 per-expert B = 65536×8/256 = **2048**，B 维并行度充足。
-> 仅在 **decode（batch=1 逐 token 生成，per-expert B≈1）** 场景下才重新成立。
-> 若项目只关心 ppl eval 吞吐，建议移出 backlog；若要做生成延迟，另立场景重新评估。
-
-- 当 M 很小（单 expert 仅几十 token）但 K 很大时 GEMM 并行度不够；对 K 维 split-K，多 block 算同一输出 tile 不同 K 段，最后原子加。
-- **适用**：MoE token 数少的 expert 场景。
-- **来源**：new-wxa16-plan-260818.md §6。
-
-#### P7-3：Bit-packing 布局优化：按 32/128-bit 对齐
-- 当前 uint8 逐字节加载，对 memory coalescing 非最优；改成 32-bit/128-bit vector 存储+加载。
-- **来源**：new-wxa16-plan-260818.md §8。
-
-#### P7-4：权重预排序（codebook lookup 友好）
-
-> ⚠️ **2026-08-26 复核：前提基本失效**。2-bit 码本只有 **4 个 fp16**（`codebook` shape (4,)），
-> 早已常驻寄存器/L1，不存在「相邻访问提升 L1 命中率」的空间。与已否决的 shared-mem-codebook 同理。
-> 建议移出 backlog，除非将来出现大码本（VQ / 多维码本）方案。
-
-- 按激活数值排序权重行/列，使相邻位置访问相近码本条目，提升 L1 命中率。需配合量化算法改。
-- **来源**：new-wxa16-plan-260818.md §10。
-
-#### P7-5：Flash Attention 风格在线反量化 Attention（KV cache 量化）
-- **问题**：Attention 的 Q/K/V 投影被量化了，但 attention 计算本身全精度；若 K/V cache 也做 TurboQuant 量化，在 Flash Attention kernel 内部实时反量化，可大幅减少 KV cache 带宽。
-- **难度**：很高（深度修改 Flash Attention kernel）。
-- **来源**：new-wxa16-plan-260818.md §9。
-
----
-
-### P8 — 备选 / 独立技术路线（长期方向，非增量优化）
-
-#### P8-0：WxA16 到 WxA4，WxA8 的整体进化。
-- 改变现在 weights 反量化为 fp16 计算的方法，而是整体切换为输入量化后和 weights 继续 int 乘法的方法。
-
-#### P8-1：ROADMAP 第四阶段：Machete / Marlin CUDA kernel（Blackwell wgmma）
-- 针对 RTX 5090 (SM12.0) 的高性能推理替代路线：从 vLLM 提取 Machete kernel（支持 wgmma），或 Marlin MoE kernel，替代 Triton 全路线。
-- **难度**：高（CUDA/C++ 扩展 + 集成）。
-- **来源**：ROADMAP.md 第四阶段。
-
-#### P8-2：QwenMultiLinear 备选方案（保持 grouped_gemm 格式）
+#### P9-4：QwenMultiLinear 备选方案（保持 grouped_gemm 格式）
 - 不转换为传统格式，直接在 Qwen3.5 grouped_gemm 格式上工作，打包所有专家指针实现一次 kernel launch，保存 `bit_to_indices` 元数据避免信息丢失。
 - **现状**：纯讨论备选，未实现。
 - **来源**：ROADMAP_ALTERNATIVE_QWENMULTILINEAR.md。
@@ -404,6 +463,38 @@ P6-0 的分阶段拆分显示 **scatter 已是第二大开销（~16%）**，每�
 | shared-mem-codebook | ❌ 不做 | 码本仅 2^bit 个 fp32（最大 1KB），L1 已缓存，手动管理反而增 barrier 开销 |
 | Triton autotune 调参 | ❌ 不做 | 动态小 kernel，搜索编译开销 > 收益 |
 | 退回 clone 旧路径 | ❌ 不作为选项 | 仅回 dfb8fc1 水平、无增益，且按规范须本人同意 |
+| P7-2 Split-K（2026-08-26 移入） | ❌ 不做 | 前提「单 expert 几十 token」对 eval 不成立（实测 per-expert B=2048，B 维并行度充足）；仅在 decode（B≈1）场景才重新成立 |
+| P7-4 权重预排序（2026-08-26 移入） | ❌ 不做 | 2-bit 码本仅 4 个 fp16，常驻寄存器/L1，不存在「相邻访问提升 L1 命中率」空间；与 shared-mem-codebook 同理 |
+| P7-3 Bit-packing 32/128-bit 向量化加载（2026-08-26 移入） | ❌ 不做 | 判定测试实测持平（gate_up 95.4% / down 96.6%，变体相对基线）：packed 权重只占 kernel 访存一小部分，瓶颈在输入 fp16 tile 加载与 tl.dot，与 packed 加载宽度无关 |
+
+> **P7-2 / P7-4 原文备份**（移入否决表前的原始记录，保留备查）：
+> - **P7-2 Split-K 优化**（来源 new-wxa16-plan-260818.md §6）：当 M 很小（单 expert 仅几十 token）
+>   但 K 很大时 GEMM 并行度不够；对 K 维 split-K，多 block 算同一输出 tile 不同 K 段，最后原子加。
+>   适用：MoE token 数少的 expert 场景。
+> - **P7-4 权重预排序**（来源 new-wxa16-plan-260818.md §10）：按激活数值排序权重行/列，使相邻位置
+>   访问相近码本条目，提升 L1 命中率。需配合量化算法改。
+
+> P7 — 已清零（2026-08-26 全部移入「已否决」表）
+> 原 P7-1（cuTile）、P7-5（Flash Attention 在线反量化）已由本人重新归类至 P8-3 / P8-0。
+> 原 P7-2 / P7-4 因前提失效移入「已否决」表（原文保留在表后附注）。
+> 原 P7-3 经判定测试实测后同样移入「已否决」表，至此 **P7 阶段整体清零**。
+> 该阶段遗留的可执行项为 0 —— MoE 内部的探索性优化空间已被 P5/P6 吃干净，
+> 下一个优化方向是 attention（见 §〇「目标转变」）。
+
+> P7-3 判定记录（2026-08-26，测试：`test/test_p73_bitpack_judge.py` + `test_p73_ref_check.py`）
+
+判定前提：「kernel 是访存 bound 且 packed 权重加载路径没吃满」。
+在真实 eval 形状（per-expert B=2048，2-bit）下对比 uint8 逐字节 vs uint32 向量化加载：
+
+| 方向 | uint8 基线 | uint32 变体 | 相对 | 结论 |
+|---|---|---|---|---|
+| gate_up (B=2048, N=1024, K=2048) | 0.064 ms | 0.061 ms | 95.4% | 基本持平 |
+| down (B=2048, N=2048, K=512) | 0.034 ms | 0.032 ms | 96.6% | 基本持平 |
+
+- 数值：两版对 fp32 参考的误差比 **1.000x**（变体数学正确；A/B 间差异是 tl.dot
+  累加顺序的 fp16 噪声）。
+- 结论：packed 权重只占 kernel 访存的一小部分（2-bit 下每 group 仅 32 字节），
+  瓶颈在输入 fp16 tile 加载与 tl.dot 计算，与 packed 加载宽度无关。**P7-3 判死刑。**
 
 ---
 
@@ -429,26 +520,28 @@ P6-0 的分阶段拆分显示 **scatter 已是第二大开销（~16%）**，每�
 4. ~~**P6-1（跨 bit 旋转复用 + dual_matmul 接线）**~~ ⛔ 前提作废（对应「已废弃 P6-1（旧）」）
 5. ~~**P6-2 + P6-4**~~ ❌ 删除（对应「已废弃 P6-2/P6-4（旧）」）
 6. ~~**P6-3（方案 D 大 K 融合）**~~ ❌ 删除（对应「已废弃 P6-3（旧）」）
-7. **P7**：见下方 4.2 的调整
+7. ~~**P7**~~ ⛔ 已整体清零（2026-08-27，全部移入「已否决」表）
 8. **P8**：见下方 4.2 的调整
 
-### 4.2 当前顺序（2026-08-26 重排）
+### 4.2 当前顺序（2026-08-27 更新）
 
 1. **P6-0（CUDA event 分阶段计时）** — ✅ 已落地。前置条件，不做这个后面无法排序也无法验证收益。
 2. **P6-1（gate_up 旋转提到 expert 循环外）** — ✅ 已落地，数学严格等价，旋转 FLOPs 与访存均降 8 倍。
 3. **P6-2（per-expert 重复常量 / 冗余分配消除）** — ✅ 已落地，低风险 Python 层清理。
 4. **P6-3（per-expert `index_add_` scatter）** — P6-0 实测发现的第二大开销（~16%），待做。
-5. **依 P6-0 的实测结果决定下一步**：
-   - 若 kernel 已是访存 bound → **P7-3（bit-packing 32/128-bit 向量化加载）**
-   - 若仍是计算 bound → **P7-1（cuTile 后端单 kernel 对比）**
-6. **P8-0（WxA8 / WxA4）** — 战略优先级已上调。A16 的天花板是 fp16 tensor core 吞吐，
-   而 W2A16 现在已经比 FP16 快 18%，P6/P7 的增量空间有限；输入侧也量化后走整数乘法才是下一个数量级。
-7. **P8-1（Machete/Marlin） / P8-2（QwenMultiLinear）** — 独立技术路线，长期备选。
+   注：attention 已成更大杠杆（见 §〇），本项相对优先级下调。
+5. **P8-1（attention 分阶段 CUDA event 测量）** — P8 方向的第一步，P6-0 方法移植到
+   `Qwen3_5MoeGatedDeltaNet` / `Qwen3_5MoeAttention`，先测后改。
+6. **P8-2 ~ P8-6（fp16 化 / 循环消除 / 融合 kernel / conv1d / tile 调优）** —
+   按 P8-1 测量结果排序执行；每条都引用 P2/P4/P5/P6 的对应经验（见 P8 节）。
+7. **P9-1（WxA8 / WxA4）** — 战略优先级已上调。A16 的天花板是 fp16 tensor core 吞吐，
+   而 W2A16 现在已经比 FP16 快 18%，P6 之后的增量空间有限；输入侧也量化后走整数乘法才是下一个数量级。
+8. **P9-2（Machete/Marlin） / P9-3（cuTile） / P9-4（QwenMultiLinear）** — 独立技术路线，长期备选。
 
 ### 4.3 待定 / 需本人决策
 
 - **P5-2**：已决定**不重测**（2026-08-26）。否决记录（eval 269.4→288.6s）与
   SM 填充度佐证数据保留在 P5-2 条目内备查，后续如硬件/形状变化可再评估。
-- **P7-2 / P7-4 是否移出 backlog**（前提已失效，见各自条目）。
+- **P7**：阶段已整体清零（2026-08-27），全部移入「已否决」表。
 
 > 每一步改动都需配套：测试程序先对齐主流程逻辑（含 GPU 填充度 / 并行 SM 分析）+ 本人在真实 eval 形状下手动复测，避免再次落入 micro≠real 陷阱。
