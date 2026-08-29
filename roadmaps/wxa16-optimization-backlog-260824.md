@@ -590,13 +590,14 @@ ppl 11.268 / 7.7944 无损失。收益小于预期（delta rule 只是全模型�
 - P8-5 causal conv1d（需先测占比，当前非瓶颈）
 - 更多 kernel 融合（cast/decay/beta_reshape 合并进 chunk 循环的第一个 kernel）
 
-#### P8-5：causal conv1d torch fallback 优化（P4-7 方法）
+#### P8-5：causal conv1d torch fallback 优化（P4-7 方法）❌ 否决
 
 - **问题**：`F.silu(self.conv1d(mixed_qkv))` 走 torch 原生 Conv1d（:498），
-  groups=conv_dim 的深度卷积，torch 实现对小 kernel 未必最优。
-- **方案**：Triton 分组深度卷积（或 shift+scale 实现）；若 P8-1 测出 conv1d 占比小
-  则降优先级。
-- **难度**：中。**风险**：低（数值可对拍）。
+  groups=conv_dim=8192 的深度卷积（kernel_size=4, B=32, seq=2048）。
+- **实测**：torch 版 6.23 ms，接近内存带宽下限（读写 ~2.1GB，RTX 5090 带宽 bound）。
+  depthwise conv 已是内存 bound，Triton 重写无收益（甚至可能更慢）。
+  silu 融合最多省一次读写 (~1GB)，端到端 <0.5%。
+- **结论**：否决。性价比太低，收益不足以覆盖开发 + 验证成本。
 
 #### P8-6：新 kernel 的 tile 联合调优（P5-3 方法）
 
