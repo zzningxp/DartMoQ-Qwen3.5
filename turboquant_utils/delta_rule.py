@@ -364,12 +364,14 @@ def _triton_wy_prep(k_beta, key, v_beta, decay_mask, g, chunk_size=64):
     val2 = value.reshape(BHNC, CS, V)
     kcd2 = kcd.reshape(BHNC, CS, K)
 
+    # P8-6 自动调优最优配置（B=32, H=16, seq=2048, CS=64, K=V=128）：
+    # BLOCK_K=128（K 维不分块）+ stages=2，wy 2.53→1.82ms（+28%）
     _delta_wy_kernel[(BHNC,)](
         kb2, key2, vb2, dm2, g2, val2, kcd2,
         kb2.stride(0), key2.stride(0), vb2.stride(0), dm2.stride(0), g2.stride(0),
         val2.stride(0), kcd2.stride(0),
-        CS=CS, K=K, V=V, BLOCK_K=32,
-        num_warps=4, num_stages=1,
+        CS=CS, K=K, V=V, BLOCK_K=128,
+        num_warps=4, num_stages=2,
     )
     return value, kcd
 
@@ -444,8 +446,10 @@ def _triton_chunk_loop(query, key, value, k_cumdecay, decay_mask, g,
     new_state = torch.empty_like(state)
     g_last_all = g2[:, :, -1].contiguous()  # (BH, NC)
 
+    # P8-6 自动调优最优配置（B=32, H=16, seq=2048, CS=64, K=V=128）：
+    # BLOCK_V=128（V 维不分块）+ warps=4 + stages=2，chunk 循环 6.34→2.92ms（+54%）
     BLOCK_K = 32
-    BLOCK_V = 32
+    BLOCK_V = 128
     for i in range(NC):
         _delta_chunk_kernel[(BH,)](
             q2[:, i], k2[:, i], v2[:, i], kcd2[:, i], dm2[:, i], g2[:, i],
@@ -455,7 +459,7 @@ def _triton_chunk_loop(query, key, value, k_cumdecay, decay_mask, g,
             g_last_all[:, i].stride(0), o2[:, i].stride(0),
             SCALE=scale,
             CS=CS, K=K, V=V, BLOCK_K=BLOCK_K, BLOCK_V=BLOCK_V,
-            num_warps=8, num_stages=1,
+            num_warps=4, num_stages=2,
         )
         state, new_state = new_state, state  # 交换缓冲，避免每块新分配
 
