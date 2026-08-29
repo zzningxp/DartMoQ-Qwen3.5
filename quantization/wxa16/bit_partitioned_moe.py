@@ -13,7 +13,7 @@ import gc
 
 import numpy as np
 
-from wxa16_linear import WxA16Linear
+from .linear import WxA16Linear
 from turboquant_utils.quantize import turboquant_quantize_packed_full
 from turboquant_utils.triton_kernels import (
     triton_fused_matmul_grouped_slice_rows,

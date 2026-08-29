@@ -795,7 +795,7 @@ def quant_layer_mix_precision_wxa16(layer, layer_idx, quant_attn, n_experts, sli
 
     # ========== 阶段 0: 量化前存储空间统计 ==========
     tick_stats = time.time()
-    from wxa16_memory_stats import print_memory_stats_layer_before
+    from quantization.wxa16.memory_stats import print_memory_stats_layer_before
     before_stats = print_memory_stats_layer_before(layer, layer_idx)
     print(f"  [DEBUG] print_memory_stats_layer_before time: {time.time() - tick_stats:.4f}s")
 
@@ -815,8 +815,8 @@ def quant_layer_mix_precision_wxa16(layer, layer_idx, quant_attn, n_experts, sli
     print(f"  Converting to WxA16 packed format...")
     tick_convert_start = time.time()
 
-    from wxa16_linear import WxA16Linear, W8A16Linear
-    from wxa16_dartmoq_backend import wxa16_quantize_linear
+    from quantization.wxa16.linear import WxA16Linear, W8A16Linear
+    from quantization.wxa16.dartmoq_backend import wxa16_quantize_linear
 
     ffn_filters = ['up_proj', 'gate_proj', 'down_proj']
 

@@ -611,8 +611,14 @@ ppl 11.268 / 7.7944 无损失。收益小于预期（delta rule 只是全模型�
 
 ### P9 — 备选 / 独立技术路线（长期方向，非增量优化）
 
-#### P9-1：WxA16 到 WxA4，WxA8 的整体进化。
-- 改变现在 weights 反量化为 fp16 计算的方法，而是整体切换为输入量化后和 weights 继续 int 乘法的方法。
+#### P9-1：WxA4（W4A16 Marlin 风格）🆕 启动
+- **路线**：权重 4bit 分组量化（group_size=128, asymmetric）+ Triton kernel 内反量化
+  + fp16 Tensor Core 计算（Marlin 风格，非纯 int4 WGMMA）。
+- **选型理由**：Triton 原生可实现、精度风险低、与 WxA16 技术栈一致；
+  纯 int4 WGMMA 路线因 Triton 3.x 不支持且精度风险高，暂不考虑。
+- **详细规划**：见 [`wxa4-plan-260829.md`](../wxa4-plan-260829.md)。
+- **阶段**：P0 基础设施 → P1 Dense kernel → P2 MoE kernel → P3 端到端调优。
+- **验收**：ppl 退化可控 + 端到端优于 WxA16。
 
 #### P9-2：ROADMAP 第四阶段：Machete / Marlin CUDA kernel（Blackwell wgmma）
 - 针对 RTX 5090 (SM12.0) 的高性能推理替代路线：从 vLLM 提取 Machete kernel（支持 wgmma），或 Marlin MoE kernel，替代 Triton 全路线。

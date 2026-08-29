@@ -547,8 +547,14 @@ def main():
     parser.add_argument('--cpu-profile', action='store_true', default=False,
                         help="CPU 侧瓶颈定位：逐层打印 wall/GPU/kwargs/move 拆分"
                              "（会在每层末尾 synchronize，只用于测量，别开它跑正式 eval）")
+    parser.add_argument('--wxa8', action='store_true', default=False,
+                        help="启用 WxA8 模式（激活 INT8 量化 + INT8 Tensor Core 计算）。"
+                             "当前未实现，预留接口。")
 
     args = parser.parse_args()
+
+    if args.wxa8:
+        raise NotImplementedError("WxA8 模式尚未实现，敬请期待。详见 roadmaps/wxa8-plan-260829.md")
 
     # 自动判断：单位置参数若为量化目录，则等价于 --load-quantized
     if args.model and not args.load_quantized and _is_quant_dir(args.model):

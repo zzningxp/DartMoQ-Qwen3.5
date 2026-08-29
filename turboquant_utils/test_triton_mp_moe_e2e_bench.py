@@ -35,7 +35,7 @@ import gc
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from wxa16_bit_partitioned_moe import WxA16BitPartitionedGroupMoE, WxA16Weights
+from quantization.wxa16.bit_partitioned_moe import WxA16BitPartitionedGroupMoE, WxA16Weights
 from turboquant_utils.quantize import (
     turboquant_quantize_packed_full,
     turboquant_dequantize_packed_rows,

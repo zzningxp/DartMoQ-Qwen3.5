@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from wxa16_linear import WxA16Linear, W8A16Linear
+from .linear import WxA16Linear, W8A16Linear
 from turboquant_utils.quantize import turboquant_quantize_packed_full
 
 

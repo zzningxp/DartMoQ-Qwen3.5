@@ -28,11 +28,15 @@ def main():
     parser.add_argument("--quantmode", type=str, default="turboquant", choices=["gptq", "turboquant"], help="Quantization mode")
     parser.add_argument("--quant-layers", type=str, default=None, help="Only quantize specific layers (e.g., '0-5,8,10' for layers 0-5, 8, and 10; default: all layers)")
     parser.add_argument("--wxa16", action="store_true", default=False, help="Use WxA16 real quantization (stored packed format, not fake quant)")
+    parser.add_argument("--wxa8", action="store_true", default=False, help="Enable WxA8 mode (INT8 activation + INT8 Tensor Core). 未实现，预留接口。")
     parser.add_argument("--save-quantized", type=str, default=None, help="Save quantized checkpoint (packed format) to this directory after quantization")
     parser.add_argument("--eval-batch-size", type=int, default=32, help="Batch size for normal (non-sequential) PPL evaluation")
     parser.add_argument("--load-quantized", type=str, default=None, help="Load quantized checkpoint from this directory, skip calibration & quantization, directly run PPL eval")
 
     args = parser.parse_args()
+
+    if args.wxa8:
+        raise NotImplementedError("WxA8 模式尚未实现，敬请期待。详见 roadmaps/wxa8-plan-260829.md")
 
     assert not (args.save_quantized and args.load_quantized), \
         "save-quantized 与 load-quantized 不能同时使用"
@@ -56,6 +60,7 @@ def main():
     print(f"Hybrid MoE: Yes (always enabled)")
     print(f"Quant mode: {args.quantmode}")
     print(f"WxA16 real quantization: {'Yes' if args.wxa16 else 'No (fake quant)'}")
+    print(f"WxA8 (INT8 activation): {'Yes' if args.wxa8 else 'No'}")
     print(f"CPU standby: {'Yes' if args.standby_layer_cpu else 'No'}")
     if args.save_quantized:
         print(f"Save quantized checkpoint: {args.save_quantized}")

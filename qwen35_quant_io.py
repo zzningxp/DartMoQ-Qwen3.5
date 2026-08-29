@@ -23,8 +23,8 @@ from safetensors.torch import load_file, save_file
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from qwen35_utils import DEV
-from wxa16_bit_partitioned_moe import WxA16BitPartitionedGroupMoE, WxA16Weights
-from wxa16_linear import WxA16Linear
+from quantization.wxa16.bit_partitioned_moe import WxA16BitPartitionedGroupMoE, WxA16Weights
+from quantization.wxa16.linear import WxA16Linear
 
 
 # ---------------------------------------------------------------------------

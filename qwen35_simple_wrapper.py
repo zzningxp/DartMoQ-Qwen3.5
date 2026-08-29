@@ -236,7 +236,7 @@ def construct_moe(model, moe_model_flag, layer, layer_idx, inp,
 
         if use_wxa16:
             print(f"Restructuring to WxA16BitPartitionedGroupMoE (layer {layer_idx})...")
-            from wxa16_bit_partitioned_moe import WxA16BitPartitionedGroupMoE
+            from quantization.wxa16.bit_partitioned_moe import WxA16BitPartitionedGroupMoE
             old_mlp = layer.mlp
             layer.mlp = WxA16BitPartitionedGroupMoE.from_build_block(old_mlp, layer_metadata, group_size=GROUPSIZE)
         else:
@@ -282,7 +282,7 @@ def construct_moe(model, moe_model_flag, layer, layer_idx, inp,
 
     # ========== WxA16: 量化后存储空间统计 ==========
     if use_wxa16 and before_stats is not None:
-        from wxa16_memory_stats import print_memory_stats_layer_after
+        from quantization.wxa16.memory_stats import print_memory_stats_layer_after
         print_memory_stats_layer_after(layer, layer_idx, before_stats, qscheme)
 
     moe_out = torch.zeros_like(hidden_states)
