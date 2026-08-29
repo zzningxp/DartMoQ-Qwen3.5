@@ -39,7 +39,7 @@ NEW_WXA16_REAL_QUANT_RE = re.compile(r"^WxA16 real quantization:\s+(?P<wxa16_rea
 NEW_QUANT_LAYERS_RE = re.compile(r"^Quantizing layers:\s+(?P<quant_layers>.+)")
 NEW_START_TIME_RE = re.compile(r"^Current time:\s*(?P<value>.+)")
 NEW_FINISH_TIME_RE = re.compile(r"^Finish time:\s*(?P<value>.+)")
-NEW_PPL_RE = re.compile(r"ppl on (?P<dataset>wikitext2|c4)(?:\s+\([^)]+\))?:\s*(?P<value>[-+0-9.eE]+)(?:\s+time:\s*(?P<time_value>[-+0-9.eE]+))?")
+NEW_PPL_RE = re.compile(r"ppl on (?P<dataset>wikitext2|c4)(?:\s+\([^)]+\))?:\s*(?P<value>[-+0-9.eE]+|nan|inf)(?:\s+time:\s*(?P<time_value>[-+0-9.eE]+))?")
 LAYER_TIME_RE = re.compile(r"Layer (?P<layer>\d+) total reconstruct and quantization time:\s*(?P<value>[-+0-9.eE]+) s")
 # Eval-specific patterns
 EVAL_DATASETS_RE = re.compile(r"^Datasets:\s+(?P<datasets>.+)")
@@ -55,7 +55,7 @@ QUANTMODE_RE = re.compile(
     r"(?P<moe_struct>\S+)\s+(?P<quantmode>\S+)(?:\s+(?P<disable_0bit_prune>\S+))?(?:\s+(?P<standby_layer_cpu>\S+))?"
 )
 BPW_RE = re.compile(r"\bwith bpw\s+(?P<bpw>[-+0-9.eE]+)")
-PPL_RE = re.compile(r"ppl on (?P<dataset>wikitext2|c4)(?:\s+\([^)]+\))?:\s*(?P<value>[-+0-9.eE]+)")
+PPL_RE = re.compile(r"ppl on (?P<dataset>wikitext2|c4)(?:\s+\([^)]+\))?:\s*(?P<value>[-+0-9.eE]+|nan|inf)")
 RUNTIME_RE = re.compile(r"Runtime of training-free construction \(ppl\):\s*(?P<value>[-+0-9.eE]+)")
 RUNTIME_QUANT_RE = re.compile(r"Runtime of quantization only:\s*(?P<value>[-+0-9.eE]+)")
 RUNTIME_PPL_EVAL_RE = re.compile(r"Runtime of wiki/c4 validation:\s*(?P<value>[-+0-9.eE]+)")
@@ -65,7 +65,7 @@ MODEL_NAME_RE = re.compile(r"^model:\s+(?P<path>\S+)\s+(?P<name>\S+)")
 NUMERIC_RE = re.compile(r"^[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?$")
 
 # For backward compatibility with old logs
-PPL_INDIVIDUAL_TIME_RE = re.compile(r"ppl on (?P<dataset>wikitext2|c4)(?:\s+\([^)]+\))?:\s*[-+0-9.eE]+\s*time:\s*(?P<value>[-+0-9.eE]+)")
+PPL_INDIVIDUAL_TIME_RE = re.compile(r"ppl on (?P<dataset>wikitext2|c4)(?:\s+\([^)]+\))?:\s*(?:[-+0-9.eE]+|nan|inf)\s*time:\s*(?P<value>[-+0-9.eE]+)")
 
 # Pattern to parse bpw from quant_scheme (format like "w8a8" or "w4a4" etc.)
 QUANT_SCHEME_BPW_RE = re.compile(r"w(?P<weight_bits>\d+)(?:a(?P<act_bits>\d+))?")

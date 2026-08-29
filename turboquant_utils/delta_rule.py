@@ -65,6 +65,12 @@ ENABLE_BMM_MERGE = False
 # 默认先开（数值对拍与性能见 test/test_p84_triton_chunk.py）。
 ENABLE_TRITON_CHUNK = True
 
+# P8-4 第三步：wy_prep 融合 kernel。wy_bmm + WY 递归（63 步在寄存器内）+
+# 2 个后置 bmm（attn@v_beta、attn@(k_beta*exp(g))）全在一个 kernel 里完成，
+# attn 矩阵不出寄存器（省 536MB 写 + 两次读），solve_triangular 也被替代
+# （WY 用原 63 步递归语义，与 solve 的差异 ~5e-4 已知可接受）。
+ENABLE_TRITON_WY = True
+
 
 def _l2norm(x, dim=-1, eps=1e-6):
     inv_norm = torch.rsqrt((x * x).sum(dim=dim, keepdim=True) + eps)
@@ -148,46 +154,18 @@ def fast_chunk_gated_delta_rule(
         decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
 
     # ---- wy_prep：WY 递归 + 三个大 bmm ----
-    with _stage("wy_bmm"):
-        if ENABLE_FP16_BMM:
-            attn = -((k_beta.half() @ key.transpose(-1, -2).half()).float() * decay_mask).masked_fill(mask, 0)
+    # P8-4 第三步：Triton 融合路径（attn 不出寄存器，WY 用 63 步递归语义）
+    if ENABLE_TRITON_WY:
+        with _stage("wy_fused"):
+            _wy_res = _triton_wy_prep(k_beta, key, v_beta, decay_mask, g, chunk_size=chunk_size)
+        if _wy_res is not False:
+            value, k_cumdecay = _wy_res
         else:
-            # key 在 cast 缩减路径下是 bf16（k_beta 已因 beta fp32 提升为 fp32），
-            # bmm 要求同类型，显式转 fp32（bf16→fp32 精确，数值不变）
-            attn = -((k_beta @ key.transpose(-1, -2).to(torch.float32)) * decay_mask).masked_fill(mask, 0)
-    if ENABLE_WY_SOLVE:
-        with _stage("wy_solve"):
-            # P8-3: 三角递归 L_new = L + L·L_new 的闭式解 L_new = (I−L)⁻¹L。
-            # attn 为严格下三角 L；I−L 单位下三角，批量三角求解一次完成。
-            # 数学与原 63 次循环等价（浮点舍入顺序不同，误差 ~1e-4~1e-3 量级）。
-            eye = torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
-            i_minus_l = eye - attn
-            attn = torch.linalg.solve_triangular(i_minus_l, attn,
-                                                 upper=False, unitriangular=True) + eye
+            value, k_cumdecay = _torch_wy_prep(
+                k_beta, key, v_beta, decay_mask, g, chunk_size, mask, v_head_dim)
     else:
-        with _stage("wy_loop"):
-            # WY 递归保持 fp32（动态范围大）
-            for i in range(1, chunk_size):
-                row = attn[..., i, :i].clone()
-                sub = attn[..., :i, :i].clone()
-                attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
-            attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
-    if ENABLE_BMM_MERGE:
-        # P8-4a: attn@v_beta 与 attn@(k_beta*exp) 共享左操作数，沿右维拼接一次 bmm
-        rhs = torch.cat([v_beta, k_beta * g.exp().unsqueeze(-1)], dim=-1)
-        if ENABLE_FP16_BMM:
-            merged = (attn.half() @ rhs.half()).float()
-        else:
-            merged = attn @ rhs
-        value = merged[..., :v_head_dim]
-        k_cumdecay = merged[..., v_head_dim:]
-    else:
-        if ENABLE_FP16_BMM:
-            value = (attn.half() @ v_beta.half()).float()
-            k_cumdecay = (attn.half() @ (k_beta * g.exp().unsqueeze(-1)).half()).float()
-        else:
-            value = attn @ v_beta
-            k_cumdecay = attn @ (k_beta * g.exp().unsqueeze(-1))
+        value, k_cumdecay = _torch_wy_prep(
+            k_beta, key, v_beta, decay_mask, g, chunk_size, mask, v_head_dim)
     last_recurrent_state = (
         torch.zeros(batch_size, num_heads, k_head_dim, v_head_dim, dtype=value.dtype, device=value.device)
         if initial_state is None
@@ -293,6 +271,148 @@ def _delta_chunk_kernel(
             state_part = tl.dot(tl.trans(k_decay_k), v_new, out_dtype=tl.float32)  # (BK, BLOCK_V)
             tl.store(new_state_ptr + pid * K * V + offs_k[:, None] * V + offs_v[None, :],
                      state_k * exp_g_last + state_part)
+
+
+@triton.jit
+def _delta_wy_kernel(
+    kb_ptr, key_ptr, vb_ptr, dmask_ptr, g_ptr,
+    value_ptr, kcd_ptr,
+    kb_rs, key_rs, vb_rs, dm_rs, g_rs, value_rs, kcd_rs,
+    CS: tl.constexpr, K: tl.constexpr, V: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    """P8-4 第三步：wy_prep 融合 kernel（每个 program 一个 (batch, head, chunk)）。
+
+    在一个 kernel 内完成：
+      attn       = -(k_beta @ key^T * decay_mask) 严格下三角（K 分块）
+      WY 递归    = 原 63 步循环（寄存器内，无 launch）
+      value      = (attn + I) @ v_beta
+      k_cumdecay = (attn + I) @ (k_beta * exp(g_cum))
+    attn 矩阵不出寄存器，替代 solve_triangular 的 536MB 内存往返。
+    WY 用原 63 步递归语义（与 solve 闭式解的差异 ~5e-4，已知可接受）。
+    """
+    pid = tl.program_id(0)
+    offs_cs = tl.arange(0, CS)
+    offs_bk = tl.arange(0, BLOCK_K)
+
+    dmask_tile = tl.load(dmask_ptr + pid * dm_rs + offs_cs[:, None] * CS + offs_cs[None, :])
+    g_vec = tl.load(g_ptr + pid * g_rs + offs_cs)  # 已 cumsum 的 g
+    g_exp = tl.exp(g_vec)
+
+    # attn = -(k_beta @ key^T) * decay_mask，严格下三角
+    attn = tl.zeros((CS, CS), dtype=tl.float32)
+    for k0 in range(0, K, BLOCK_K):
+        offs_k = k0 + offs_bk
+        kb_k = tl.load(kb_ptr + pid * kb_rs + offs_cs[:, None] * K + offs_k[None, :])
+        key_k = tl.load(key_ptr + pid * key_rs + offs_cs[:, None] * K + offs_k[None, :]).to(tl.float32)
+        attn += tl.dot(kb_k, tl.trans(key_k), out_dtype=tl.float32)
+    attn = -attn * dmask_tile
+    attn = tl.where(offs_cs[None, :] < offs_cs[:, None], attn, 0.0)  # 严格下三角
+
+    # WY 递归 63 步（寄存器内）
+    # 原 torch 语义：attn[i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
+    #   row = attn[i, :i] (i,), sub = attn[:i, :i] (i, i)
+    #   row.unsqueeze(-1) 是 (i, 1) 列向量，广播乘 sub → (i, i)
+    #   result[p, q] = row[p] * sub[p, q]（row 第 p 个元素 × sub 第 p 行所有列）
+    #   .sum(-2) 对行维求和 → result[q] = sum_p row[p] * sub[p, q] = row @ sub
+    # Triton 中用 tl.expand_dims(row, 1) 得到 (CS,1) 列向量，与 sub(CS,CS) 广播乘即列向量语义。
+    for i in tl.static_range(1, CS):
+        row = tl.sum(tl.where(offs_cs[:, None] == i, attn, 0.0), axis=0)  # (CS,) 第 i 行
+        sub = tl.where(offs_cs[:, None] < i, attn, 0.0)                   # (CS, CS) 前 i 行
+        row_col = tl.expand_dims(row, axis=1)                             # (CS, 1) 列向量
+        weighted = row_col * sub                                          # (CS, CS) 列广播：[r,c]=row[r]*sub[r,c]
+        update = tl.sum(weighted, axis=0)                                 # (CS,) 对行求和 = row @ sub
+        update = tl.where(offs_cs < i, update, 0.0)
+        attn = attn + tl.where(offs_cs[:, None] == i, update[None, :], 0.0)
+
+    attn = attn + tl.where(offs_cs[:, None] == offs_cs[None, :], 1.0, 0.0)  # + I
+
+    # value = attn @ v_beta（V 分块 64）
+    for v0 in range(0, V, 64):
+        offs_v = v0 + tl.arange(0, 64)
+        vb_tile = tl.load(vb_ptr + pid * vb_rs + offs_cs[:, None] * V + offs_v[None, :])
+        val_tile = tl.dot(attn, vb_tile, out_dtype=tl.float32)             # (CS, 64)
+        tl.store(value_ptr + pid * value_rs + offs_cs[:, None] * V + offs_v[None, :], val_tile)
+
+    # k_cumdecay = attn @ (k_beta * exp(g_cum))（K 分块，k_beta 重载自 L2）
+    for k0 in range(0, K, BLOCK_K):
+        offs_k = k0 + offs_bk
+        kb_k = tl.load(kb_ptr + pid * kb_rs + offs_cs[:, None] * K + offs_k[None, :])
+        kbg_k = kb_k * g_exp[:, None]
+        kcd_tile = tl.dot(attn, kbg_k, out_dtype=tl.float32)               # (CS, BK)
+        tl.store(kcd_ptr + pid * kcd_rs + offs_cs[:, None] * K + offs_k[None, :], kcd_tile)
+
+
+def _triton_wy_prep(k_beta, key, v_beta, decay_mask, g, chunk_size=64):
+    """P8-4 第三步：wy_prep 的 Triton 融合版。
+
+    返回 (value, k_cumdecay)；形状不满足（CS=64, K=128, V%64==0）时返回 False。
+    g 必须是已 cumsum 的 g（decay 阶段完成）。attn 矩阵全程不出 kernel。
+    """
+    B, H, NC, CS, K = k_beta.shape
+    V = v_beta.shape[-1]
+    if CS != 64 or K != 128 or V % 64 != 0:
+        return False
+
+    BHNC = B * H * NC
+    kb2 = k_beta.reshape(BHNC, CS, K)
+    key2 = key.reshape(BHNC, CS, K)
+    vb2 = v_beta.reshape(BHNC, CS, V)
+    dm2 = decay_mask.reshape(BHNC, CS, CS)
+    g2 = g.reshape(BHNC, CS)
+    value = torch.empty(B, H, NC, CS, V, dtype=torch.float32, device=k_beta.device)
+    kcd = torch.empty(B, H, NC, CS, K, dtype=torch.float32, device=k_beta.device)
+    val2 = value.reshape(BHNC, CS, V)
+    kcd2 = kcd.reshape(BHNC, CS, K)
+
+    _delta_wy_kernel[(BHNC,)](
+        kb2, key2, vb2, dm2, g2, val2, kcd2,
+        kb2.stride(0), key2.stride(0), vb2.stride(0), dm2.stride(0), g2.stride(0),
+        val2.stride(0), kcd2.stride(0),
+        CS=CS, K=K, V=V, BLOCK_K=32,
+        num_warps=4, num_stages=1,
+    )
+    return value, kcd
+
+
+def _torch_wy_prep(k_beta, key, v_beta, decay_mask, g, chunk_size, mask, v_head_dim):
+    """wy_prep 的 torch 版（原路径，作回退与消融基准）。"""
+    if ENABLE_FP16_BMM:
+        attn = -((k_beta.half() @ key.transpose(-1, -2).half()).float() * decay_mask).masked_fill(mask, 0)
+    else:
+        # key 在 cast 缩减路径下是 bf16（k_beta 已因 beta fp32 提升为 fp32），
+        # bmm 要求同类型，显式转 fp32（bf16→fp32 精确，数值不变）
+        attn = -((k_beta @ key.transpose(-1, -2).to(torch.float32)) * decay_mask).masked_fill(mask, 0)
+    if ENABLE_WY_SOLVE:
+        # P8-3: 三角递归 L_new = L + L·L_new 的闭式解 L_new = (I−L)⁻¹L。
+        # attn 为严格下三角 L；I−L 单位下三角，批量三角求解一次完成。
+        eye = torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
+        i_minus_l = eye - attn
+        attn = torch.linalg.solve_triangular(i_minus_l, attn,
+                                             upper=False, unitriangular=True) + eye
+    else:
+        # WY 递归保持 fp32（动态范围大）
+        for i in range(1, chunk_size):
+            row = attn[..., i, :i].clone()
+            sub = attn[..., :i, :i].clone()
+            attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
+        attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
+    if ENABLE_BMM_MERGE:
+        # P8-4a: attn@v_beta 与 attn@(k_beta*exp) 共享左操作数，沿右维拼接一次 bmm
+        rhs = torch.cat([v_beta, k_beta * g.exp().unsqueeze(-1)], dim=-1)
+        if ENABLE_FP16_BMM:
+            merged = (attn.half() @ rhs.half()).float()
+        else:
+            merged = attn @ rhs
+        value = merged[..., :v_head_dim]
+        k_cumdecay = merged[..., v_head_dim:]
+    else:
+        if ENABLE_FP16_BMM:
+            value = (attn.half() @ v_beta.half()).float()
+            k_cumdecay = (attn.half() @ (k_beta * g.exp().unsqueeze(-1)).half()).float()
+        else:
+            value = attn @ v_beta
+            k_cumdecay = attn @ (k_beta * g.exp().unsqueeze(-1))
+    return value, k_cumdecay
 
 
 def _triton_chunk_loop(query, key, value, k_cumdecay, decay_mask, g,
