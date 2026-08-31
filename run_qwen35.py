@@ -31,15 +31,13 @@ def main():
     parser.add_argument("--inference-quant-mode", type=str, default="wxa16",
                         choices=["wxa16", "wxa8"],
                         help="推理量化模式：wxa16 (FP16 激活+FP16 计算，默认) / "
-                             "wxa8 (INT8 激活+INT8 Tensor Core)。WxA8 暂未实现。")
+                             "wxa8 (INT8 激活+INT8 Tensor Core，MoE 部分；"
+                             "attention 保持 W8A16 直到 P3)")
     parser.add_argument("--save-quantized", type=str, default=None, help="Save quantized checkpoint (packed format) to this directory after quantization")
     parser.add_argument("--eval-batch-size", type=int, default=32, help="Batch size for normal (non-sequential) PPL evaluation")
     parser.add_argument("--load-quantized", type=str, default=None, help="Load quantized checkpoint from this directory, skip calibration & quantization, directly run PPL eval")
 
     args = parser.parse_args()
-
-    if args.inference_quant_mode == 'wxa8':
-        raise NotImplementedError("WxA8 推理模式尚未实现，敬请期待。详见 roadmaps/wxa8-plan-260829.md")
 
     assert not (args.save_quantized and args.load_quantized), \
         "save-quantized 与 load-quantized 不能同时使用"
@@ -82,7 +80,8 @@ def main():
         from qwen35_quant_io import load_quantized_model
         from eval_qwen35 import run_ppl_evaluation
         model, tokenizer = load_quantized_model(
-            args.model, args.load_quantized, standby_cpu=args.standby_layer_cpu
+            args.model, args.load_quantized, standby_cpu=args.standby_layer_cpu,
+            inference_quant_mode=args.inference_quant_mode,
         )
         print("\nStarting PPL evaluation...")
         run_ppl_evaluation(model, tokenizer, args)
@@ -108,6 +107,12 @@ def main():
             model, tokenizer, dataloader, args, test_ppl=True,
             save_quantized_dir=args.save_quantized
         )
+
+    if args.inference_quant_mode == "wxa8":
+        print("(Note: --inference-quant-mode wxa8 在 load 路径生效 —— "
+              "量化保存后用 "
+              "`python eval_qwen35.py --load-quantized <dir> --inference-quant-mode wxa8` "
+              "评测，本次内存内评测仍走 wxa16)")
 
     print(f"\nFinish time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}")
 

@@ -377,8 +377,29 @@ def restore_quant_metadata(model, meta: dict, state_dict: dict = None):
     return model
 
 
+def convert_model_to_wxa8(model):
+    """把已加载的 WxA16 模型原地切到 WxA8 推理路径。
+
+    WxA8 的 packed 存储格式与 WxA16 完全相同（checkpoint 通用），码本转
+    INT8 是加载期算的，所以这里只换 __class__，零张量拷贝、零显存增长。
+
+    当前只切 MoE（WxA8BitPartitionedGroupMoE）；attention 的 WxA16Linear
+    要等 P3 的均匀码本改造之后才有 WxA8Linear，在此之前保持 W8A16。
+    """
+    from quantization.wxa8 import WxA8BitPartitionedGroupMoE
+
+    n = 0
+    for sub in model.modules():
+        if isinstance(sub, WxA16BitPartitionedGroupMoE):
+            WxA8BitPartitionedGroupMoE.from_wxa16(sub)
+            n += 1
+    print(f"Converted {n} MoE layers to WxA8 (attention linears stay W8A16 until P3)")
+    return model
+
+
 def load_quantized_model(base_model_path: str = None, quant_dir: str = None,
-                         standby_cpu: bool = False, seqlen: int = 2048):
+                         standby_cpu: bool = False, seqlen: int = 2048,
+                         inference_quant_mode: str = "wxa16"):
     """加载已量化的 checkpoint，跳过校准与现场量化。
 
     Args:
@@ -387,6 +408,8 @@ def load_quantized_model(base_model_path: str = None, quant_dir: str = None,
         quant_dir: 保存目录（含 model.safetensors + meta.json）
         standby_cpu: 加载后保持 CPU（逐层搬移的 sequential eval 用）
         seqlen: 模型序列长度（与原加载路径一致，固定 2048）
+        inference_quant_mode: "wxa16"（默认）或 "wxa8"。wxa8 在 restore 后
+            把 MoE 原地切到 INT8 激活路径（checkpoint 本身不变）
     """
     if base_model_path is None:
         # 优先从 meta.json 读 base_model 路径（旧 checkpoint 没拷 tokenizer 时也能用）
@@ -425,6 +448,13 @@ def load_quantized_model(base_model_path: str = None, quant_dir: str = None,
     print(f"Loaded {len(sd)} tensors in {time.time() - tick0:.2f}s")
 
     restore_quant_metadata(model, meta, sd)
+
+    # WxA8 推理模式：MoE 原地切到 INT8 激活路径（checkpoint 格式不变，
+    # 同一份 2bpw checkpoint 可同时跑 wxa16 / wxa8）
+    if inference_quant_mode == "wxa8":
+        convert_model_to_wxa8(model)
+    elif inference_quant_mode != "wxa16":
+        raise ValueError(f"未知 inference_quant_mode: {inference_quant_mode}")
 
     del sd
     gc.collect()

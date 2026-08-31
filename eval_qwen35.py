@@ -550,12 +550,10 @@ def main():
     parser.add_argument('--inference-quant-mode', type=str, default='wxa16',
                         choices=['wxa16', 'wxa8'],
                         help="推理量化模式：wxa16 (FP16 激活+FP16 计算，默认) / "
-                             "wxa8 (INT8 激活+INT8 Tensor Core)。WxA8 暂未实现。")
+                             "wxa8 (INT8 激活+INT8 Tensor Core，MoE 部分；"
+                             "attention 保持 W8A16 直到 P3)")
 
     args = parser.parse_args()
-
-    if args.inference_quant_mode == 'wxa8':
-        raise NotImplementedError("WxA8 推理模式尚未实现，敬请期待。详见 roadmaps/wxa8-plan-260829.md")
 
     # 自动判断：单位置参数若为量化目录，则等价于 --load-quantized
     if args.model and not args.load_quantized and _is_quant_dir(args.model):
@@ -570,6 +568,7 @@ def main():
     print(f"Git HEAD: {git_hash}")
     if args.load_quantized:
         print(f"Quantized checkpoint: {args.load_quantized}")
+        print(f"Inference quant mode: {args.inference_quant_mode}")
         if args.model:
             print(f"Base model (config/tokenizer): {args.model}")
     else:
@@ -582,8 +581,9 @@ def main():
     if args.load_quantized:
         print("\nLoading quantized checkpoint (skip fp16 model loading)...")
         from qwen35_quant_io import load_quantized_model
-        model, tokenizer = load_quantized_model(args.model, args.load_quantized,
-                                                standby_cpu=args.standby_cpu)
+        model, tokenizer = load_quantized_model(
+            args.model, args.load_quantized, standby_cpu=args.standby_cpu,
+            inference_quant_mode=args.inference_quant_mode)
     else:
         print("\nLoading model...")
         model, tokenizer = load_model(args.model, standby_cpu=args.standby_cpu)

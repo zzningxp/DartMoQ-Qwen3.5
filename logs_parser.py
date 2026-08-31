@@ -46,6 +46,8 @@ EVAL_DATASETS_RE = re.compile(r"^Datasets:\s+(?P<datasets>.+)")
 EVAL_SEQUENTIAL_RE = re.compile(r"^Sequential eval:\s+(?P<sequential>\S+)")
 EVAL_STANDBY_CPU_RE = re.compile(r"^Standby CPU:\s+(?P<standby_cpu>\S+)")
 EVAL_LOAD_QUANTIZED_RE = re.compile(r"^Load quantized checkpoint:\s+(?P<path>\S+)")
+# WxA8 推理模式（eval_qwen35.py 打印，位于 Quantized checkpoint 之后）
+EVAL_INFERENCE_QUANT_MODE_RE = re.compile(r"^Inference quant mode:\s+(?P<mode>\S+)")
 
 # Old log format patterns (for backward compatibility)
 LOADING_RE = re.compile(r"Loading model:\s*\(ppl\)\s*(?P<path>\S+)")
@@ -320,6 +322,14 @@ def parse_log(path: str) -> list[RunRecord]:
                     current.model_name = _last_path_component(qpath)
                     current.wxa16_real_quant = "Yes"
                     current.quantmode = "wxa16_load"
+                    continue
+
+                # 推理量化模式：wxa8 覆盖默认的 wxa16_load 标记
+                # （Quantized checkpoint 行之后打印，见 eval_qwen35.py）
+                eval_inf_mode_match = EVAL_INFERENCE_QUANT_MODE_RE.search(line)
+                if eval_inf_mode_match:
+                    mode = eval_inf_mode_match.group("mode")
+                    current.quantmode = f"{mode}_load"
                     continue
 
                 # Eval uses the same PPL format

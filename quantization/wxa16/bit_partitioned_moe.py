@@ -620,6 +620,94 @@ class WxA16BitPartitionedGroupMoE(nn.Module):
         _ = self.forward(dummy)
         torch.cuda.synchronize()
 
+    def _gate_up_matmul(self, ctx, bit, bit_str, x, x_rot_by_bit,
+                        exp_token_idx, expert_tokens, start, end, prof):
+        """gate_up 方向的量化 matmul（含激活 gather）。
+
+        抽成独立方法只为让 WxA8 子类覆盖这一处，不必复制整个 forward
+        （见 quantization/wxa8/bit_partitioned_moe.py）。逻辑与抽取前逐字一致。
+
+        Returns:
+            (gate_up_out, expert_tokens) —— expert_tokens 是懒 gather 的缓存，
+            可能在本次调用中才被填充，需要回传给调用方在同 expert 的后续 bit 复用。
+        """
+        gate_up_packed = ctx["gate_up"]
+        if ctx["gf_gate_up"]:
+            # P5-1: Group-First 布局，memory coalescing 更优
+            # P6-1: 该 bit 若已整体预旋转，直接按 token 索引切片，kernel 内跳过旋转
+            x_rot_b = x_rot_by_bit.get(bit_str)
+            if x_rot_b is not None:
+                with prof.stage("gather_rotated"):
+                    gate_up_inp = x_rot_b[exp_token_idx]
+            else:
+                if expert_tokens is None:
+                    with prof.stage("gather_x"):
+                        expert_tokens = x[exp_token_idx]
+                gate_up_inp = expert_tokens
+
+            with prof.stage("gate_up_kernel"):
+                gate_up_out = triton_fused_matmul_grouped_slice_rows_gf(
+                    gate_up_inp,
+                    gate_up_packed["indices_packed_gf"],
+                    ctx["gate_up_codebook"],
+                    gate_up_packed["norms_gf"],
+                    ctx["gate_up_seed"],
+                    ctx["gate_up_group_size"],
+                    ctx["gate_up_in_features"],
+                    2 * start, 2 * end,  # row slice
+                    bit,
+                    x_is_rotated=(x_rot_b is not None),
+                    norms_prescaled=ctx["gate_up_norms_prescaled"],
+                )
+            del gate_up_inp
+        else:
+            if expert_tokens is None:
+                with prof.stage("gather_x"):
+                    expert_tokens = x[exp_token_idx]
+            with prof.stage("gate_up_kernel"):
+                gate_up_out = triton_fused_matmul_grouped_slice_rows(
+                    expert_tokens,
+                    gate_up_packed["indices_packed"],
+                    ctx["gate_up_codebook"],
+                    gate_up_packed["norms"],
+                    ctx["gate_up_seed"],
+                    ctx["gate_up_group_size"],
+                    ctx["gate_up_in_features"],
+                    2 * start, 2 * end,  # row slice
+                    bit
+                )
+        return gate_up_out, expert_tokens
+
+    def _down_matmul(self, ctx, bit, act_out, start, end, prof):
+        """down 方向的量化 matmul。WxA8 子类覆盖此方法。逻辑与抽取前逐字一致。"""
+        down_packed = ctx["down"]
+        with prof.stage("down_kernel"):
+            if ctx["gf_down"]:
+                # P5-1: Group-First 布局，in_features 切片整块连续
+                return triton_fused_matmul_grouped_slice_in_features_gf(
+                    act_out,
+                    down_packed["indices_packed_gf"],
+                    ctx["down_codebook"],
+                    down_packed["norms_gf"],
+                    ctx["down_seed"],
+                    ctx["down_group_size"],
+                    start, end,  # original_start, original_end
+                    ctx["down_in_features"],
+                    bit,
+                    norms_prescaled=ctx["down_norms_prescaled"],
+                )
+            return triton_fused_matmul_grouped_slice_in_features(
+                act_out,
+                down_packed["indices_packed"],
+                ctx["down_codebook"],
+                down_packed["norms"],
+                ctx["down_seed"],
+                ctx["down_group_size"],
+                start, end,  # original_start, original_end
+                ctx["down_in_features"],
+                bit
+            )
+
     @torch.no_grad()
     def forward(self, hidden_states):
         """
@@ -756,54 +844,12 @@ class WxA16BitPartitionedGroupMoE(nn.Module):
                 actual_inter_size = end - start
                 ctx = bit_ctx[bit_str]
 
-                # ========== WxA16: Triton Fused + 部分反量化 ==========
-
-                # 使用 Triton Fused Kernel 处理 gate_up
-                gate_up_packed = ctx["gate_up"]
-                if ctx["gf_gate_up"]:
-                    # P5-1: Group-First 布局，memory coalescing 更优
-                    # P6-1: 该 bit 若已整体预旋转，直接按 token 索引切片，kernel 内跳过旋转
-                    x_rot_b = x_rot_by_bit.get(bit_str)
-                    if x_rot_b is not None:
-                        with prof.stage("gather_rotated"):
-                            gate_up_inp = x_rot_b[exp_token_idx]
-                    else:
-                        if expert_tokens is None:
-                            with prof.stage("gather_x"):
-                                expert_tokens = x[exp_token_idx]
-                        gate_up_inp = expert_tokens
-
-                    with prof.stage("gate_up_kernel"):
-                        gate_up_out = triton_fused_matmul_grouped_slice_rows_gf(
-                            gate_up_inp,
-                            gate_up_packed["indices_packed_gf"],
-                            ctx["gate_up_codebook"],
-                            gate_up_packed["norms_gf"],
-                            ctx["gate_up_seed"],
-                            ctx["gate_up_group_size"],
-                            ctx["gate_up_in_features"],
-                            2*start, 2*end,  # row slice
-                            bit,
-                            x_is_rotated=(x_rot_b is not None),
-                            norms_prescaled=ctx["gate_up_norms_prescaled"],
-                        )
-                    del gate_up_inp
-                else:
-                    if expert_tokens is None:
-                        with prof.stage("gather_x"):
-                            expert_tokens = x[exp_token_idx]
-                    with prof.stage("gate_up_kernel"):
-                        gate_up_out = triton_fused_matmul_grouped_slice_rows(
-                            expert_tokens,
-                            gate_up_packed["indices_packed"],
-                            ctx["gate_up_codebook"],
-                            gate_up_packed["norms"],
-                            ctx["gate_up_seed"],
-                            ctx["gate_up_group_size"],
-                            ctx["gate_up_in_features"],
-                            2*start, 2*end,  # row slice
-                            bit
-                        )
+                # ========== 量化 matmul：gate_up → silu*up → down ==========
+                # 两个 matmul 抽成方法，WxA8 子类只覆盖这两处
+                gate_up_out, expert_tokens = self._gate_up_matmul(
+                    ctx, bit, bit_str, x, x_rot_by_bit,
+                    exp_token_idx, expert_tokens, start, end, prof,
+                )
 
                 with prof.stage("silu_mul"):
                     gate_out = gate_up_out[:, :actual_inter_size]
@@ -813,35 +859,7 @@ class WxA16BitPartitionedGroupMoE(nn.Module):
                     act_out = F.silu(gate_out) * up_out
                     del gate_out, up_out
 
-                # 使用 Triton Fused Kernel 处理 down (in_features slicing)
-                down_packed = ctx["down"]
-                with prof.stage("down_kernel"):
-                    if ctx["gf_down"]:
-                        # P5-1: Group-First 布局，in_features 切片整块连续
-                        down_out = triton_fused_matmul_grouped_slice_in_features_gf(
-                            act_out,
-                            down_packed["indices_packed_gf"],
-                            ctx["down_codebook"],
-                            down_packed["norms_gf"],
-                            ctx["down_seed"],
-                            ctx["down_group_size"],
-                            start, end,  # original_start, original_end
-                            ctx["down_in_features"],
-                            bit,
-                            norms_prescaled=ctx["down_norms_prescaled"],
-                        )
-                    else:
-                        down_out = triton_fused_matmul_grouped_slice_in_features(
-                            act_out,
-                            down_packed["indices_packed"],
-                            ctx["down_codebook"],
-                            down_packed["norms"],
-                            ctx["down_seed"],
-                            ctx["down_group_size"],
-                            start, end,  # original_start, original_end
-                            ctx["down_in_features"],
-                            bit
-                        )
+                down_out = self._down_matmul(ctx, bit, act_out, start, end, prof)
                 del act_out
 
                 # P6-2: 首个活跃 bit 直接接管输出，避免 zeros_like 预分配

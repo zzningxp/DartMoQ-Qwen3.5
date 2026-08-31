@@ -85,9 +85,12 @@ python run_qwen35.py $model_path wikitext2 \
 # WxA16（默认，FP16 激活 + FP16 计算）
 python eval_qwen35.py --load-quantized ./quant_ckpt --inference-quant-mode wxa16
 
-# WxA8（INT8 激活 + INT8 Tensor Core，暂未实现）
+# WxA8（INT8 激活 + INT8 Tensor Core，MoE 部分；attention 保持 W8A16 直到 P3）
 python eval_qwen35.py --load-quantized ./quant_ckpt --inference-quant-mode wxa8
 ```
+
+WxA8 与 WxA16 共用同一份 packed checkpoint（码本转 INT8 是加载期算的），
+`--load-quantized` 加载后 `qwen35_quant_io.convert_model_to_wxa8` 原地切换，零拷贝。
 
 ## 路线图
 
@@ -100,5 +103,8 @@ python eval_qwen35.py --load-quantized ./quant_ckpt --inference-quant-mode wxa8
   - 详细优化记录详见 [roadmaps/wxa16-optimization-backlog-260824.md](roadmaps/wxa16-optimization-backlog-260824.md)
 
 - **WxA8** 🚧 进行中（INT8 激活 + INT8 Tensor Core + INT32 累加）
+  - MoE 全路径已落地：融合 kernel（kernel 级 1.52x）+ rotate-quantize 融合
+    （18.75x）+ 加载接线（`--inference-quant-mode wxa8`）
+  - attention 均匀码本改造 + WxA8Linear 待做（P3）
   - 详见 [roadmaps/wxa8-plan-260829.md](roadmaps/wxa8-plan-260829.md)
 - **WxA4** 🔮 规划中（WGMMA int4，需 Machete 库或 CUTLASS）
