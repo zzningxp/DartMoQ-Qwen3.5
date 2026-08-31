@@ -515,7 +515,7 @@ def write_csv(records: list[RunRecord], out) -> None:
 
 
 DISPLAY_FIELDS = [
-    "git_hash", "model_name", "slices", "quant_scheme", "rank_mode", "quantmode", "quant_layers", "wxa16_real_quant", "bpw",
+    "git_hash", "model_name", "slices", "quant_scheme", "rank_mode", "quantmode", "quant_layers", "bpw",
     "ppl_wikitext2", "ppl_c4",
     "status",
     "runtime_ppl", "runtime_quant", "runtime_ppl_eval", "runtime_ppl_wikitext2", "runtime_ppl_c4", "error",
@@ -531,7 +531,6 @@ PLAIN_HEADERS = {
     "disable_0bit_prune": "no0prune",
     "standby_layer_cpu": "stdbycpu",
     "quant_layers": "qlayers",
-    "wxa16_real_quant": "wxa16",
     "git_hash": "git",
     "bpw": "bpw",
     "ppl_wikitext2": "wiki",
