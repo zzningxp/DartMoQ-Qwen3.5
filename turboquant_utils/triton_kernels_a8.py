@@ -54,6 +54,7 @@ def _wxa8_fused_matmul_kernel_grouped_gf(
     NUM_GROUPS: tl.constexpr,
     BIT_WIDTH: tl.constexpr,
     N_LEVELS: tl.constexpr,
+    IDENTITY_CB: tl.constexpr = False,
     BLOCK_B: tl.constexpr = 256,
     BLOCK_N: tl.constexpr = 32,
     BLOCK_K: tl.constexpr = 128,
@@ -64,6 +65,10 @@ def _wxa8_fused_matmul_kernel_grouped_gf(
     起点），kernel 内 g 从 0 到 NUM_GROUPS-1，通过 *_G0_STRIDE 算每个 group 基址。
     xs_ptr 则指向完整的 (B, NUM_GROUPS_TOTAL) 起点 —— down 路径下 x 已经是
     切片后的输入，其 scale 也是按切片后的 group 数排布的，故两者一致。
+
+    IDENTITY_CB（仅 BIT_WIDTH==8）：均匀码本下 indices 直接就是 int8 权重
+    （w_i8 = idx - 128），免查表 —— attention 路径用。此时 codebook_ptr 不会被
+    访问（调用方仍须传一个合法指针，可传占位张量）。
     """
     pid_b = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -111,7 +116,12 @@ def _wxa8_fused_matmul_kernel_grouped_gf(
                 packed = tl.load(indices_ptr + byte_off, mask=w_mask, other=0).to(tl.uint8)
                 shift = pos_in_byte * BIT_WIDTH
                 idx = ((packed >> shift[None, :]) & BIT_MASK).to(tl.int32)
-            w_i8 = tl.load(codebook_ptr + idx, mask=w_mask, other=0)
+
+            if IDENTITY_CB:
+                # 均匀码本：w_i8 = idx - 128（indices 就是 int8 权重，免查表）
+                w_i8 = (idx - 128).to(tl.int8)
+            else:
+                w_i8 = tl.load(codebook_ptr + idx, mask=w_mask, other=0)
 
             acc_i += tl.dot(x_tile, tl.trans(w_i8), out_dtype=tl.int32)
 
@@ -175,6 +185,17 @@ _WXA8_CONFIG_DOWN = {
     },
 }
 
+# attention 方向（完整矩阵无切片，8-bit 均匀码本 IDENTITY_CB 免查表）
+# 扫描: /tmp/sweep_attn.py（B=16384, qkv N=4096 K=2048 / o N=2048 K=4096）
+_WXA8_CONFIG_ATTN = {
+    "small": {
+        8: (64, 128, 128, 8, 3),   # 未单独扫描，按 large 档缩小 BLOCK_B 保守取值
+    },
+    "large": {
+        8: (128, 128, 128, 8, 3),  # 649.6us / 659.6us, ~420 TOP/s（两形状一致）
+    },
+}
+
 # B 自适应阈值，与 WxA16 保持一致（triton_kernels.py:_B_THRESHOLD_SMALL）
 _B_THRESHOLD_SMALL = 256
 
@@ -185,8 +206,16 @@ _WXA8_DEFAULT_CONFIG = (64, 32, 128, 4, 2)
 
 
 def get_wxa8_config(bit_width: int, direction: str = "gate_up", B: int | None = None):
-    """取指定 bit-width / 方向 / B 档位的最优 INT8 tile 配置。"""
-    table = _WXA8_CONFIG_DOWN if direction == "down" else _WXA8_CONFIG_GATE_UP
+    """取指定 bit-width / 方向 / B 档位的最优 INT8 tile 配置。
+
+    direction: "gate_up" / "down"（MoE 切片路径）/ "attn"（完整矩阵）
+    """
+    if direction == "attn":
+        table = _WXA8_CONFIG_ATTN
+    elif direction == "down":
+        table = _WXA8_CONFIG_DOWN
+    else:
+        table = _WXA8_CONFIG_GATE_UP
     size_key = "small" if (B is not None and B <= _B_THRESHOLD_SMALL) else "large"
     return table[size_key].get(bit_width, _WXA8_DEFAULT_CONFIG)
 
@@ -396,15 +425,17 @@ def build_int8_codebook(codebook: torch.Tensor):
 # ===========================================================================
 
 def _launch(x_i8, x_scale, indices_slice, cb_i8, norms_slice,
-            group_size, num_groups, bit_width, direction):
+            group_size, num_groups, bit_width, direction,
+            identity_cb=False, cfg=None):
     B = x_i8.shape[0]
     N = indices_slice.shape[1]
     K_total = x_i8.shape[1]
 
     out = torch.empty(B, N, dtype=torch.float16, device=x_i8.device)
 
-    BLOCK_B, BLOCK_N, BLOCK_K, num_warps, num_stages = get_wxa8_config(
-        bit_width, direction=direction, B=B)
+    BLOCK_B, BLOCK_N, BLOCK_K, num_warps, num_stages = (
+        cfg if cfg is not None
+        else get_wxa8_config(bit_width, direction=direction, B=B))
 
     grid = (triton.cdiv(B, BLOCK_B), triton.cdiv(N, BLOCK_N))
     _wxa8_fused_matmul_kernel_grouped_gf[grid](
@@ -413,6 +444,7 @@ def _launch(x_i8, x_scale, indices_slice, cb_i8, norms_slice,
         indices_slice.stride(0), norms_slice.stride(0), x_scale.stride(0),
         GROUP_SIZE=group_size, NUM_GROUPS=num_groups,
         BIT_WIDTH=bit_width, N_LEVELS=cb_i8.shape[0],
+        IDENTITY_CB=identity_cb,
         BLOCK_B=BLOCK_B, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
         num_warps=num_warps, num_stages=num_stages,
     )
@@ -505,4 +537,36 @@ def wxa8_matmul_grouped_slice_in_features_gf(
         codebook_i8,
         norms_slice,
         group_size, g_end - g_start, bit_width, "down",
+    )
+
+
+def wxa8_matmul_grouped_gf(
+    x_i8, x_scale, indices_packed_gf, codebook_i8, norms_gf,
+    group_size, num_groups, bit_width: int = 8,
+    identity_cb: bool = False, cfg=None,
+):
+    """attention 路径：完整矩阵（无切片）。
+
+    对应 WxA16 的 triton_fused_matmul_grouped（gf 布局变体），输入已经
+    旋转 + 量化（调用方用 rotate_quantize_fused 做，cb_step 折进 x_scale）。
+
+    identity_cb=True（8-bit 均匀码本）时 codebook_i8 不被访问，传任意
+    形状为 (256,) 的 int8 占位张量即可。
+
+    Args:
+        x_i8: (B, K_total) int8
+        x_scale: (B, num_groups) fp32
+        indices_packed_gf: (num_groups, N, packed_per_group) uint8
+        codebook_i8: (n_levels,) int8（identity_cb 时为占位）
+        norms_gf: (num_groups, N) fp16，需已预乘 1/sqrt(group_size)
+
+    Returns:
+        output: (B, N) fp16
+    """
+    if bit_width not in {1, 2, 4, 8}:
+        raise ValueError(f"bit_width must be 1/2/4/8, got {bit_width}")
+    return _launch(
+        x_i8, x_scale, indices_packed_gf, codebook_i8, norms_gf,
+        group_size, num_groups, bit_width, "attn",
+        identity_cb=identity_cb, cfg=cfg,
     )

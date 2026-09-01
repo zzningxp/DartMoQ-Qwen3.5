@@ -4,5 +4,6 @@
 """
 
 from .bit_partitioned_moe import WxA8BitPartitionedGroupMoE
+from .linear import WxA8Linear
 
-__all__ = ["WxA8BitPartitionedGroupMoE"]
+__all__ = ["WxA8BitPartitionedGroupMoE", "WxA8Linear"]

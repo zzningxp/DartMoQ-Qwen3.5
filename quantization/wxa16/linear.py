@@ -49,6 +49,7 @@ class WxA16Linear(nn.Module):
         rotation: str = "qr",
         bias = None,
         orig_dtype: torch.dtype = torch.float16,
+        codebook_type: str = "lloydmax",
     ):
         super().__init__()
 
@@ -59,6 +60,9 @@ class WxA16Linear(nn.Module):
         self.seed = seed
         self.rotation = rotation
         self.orig_dtype = orig_dtype
+        # "uniform"（WxA8 attention 用，indices 可直接映射为 int8 权重）
+        # 或 "lloydmax"（默认，WxA16 传统码本）
+        self.codebook_type = codebook_type
 
         # 存储量化参数 (注册为 buffers 以便 state_dict 保存)
         self.register_buffer("packed_indices", packed_indices)
@@ -87,6 +91,7 @@ class WxA16Linear(nn.Module):
         seed: int = 42,
         rotation: str = "qr",
         keep_on_gpu: bool = True,
+        uniform_codebook: bool = False,
     ) -> "WxA16Linear":
         """
         从 nn.Linear 量化转换为 WxA16Linear。
@@ -98,6 +103,8 @@ class WxA16Linear(nn.Module):
             seed: 随机种子
             rotation: 旋转类型
             keep_on_gpu: 是否保持在 GPU
+            uniform_codebook: 仅 bit_width==8 有效，均匀码本（WxA8 attention 用，
+                见 turboquant_quantize_packed_full 的说明）
 
         Returns:
             WxA16Linear 实例
@@ -113,6 +120,7 @@ class WxA16Linear(nn.Module):
             seed=seed,
             rotation=rotation,
             keep_on_gpu=keep_on_gpu,
+            uniform_codebook=uniform_codebook,
         )
 
         # 处理 bias
@@ -131,6 +139,7 @@ class WxA16Linear(nn.Module):
             rotation=rotation,
             bias=bias,
             orig_dtype=linear.weight.dtype,
+            codebook_type=packed_data["codebook_type"],
         )
 
     @classmethod
@@ -153,6 +162,7 @@ class WxA16Linear(nn.Module):
             rotation=meta["rotation"],
             bias=torch.empty(meta["bias_shape"], dtype=torch.float16) if meta.get("has_bias", False) else None,
             orig_dtype=_parse_dtype_str(meta["orig_dtype"]),
+            codebook_type=meta.get("codebook_type", "lloydmax"),
         )
 
     @torch.no_grad()
@@ -188,8 +198,9 @@ class WxA16Linear(nn.Module):
             norms_g = norms[:, group_idx].unsqueeze(1)
             group_idx += 1
 
-            # 从码本还原
-            Y_quant_scaled = codebook[indices_g]
+            # 从码本还原（float：码本存 fp16，但旋转矩阵 Pi 是 fp32，
+            # 直接 fp16 @ fp32 会 dtype 不匹配；反量化本就不走 kernel，用 fp32 更准）
+            Y_quant_scaled = codebook[indices_g].float()
 
             # 逆缩放
             scale = math.sqrt(g_dim)
@@ -302,6 +313,11 @@ class WxA16Linear(nn.Module):
 class W8A16Linear(WxA16Linear):
     """
     专用 W8A16 版本，对 8-bit 有潜在优化。
+
+    默认 uniform_codebook=True：均匀码本让 indices 可以直接映射为 int8 权重
+    （w_i8 = idx - 128），WxA8 attention 路径的 kernel 免查表。
+    旧 checkpoint（Lloyd-Max 码本）加载不受影响 —— 加载路径走 from_metadata，
+    codebook_type 从 meta.json 恢复；转换 WxA8 时会按码本类型判定。
     """
 
     @classmethod
@@ -313,6 +329,7 @@ class W8A16Linear(WxA16Linear):
         seed: int = 42,
         rotation: str = "qr",
         keep_on_gpu: bool = True,
+        uniform_codebook: bool = True,
     ) -> "W8A16Linear":
         return super().from_linear(
             linear,
@@ -321,4 +338,5 @@ class W8A16Linear(WxA16Linear):
             seed=seed,
             rotation=rotation,
             keep_on_gpu=keep_on_gpu,
+            uniform_codebook=uniform_codebook,
         )

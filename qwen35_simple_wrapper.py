@@ -74,8 +74,10 @@ def construct_moe(model, moe_model_flag, layer, layer_idx, inp,
     import inspect
     from grouped_gemm_moe_adapter import convert_single_layer, is_grouped_gemm_moe_layer
 
-    # WxA16 flag
-    use_wxa16 = getattr(args, 'wxa16', False)
+    # WxA16 真量化开关：--wxa16 显式开启，或 --save-quantized 隐含开启
+    # （要保存 packed checkpoint 必然是真量化路径；只 --save-quantized 不加
+    # --wxa16 时会量化成原始 fp16 直接写盘 ~70GB 报 ENOSPC，2026-09-01 实踩）
+    use_wxa16 = getattr(args, 'wxa16', False) or bool(getattr(args, 'save_quantized', None))
 
     # Convert this single layer first if needed
     if is_grouped_gemm_moe_layer(layer):
@@ -599,6 +601,12 @@ def dartmoq_quant_grouped_gemm_moe(model, tokenizer, dataloader, args, test_ppl=
         )
 
     if test_ppl:
+        # 量化后的内存内 eval 也尊重 --inference-quant-mode：
+        # wxa8 时先原地切换（checkpoint 已在上方保存为 WxA16 格式，不受影响），
+        # 与 load 路径的 `load_quantized_model(inference_quant_mode="wxa8")` 语义一致
+        if getattr(args, 'inference_quant_mode', 'wxa16') == 'wxa8':
+            from qwen35_quant_io import convert_model_to_wxa8
+            convert_model_to_wxa8(model)
         print("\nEvaluating perplexity...")
         run_ppl_evaluation(model, tokenizer, args)
 

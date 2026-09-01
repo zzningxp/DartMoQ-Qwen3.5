@@ -27,7 +27,9 @@ def main():
     parser.add_argument("--sequential-eval", action="store_true", default=False, help="Use sequential PPL evaluation")
     parser.add_argument("--quantmode", type=str, default="turboquant", choices=["gptq", "turboquant"], help="Quantization mode")
     parser.add_argument("--quant-layers", type=str, default=None, help="Only quantize specific layers (e.g., '0-5,8,10' for layers 0-5, 8, and 10; default: all layers)")
-    parser.add_argument("--wxa16", action="store_true", default=False, help="Use WxA16 real quantization (stored packed format, not fake quant)")
+    parser.add_argument("--wxa16", action="store_true", default=False,
+                        help="Use WxA16 real quantization (stored packed format, not fake quant). "
+                             "--save-quantized 时自动启用，无需重复指定")
     parser.add_argument("--inference-quant-mode", type=str, default="wxa16",
                         choices=["wxa16", "wxa8"],
                         help="推理量化模式：wxa16 (FP16 激活+FP16 计算，默认) / "
@@ -60,7 +62,8 @@ def main():
     print(f"Slices per expert: {args.slices}")
     print(f"Hybrid MoE: Yes (always enabled)")
     print(f"Quant mode: {args.quantmode}")
-    print(f"WxA16 real quantization: {'Yes' if args.wxa16 else 'No (fake quant)'}")
+    print(f"WxA16 real quantization: "
+          f"{'Yes' if (args.wxa16 or args.save_quantized) else 'No (fake quant)'}")
     print(f"Inference quant mode: {args.inference_quant_mode}")
     print(f"CPU standby: {'Yes' if args.standby_layer_cpu else 'No'}")
     if args.save_quantized:
@@ -107,12 +110,6 @@ def main():
             model, tokenizer, dataloader, args, test_ppl=True,
             save_quantized_dir=args.save_quantized
         )
-
-    if args.inference_quant_mode == "wxa8":
-        print("(Note: --inference-quant-mode wxa8 在 load 路径生效 —— "
-              "量化保存后用 "
-              "`python eval_qwen35.py --load-quantized <dir> --inference-quant-mode wxa8` "
-              "评测，本次内存内评测仍走 wxa16)")
 
     print(f"\nFinish time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}")
 

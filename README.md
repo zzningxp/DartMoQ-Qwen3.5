@@ -5,7 +5,7 @@
 Triton kernel 量化推理支持两种精度模式（共用同一份 packed checkpoint）：
 
 - **WxA16** ✅：FP16 激活张量 + FP16 Tensor Core，支持 w1a16/w2a16/w4a16/w8a16 混合精度权重
-- **WxA8** 🚧：INT8 激活张量 + INT8 Tensor Core（MoE 部分已落地，attention 待 P3）
+- **WxA8** ✅：INT8 激活张量 + INT8 Tensor Core（MoE + attention 全路径）
 - WxA4（WGMMA int4）规划中
 
 ## 核心特性
@@ -34,12 +34,15 @@ Triton kernel 量化推理支持两种精度模式（共用同一份 packed chec
 | wikitext2（145 samples） | 90.05 s | **57.52 s** | **35.6% 更快** | 7.7944（持平） |
 | c4（256 samples） | 114.7 s | **88.36 s** | **23.0% 更快** | 11.268（持平） |
 
-> WxA8 vs WxA16（同一 checkpoint 同机四组对照，2026-08-30）
+> WxA8 vs WxA16（同一机器对照，2026-08-30 ~ 09-01，sequential eval）
 
-| 数据集 | WxA16 | WxA8 | 加速比 | ppl |
+| 数据集 | WxA16 | WxA8（MoE） | **WxA8（MoE+attention）** | ppl |
 |---|---|---|---|---|
-| wikitext2（145 samples） | 58.18 s | **54.09 s** | **7.0% 更快** | 7.7975（+0.003） |
-| c4（256 samples） | 88.62 s | **82.71 s** | **6.7% 更快** | 11.2717（+0.004） |
+| wikitext2（145 samples） | 58.18 s | 54.09 s | **46.95 s（-19.3%）** | 7.7966（+0.002） |
+| c4（256 samples） | 88.62 s | 82.71 s | **68.79 s（-22.4%）** | 11.265（-0.003，好于 A16） |
+
+MoE 单独贡献 -7.0%/-6.7%，attention 路径贡献 -13.2%/-16.8%。
+WxA8 全路径数字基于 260831-u8 checkpoint（attention 均匀码本，MoE 与 260824 同型）。
 
 > 端到端时间含约 20s 的 PPL 计算开销。MoE 层与 Linear Attention 的相对加速比见各模块说明。
 > ⚠ 首次运行 WxA8 会触发 Triton JIT 编译（逐 expert 形状边跑边编译，端到端可虚增 10%+），
@@ -59,10 +62,11 @@ pip install torch transformers datasets triton
 
 ```
 # 或先量化保存，再单独评测
+# --save-quantized 自动启用真量化路径（packed 落盘），无需再加 --wxa16
 python run_qwen35.py $model_path wikitext2 \
         --nsamples 64 --slices 4 --quant-scheme global-a8s8m2bpw \
         --rank-mode turboquant_innerproduct --quantmode turboquant --standby-layer-cpu \
-        --inference-quant-mode wxa16 --save-quantized ./quant_ckpt 
+        --save-quantized ./quant_ckpt 
 
 python eval_qwen35.py --load-quantized ./quant_ckpt
 
@@ -85,9 +89,9 @@ python eval_qwen35.py /path/to/qwen3.5/model
 ### 3. WxA16 量化 + 评测
 
 ```bash
-# 量化 + 评测（一步完成）
+# 量化 + 评测（一步完成；不落盘时需显式 --wxa16 开真量化）
 python run_qwen35.py $model_path wikitext2 \
-    --inference-quant-mode wxa16 \
+    --wxa16 \
     --nsamples 64 \
     --slices 4 \
     --quant-scheme global-a8s8m2bpw \
@@ -120,14 +124,16 @@ WxA8 与 WxA16 共用同一份 packed checkpoint（码本转 INT8 是加载期�
   - **Linear Attention 深度优化**：chunk delta rule 全路径 Triton 化，包括 pad-skip 跳过、WY 闭式解、cast 缩减、wy_prep 融合、kernel 自动调优等
   - 详细优化记录详见 [roadmaps/wxa16-optimization-backlog-260824.md](roadmaps/wxa16-optimization-backlog-260824.md)
 
-- **WxA8** 🚧 MoE 已落地（INT8 激活 + INT8 Tensor Core + INT32 累加）
+- **WxA8** ✅ MoE + attention 全路径落地（INT8 激活 + INT8 Tensor Core + INT32 累加）
   - **INT8 融合 kernel**：kernel 级 1.52x（gate_up 1.61x / down 1.39x，真实 eval 形状），
     独立 INT8 tile 调优表（与 WxA16 最优点完全不同）
   - **Rotate+Quantize 融合**：分组旋转 + per-token per-group 量化单 kernel，hoist 规模 18.75x
-  - **零格式变更**：码本转 INT8 加载期完成，与 WxA16 共用同一份 2bpw checkpoint，
-    `--inference-quant-mode wxa8` 一键切换
-  - **端到端实测**：wiki -7.0% / c4 -6.7%，ppl 退化 +0.003~+0.004（几乎为零）
-  - 待做：attention 均匀码本改造 + WxA8Linear（P3）；per-expert 循环开销（占 MoE
-    forward wall 约 80%，多 expert 合并 kernel 方向）
+  - **零格式变更**：MoE 码本转 INT8 加载期完成，与 WxA16 共用同一份 packed checkpoint
+  - **attention 路径**：8-bit 均匀码本（indices 即 int8 权重，免查表），
+    kernel 实测 2.63x/2.85x vs WxA16Linear；旧 checkpoint 的 Lloyd-Max 码本
+    自动保持 W8A16（安全阀，静默降级防护）
+  - **端到端实测**：wiki -19.3% / c4 -22.4%（vs WxA16），ppl 基本持平
+    （wiki +0.002 / c4 -0.003）
+  - 待做：per-expert 循环开销（占 MoE forward wall 约 80%，多 expert 合并 kernel 方向）
   - 详见 [roadmaps/wxa8-plan-260829.md](roadmaps/wxa8-plan-260829.md)
 - **WxA4** 🔮 规划中（WGMMA int4，需 Machete 库或 CUTLASS）

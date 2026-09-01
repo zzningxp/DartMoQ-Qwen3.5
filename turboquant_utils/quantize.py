@@ -350,6 +350,7 @@ def turboquant_quantize_packed_full(
     seed: int = 42,
     rotation: str = "qr",
     keep_on_gpu: bool = False,
+    uniform_codebook: bool = False,
 ) -> dict:
     """全功能 TurboQuant 量化并返回打包表示，支持 1/2/4/8 bit。
 
@@ -360,13 +361,22 @@ def turboquant_quantize_packed_full(
         seed: 旋转种子
         rotation: "qr" 或 "hadamard" 或 "none"
         keep_on_gpu: 是否保持在 GPU 上（默认移到 CPU 节省显存）
+        uniform_codebook: 仅 bit_width==8 有效。True 时码本改为均匀网格
+            `cb[i] = (i - 128) * (3.5/128)`，使得 indices 可以直接映射为
+            int8 权重（w_i8 = idx - 128，kernel 免查表）——WxA8 的 attention
+            路径需要这个，因为 256 级 Lloyd-Max 非均匀码本塞进 int8 均匀
+            网格会塌掉 61 级（实测等效约 7.6-bit，relerr 0.0128）。
+            代价：量化误差约 2 倍（Lloyd-Max 8-bit SQNR 48.1 dB →
+            均匀 41.9 dB），且 ±3.5σ 以外的尾部被 clip（约 0.05% 质量）。
 
     Returns:
-        dict 包含完整的量化信息
+        dict 包含完整的量化信息（codebook_type: "uniform" / "lloydmax"）
     """
     supported_bits = {1, 2, 4, 8}
     if bit_width not in supported_bits:
         raise ValueError(f"Only {supported_bits} bits are supported, got {bit_width}")
+    if uniform_codebook and bit_width != 8:
+        raise ValueError(f"uniform_codebook 只支持 bit_width=8，got {bit_width}")
 
     M, N = W.shape
     if group_size is None:
@@ -376,7 +386,18 @@ def turboquant_quantize_packed_full(
     W = W.float()
 
     # 获取码本
-    centroids, boundaries = get_codebook(bit_width)
+    if uniform_codebook:
+        # 均匀网格：cb[i] = (i-128)*step，step = 3.5/128。
+        # cb[0] = -3.5、cb[255] = 127*step，w_i8 = idx-128 恰为 int8 全域。
+        # 覆盖 N(0,1) 的 ±3.5σ（clip 掉约 0.05% 尾部质量）。
+        n_levels = 256
+        step = 3.5 / 128.0
+        centroids = (torch.arange(n_levels, dtype=torch.float32) - 128) * step
+        boundaries = (torch.arange(n_levels - 1, dtype=torch.float32) - 127.5) * step
+        codebook_type = "uniform"
+    else:
+        centroids, boundaries = get_codebook(bit_width)
+        codebook_type = "lloydmax"
     centroids = centroids.to(W.device)
     boundaries = boundaries.to(W.device)
 
@@ -409,7 +430,7 @@ def turboquant_quantize_packed_full(
         scale = math.sqrt(g_dim)
         Y_scaled = Y * scale
 
-        # Step 3: Lloyd-Max 标量量化
+        # Step 3: 标量量化（Lloyd-Max 或均匀码本，共用 searchsorted 边界查找）
         indices = torch.searchsorted(boundaries, Y_scaled.reshape(-1))
         indices = indices.clamp(0, len(centroids) - 1).reshape(M, g_dim)
         all_indices.append(indices)
@@ -438,6 +459,7 @@ def turboquant_quantize_packed_full(
         "bit_width": bit_width,
         "rotation": rotation,
         "orig_dtype": str(orig_dtype),
+        "codebook_type": codebook_type,
     }
 
     return result

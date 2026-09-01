@@ -24,6 +24,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from qwen35_utils import DEV
 from quantization.wxa16.bit_partitioned_moe import WxA16BitPartitionedGroupMoE, WxA16Weights
+from quantization.wxa8.linear import is_uniform_codebook
 from quantization.wxa16.linear import WxA16Linear
 
 
@@ -47,6 +48,9 @@ def _linear_meta(linear: WxA16Linear) -> dict:
         "codebook_shape": list(linear.codebook.shape),
         "norms_shape": list(linear.norms.shape),
         "bias_shape": list(linear.bias.shape) if linear.bias is not None else None,
+        # WxA8 attention 路径判定用：均匀码本才能安全转 int8（旧 checkpoint 无此
+        # 字段，加载时按 "lloydmax" 处理，转换时会被拒绝并保持 W8A16）
+        "codebook_type": getattr(linear, "codebook_type", "lloydmax"),
     }
 
 
@@ -383,17 +387,33 @@ def convert_model_to_wxa8(model):
     WxA8 的 packed 存储格式与 WxA16 完全相同（checkpoint 通用），码本转
     INT8 是加载期算的，所以这里只换 __class__，零张量拷贝、零显存增长。
 
-    当前只切 MoE（WxA8BitPartitionedGroupMoE）；attention 的 WxA16Linear
-    要等 P3 的均匀码本改造之后才有 WxA8Linear，在此之前保持 W8A16。
+    转换范围：
+      - MoE：全部转 WxA8BitPartitionedGroupMoE
+      - attention / shared expert 的 8-bit linear：只有均匀码本
+        （codebook_type="uniform"）才转 WxA8Linear；Lloyd-Max 码本
+        （含旧 checkpoint）保持 W8A16 并计数警告 —— 塞进 int8 网格会
+        塌掉约 61 级（等效 7.6-bit），不能静默降级
     """
-    from quantization.wxa8 import WxA8BitPartitionedGroupMoE
+    from quantization.wxa8 import WxA8BitPartitionedGroupMoE, WxA8Linear
 
-    n = 0
+    n_moe = 0
+    n_attn = 0
+    n_kept = 0
     for sub in model.modules():
         if isinstance(sub, WxA16BitPartitionedGroupMoE):
             WxA8BitPartitionedGroupMoE.from_wxa16(sub)
-            n += 1
-    print(f"Converted {n} MoE layers to WxA8 (attention linears stay W8A16 until P3)")
+            n_moe += 1
+        elif isinstance(sub, WxA16Linear):
+            if sub.bit_width == 8 and is_uniform_codebook(sub.codebook):
+                WxA8Linear.from_wxa16(sub)
+                n_attn += 1
+            elif sub.bit_width == 8:
+                n_kept += 1
+            # 非 8-bit 的 linear 不存在于主流程（attention/shared 都是 8-bit）
+    print(f"Converted to WxA8: {n_moe} MoE layers, {n_attn} attention/shared linears")
+    if n_kept:
+        print(f"  ⚠ {n_kept} 个 8-bit linear 保持 W8A16：码本非均匀（Lloyd-Max），"
+              f"转 int8 会等效降级到 ~7.6-bit。需要均匀码本重新量化后才能转。")
     return model
 
 
