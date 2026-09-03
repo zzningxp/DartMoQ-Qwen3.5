@@ -136,6 +136,136 @@ def _wxa8_fused_matmul_kernel_grouped_gf(
 
 
 # ===========================================================================
+# P5-1: gate_up + silu×up 融合 kernel（group-first 布局）
+# ===========================================================================
+# 与 _wxa8_fused_matmul_kernel_grouped_gf 结构几乎相同，区别：
+#   - 输出列数 = inter_size（N_out），但权重有 2*N_out 列（gate + up）
+#   - 内部同时算 gate 和 up 两个累加器
+#   - epilogue: out = silu(gate_out) * up_out
+# 收益：省一次完整 gate_up 输出的读写（4MB/expert × 256 = 1GB/层）
+#       + 省一次独立的 silu×up launch
+# ===========================================================================
+
+@triton.jit
+def _wxa8_gate_up_silu_kernel_gf(
+    # Input
+    x_ptr,            # (B, K_total) int8    —— 已旋转并量化
+    xs_ptr,           # (B, NUM_GROUPS) fp32 —— per-token per-group 激活 scale
+    # Quantized weight (group-first 布局) —— 列数 = 2 * N_out（gate 在前，up 在后）
+    indices_ptr,      # (NUM_GROUPS_TOTAL, 2*N_out, PACKED_PER_GROUP) uint8
+    codebook_ptr,     # (n_levels,) int8
+    norms_ptr,        # (NUM_GROUPS_TOTAL, 2*N_out) fp16
+    # Output
+    output_ptr,       # (B, N_out) fp16 —— silu(gate) * up
+    # Shape
+    B, N_OUT,         # N_OUT = inter_size（输出列数），权重列数 = 2*N_OUT
+    K_total,              # 总 K = num_groups * group_size
+    INDICES_G0_STRIDE,    # indices 第 0 维 stride = 2*N_out * PACKED_PER_GROUP
+    NORMS_G0_STRIDE,      # norms 第 0 维 stride = 2*N_out
+    XS_ROW_STRIDE,        # xs 第 0 维 stride = NUM_GROUPS_TOTAL
+    # Constexpr config
+    GROUP_SIZE: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,
+    BIT_WIDTH: tl.constexpr,
+    N_LEVELS: tl.constexpr,
+    IDENTITY_CB: tl.constexpr = False,
+    BLOCK_B: tl.constexpr = 256,
+    BLOCK_N: tl.constexpr = 32,
+    BLOCK_K: tl.constexpr = 128,
+):
+    """WxA8 gate_up + silu×up 融合 kernel（group-first 布局）。
+
+    与独立 gate_up kernel + 独立 silu 等价，但中间结果不落地。
+    权重布局不变（仍是 2*inter_size 列，gate 在前 up 在后），
+    输出只有 inter_size 列（= silu(gate) * up）。
+    """
+    pid_b = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    rb = pid_b * BLOCK_B + tl.arange(0, BLOCK_B)
+    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)  # 输出列坐标（< N_OUT）
+    mask_b = rb < B
+    mask_n = rn < N_OUT
+
+    gate_acc = tl.zeros((BLOCK_B, BLOCK_N), dtype=tl.float32)
+    up_acc = tl.zeros((BLOCK_B, BLOCK_N), dtype=tl.float32)
+
+    ELEMENTS_PER_BYTE = 8 // BIT_WIDTH
+    PACKED_PER_GROUP = GROUP_SIZE // ELEMENTS_PER_BYTE
+
+    # gate 列和 up 列的权重基址（同一行号 n 在 gate 和 up 各有一列）
+    row_base_gate = rn * PACKED_PER_GROUP          # gate 侧：列 n
+    row_base_up = (rn + N_OUT) * PACKED_PER_GROUP  # up 侧：列 n + N_OUT
+
+    for g in range(NUM_GROUPS):
+        g_start = g * GROUP_SIZE
+        g_base = g * INDICES_G0_STRIDE
+
+        # 本 group 的 norms：gate 侧和 up 侧各取 BLOCK_N 列
+        norm_gate = tl.load(norms_ptr + g * NORMS_G0_STRIDE + rn,
+                            mask=mask_n, other=0.0)
+        norm_up = tl.load(norms_ptr + g * NORMS_G0_STRIDE + rn + N_OUT,
+                          mask=mask_n, other=0.0)
+        xs_g = tl.load(xs_ptr + rb * XS_ROW_STRIDE + g, mask=mask_b, other=0.0)
+
+        acc_gate_i = tl.zeros((BLOCK_B, BLOCK_N), dtype=tl.int32)
+        acc_up_i = tl.zeros((BLOCK_B, BLOCK_N), dtype=tl.int32)
+
+        for k_start in range(0, GROUP_SIZE, BLOCK_K):
+            rk = k_start + tl.arange(0, BLOCK_K)
+            mask_k = rk < GROUP_SIZE
+
+            # 激活 tile（gate 和 up 共用同一份输入）
+            inp_off = rb[:, None] * K_total + (g_start + rk)[None, :]
+            x_tile = tl.load(x_ptr + inp_off,
+                             mask=mask_b[:, None] & mask_k[None, :], other=0)
+
+            w_mask = mask_n[:, None] & mask_k[None, :]
+            if BIT_WIDTH == 8:
+                # ---- gate 权重 ----
+                byte_off_gate = g_base + row_base_gate[:, None] + rk[None, :]
+                idx_gate = tl.load(indices_ptr + byte_off_gate, mask=w_mask, other=0).to(tl.int32)
+                # ---- up 权重 ----
+                byte_off_up = g_base + row_base_up[:, None] + rk[None, :]
+                idx_up = tl.load(indices_ptr + byte_off_up, mask=w_mask, other=0).to(tl.int32)
+            else:
+                BIT_MASK = (1 << BIT_WIDTH) - 1
+                byte_col = rk // ELEMENTS_PER_BYTE
+                pos_in_byte = rk % ELEMENTS_PER_BYTE
+                # ---- gate 权重 ----
+                byte_off_gate = g_base + row_base_gate[:, None] + byte_col[None, :]
+                packed_gate = tl.load(indices_ptr + byte_off_gate, mask=w_mask, other=0).to(tl.uint8)
+                shift = pos_in_byte * BIT_WIDTH
+                idx_gate = ((packed_gate >> shift[None, :]) & BIT_MASK).to(tl.int32)
+                # ---- up 权重 ----
+                byte_off_up = g_base + row_base_up[:, None] + byte_col[None, :]
+                packed_up = tl.load(indices_ptr + byte_off_up, mask=w_mask, other=0).to(tl.uint8)
+                idx_up = ((packed_up >> shift[None, :]) & BIT_MASK).to(tl.int32)
+
+            if IDENTITY_CB:
+                w_gate = (idx_gate - 128).to(tl.int8)
+                w_up = (idx_up - 128).to(tl.int8)
+            else:
+                w_gate = tl.load(codebook_ptr + idx_gate, mask=w_mask, other=0)
+                w_up = tl.load(codebook_ptr + idx_up, mask=w_mask, other=0)
+
+            acc_gate_i += tl.dot(x_tile, tl.trans(w_gate), out_dtype=tl.int32)
+            acc_up_i += tl.dot(x_tile, tl.trans(w_up), out_dtype=tl.int32)
+
+        # 出 group：int32 → fp32，乘 scale
+        gate_acc += acc_gate_i.to(tl.float32) * xs_g[:, None] * norm_gate[None, :]
+        up_acc += acc_up_i.to(tl.float32) * xs_g[:, None] * norm_up[None, :]
+
+    # Epilogue: out = silu(gate) * up
+    out = gate_acc * tl.sigmoid(gate_acc) * up_acc
+
+    tl.store(
+        output_ptr + rb[:, None] * N_OUT + rn[None, :],
+        out.to(output_ptr.dtype.element_ty),
+        mask=mask_b[:, None] & mask_n[None, :],
+    )
+
+
+# ===========================================================================
 # INT8 tile 配置表
 #
 # 必须与 WxA16 分开调：INT8 下每元素 1 字节、累加器是 int32，寄存器与
@@ -492,6 +622,102 @@ def wxa8_matmul_grouped_slice_rows_gf(
         norms_slice,
         group_size, num_groups, bit_width, "gate_up",
     )
+
+
+def wxa8_gate_up_silu_fused_gf(
+    x_i8, x_scale, indices_packed_gf, codebook_i8, norms_gf,
+    group_size, in_features, inter_start, inter_end, bit_width: int = 2,
+    norms_prescaled: bool = False,
+):
+    """gate_up + silu×up 融合 kernel（P5-1）。
+
+    等价于：
+        gate_up_out = wxa8_matmul_grouped_slice_rows_gf(2*inter_start, 2*inter_end)
+        gate = gate_up_out[:, :inter_size]
+        up = gate_up_out[:, inter_size:]
+        act_out = silu(gate) * up
+
+    但中间结果不落地，省一次完整 gate_up 输出的读写 + 一次独立 silu launch。
+
+    Args:
+        inter_start, inter_end: inter_size 维度的切片范围。
+            权重的 gate_up 总列数 = 2 * total_inter_size，其中 gate 列 =
+            [0, total_inter_size)，up 列 = [total_inter_size, 2*total_inter_size)。
+            这里传的是 inter 侧的切片范围，函数内部自动映射到 gate 和 up 的列。
+        其他参数同 wxa8_matmul_grouped_slice_rows_gf。
+
+    Returns:
+        output: (B, inter_end - inter_start) fp16 = silu(gate) * up
+    """
+    if bit_width not in {1, 2, 4, 8}:
+        raise ValueError(f"bit_width must be 1/2/4/8, got {bit_width}")
+    if in_features % group_size != 0:
+        raise ValueError(
+            f"WxA8 要求 in_features ({in_features}) 对齐 group_size ({group_size})")
+
+    num_groups = in_features // group_size
+    inter_size = inter_end - inter_start
+    # gate 列: [inter_start, inter_end)，up 列: [total_inter+inter_start, total_inter+inter_end)
+    # 但 indices/norms 的完整列数 = 2*total_inter_size，我们需要的是连续的 2*inter_size 列
+    # 从 gate 侧的 inter_start 到 up 侧的 total_inter+inter_end —— 这不连续！
+    #
+    # 注意：bit_partitioned_moe 里 _gate_up_matmul 传的 row_start/row_end =
+    # 2*start, 2*end，其中 start/end 是 inter_size 维度的偏移。
+    # 也就是说，权重的 gate_up 按 [gate_0, up_0, gate_1, up_1, ..., gate_n, up_n] 排列？
+    # 不，让我回去确认一下。
+    #
+    # WxA16 的 gate_up 是 gate_proj 和 up_proj 拼接在一起的：
+    #   total N = 2 * inter_size，gate = 前 inter_size 列，up = 后 inter_size 列
+    # 所以切片 [2*start, 2*end) = [gate_start..gate_end) + [up_start..up_end)
+    # 其中 gate_start = 2*start, gate_end = start+end, up_start = start+end, up_end = 2*end？
+    # 不对，让我想清楚。
+    #
+    # 看 bit_partitioned_moe.py 的 _gate_up_matmul:
+    #   return gate_up_out, expert_tokens
+    # 然后: gate_out = gate_up_out[:, :actual_inter_size]
+    #       up_out = gate_up_out[:, actual_inter_size:]
+    # 所以 gate_up_out 的列数 = 2 * actual_inter_size，
+    # 前半 = gate，后半 = up。
+    # 也就是说 row_start=2*start, row_end=2*end 切出来的是 gate 的 [start,end) + up 的 [start,end)。
+    # 这是连续的 2*(end-start) 列，没错。
+    #
+    # 所以 fusion kernel 需要的权重就是 indices_packed_gf[:, 2*inter_start : 2*inter_end, :]
+    # 和 norms_gf[:, 2*inter_start : 2*inter_end]
+    # 输出列数 = inter_end - inter_start。
+    #
+    # 但权重的布局是 [gate_all, up_all]，所以 2*inter_start:2*inter_end 正好是
+    # [gate_part, up_part]，连续的 2*inter_size 列。✅
+
+    row_start = 2 * inter_start
+    row_end = 2 * inter_end
+
+    # 取切片：indices 和 norms 的列范围是 [row_start, row_end) = 2*inter_size 列
+    indices_slice = indices_packed_gf[:, row_start:row_end, :]
+    norms_slice = norms_gf[:, row_start:row_end]
+    if not norms_prescaled:
+        norms_slice = norms_slice.float() / math.sqrt(group_size)
+
+    B = x_i8.shape[0]
+    K_total = x_i8.shape[1]
+    N_out = inter_size
+
+    out = torch.empty(B, N_out, dtype=torch.float16, device=x_i8.device)
+
+    BLOCK_B, BLOCK_N, BLOCK_K, num_warps, num_stages = (
+        get_wxa8_config(bit_width, direction="gate_up", B=B))
+
+    grid = (triton.cdiv(B, BLOCK_B), triton.cdiv(N_out, BLOCK_N))
+    _wxa8_gate_up_silu_kernel_gf[grid](
+        x_i8, x_scale, indices_slice, codebook_i8, norms_slice, out,
+        B, N_out, K_total,
+        indices_slice.stride(0), norms_slice.stride(0), x_scale.stride(0),
+        GROUP_SIZE=group_size, NUM_GROUPS=num_groups,
+        BIT_WIDTH=bit_width, N_LEVELS=codebook_i8.shape[0],
+        IDENTITY_CB=False,
+        BLOCK_B=BLOCK_B, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        num_warps=num_warps, num_stages=num_stages,
+    )
+    return out
 
 
 def wxa8_matmul_grouped_slice_in_features_gf(

@@ -42,6 +42,12 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
     from turboquant_utils.delta_rule import patch_delta_rule
     patch_delta_rule(model)
 
+    # Norm 融合接线（2026-09-03）：RMSNorm / gated RMSNorm 换成 Triton 单 pass 版
+    # （每层省 ~15ms GPU，对拍与集成验证见 test/test_norm_fusion.py，全部 PASS；
+    #   A/B 对比时注释掉下一行即可，类级 patch 可用 unpatch_norms() 复原）
+    from turboquant_utils.norm_kernels import patch_norms
+    patch_norms(model)
+
     original_devices = []
     for layer in layers:
         if hasattr(layer, 'parameters') and len(list(layer.parameters())) > 0:

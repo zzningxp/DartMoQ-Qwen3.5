@@ -83,7 +83,11 @@ python eval_qwen35.py --load-quantized ./quant_ckpt
 
 ```bash
 # 原始 fp16 模型直接评测（--inference-quant-mode 只对 --load-quantized 生效）
-python eval_qwen35.py /path/to/qwen3.5/model
+python eval_qwen35.py /path/to/qwen3.5-origin-fp16/model
+```
+如果显卡放不下可以测试：
+```bash
+python eval_qwen35.py $quant_modelname --sequential-eval --standby-cpu
 ```
 
 ### 3. WxA16 量化 + 评测
