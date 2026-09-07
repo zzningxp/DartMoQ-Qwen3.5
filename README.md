@@ -27,19 +27,14 @@ Triton kernel 量化推理支持两种精度模式（共用同一份 packed chec
 
 ## 性能
 
-> Qwen3.5-35B-A3B, WxA16, bpw2, RTX 5090 (400w 功率下）, sequential eval
+> Qwen3.5-35B-A3B, bpw2, RTX 5090, sequential eval, HEAD 6eabe23
 
-| 数据集 | FP16 | WxA16 | 加速比 | ppl |
+| 数据集 | WxA16 | **WxA8** | 加速比 | ppl |
 |---|---|---|---|---|
-| wikitext2（145 samples） | 90.05 s | **57.52 s** | **35.6% 更快** | 7.7944（持平） |
-| c4（256 samples） | 114.7 s | **88.36 s** | **23.0% 更快** | 11.268（持平） |
+| wikitext2（256 samples） | 53.12 s | **45.08 s** | **-15.1%** | 7.7947（-0.0008，略好于 A16） |
+| c4（145 samples） | 76.71 s | **61.84 s** | **-19.4%** | 11.2676（+0.0045） |
 
-> WxA8 vs WxA16（同一机器对照，2026-08-30 ~ 09-01，sequential eval）
 
-| 数据集 | WxA16 | WxA8（MoE） | **WxA8（MoE+attention）** | ppl |
-|---|---|---|---|---|
-| wikitext2（145 samples） | 58.18 s | 54.09 s | **46.95 s（-19.3%）** | 7.7966（+0.002） |
-| c4（256 samples） | 88.62 s | 82.71 s | **68.79 s（-22.4%）** | 11.265（-0.003，好于 A16） |
 
 MoE 单独贡献 -7.0%/-6.7%，attention 路径贡献 -13.2%/-16.8%。
 WxA8 全路径数字基于 260831-u8 checkpoint（attention 均匀码本，MoE 与 260824 同型）。
@@ -136,8 +131,8 @@ WxA8 与 WxA16 共用同一份 packed checkpoint（码本转 INT8 是加载期�
   - **attention 路径**：8-bit 均匀码本（indices 即 int8 权重，免查表），
     kernel 实测 2.63x/2.85x vs WxA16Linear；旧 checkpoint 的 Lloyd-Max 码本
     自动保持 W8A16（安全阀，静默降级防护）
-  - **端到端实测**：wiki -19.3% / c4 -22.4%（vs WxA16），ppl 基本持平
-    （wiki +0.002 / c4 -0.003）
+  - **端到端实测**：wiki -15.1% / c4 -19.4%（vs WxA16），ppl 基本持平
+    （wiki -0.0008 / c4 +0.0045）
   - 待做：per-expert 循环开销（占 MoE forward wall 约 80%，多 expert 合并 kernel 方向）
   - 详见 [roadmaps/wxa8-plan-260829.md](roadmaps/wxa8-plan-260829.md)
 - **WxA4** 🔮 规划中（WGMMA int4，需 Machete 库或 CUTLASS）
