@@ -417,6 +417,57 @@ def convert_model_to_wxa8(model):
     return model
 
 
+def convert_model_to_wxfp8(model, attn: str = "wxa8"):
+    """把已加载的 WxA16 模型原地切到 WxFP8 推理路径（MoE 走 e4m3 激活）。
+
+    存储格式与 WxA16 完全相同（checkpoint 通用，e4m3 码本 LUT 是加载期算的），
+    只换 __class__，零张量拷贝、零显存增长。
+
+    attn 参数决定 attention / shared expert 的 8-bit linear 走哪条路：
+      - "wxa8"（默认，混合部署）：attention 保持 WxA8（int8）。
+        实测依据（roadmaps/wxfp8-plan-260924.md §七 WF-3）：attention W8 走
+        e4m3 LUT 速度只有 int8-identity 的 0.58x、精度 3.9x 退化——fp8 只铺
+        MoE（那里双方都查 LUT，速度 0.89~1.00x 中性）
+      - "wxfp8"：attention 也切 e4m3（WxFP8Linear，Lloyd-Max 码本同样可转，
+        供 full-fp8 对比实验用）
+      - "wxa16"：attention 保持 W8A16
+    """
+    from quantization.wxa8.linear import WxA8Linear, is_uniform_codebook
+    from quantization.wxfp8 import WxFP8BitPartitionedGroupMoE, WxFP8Linear
+
+    if attn not in {"wxa8", "wxfp8", "wxa16"}:
+        raise ValueError(f"未知 attn 模式: {attn}")
+
+    n_moe = 0
+    n_attn = 0
+    n_kept = 0
+    for sub in model.modules():
+        if isinstance(sub, WxA16BitPartitionedGroupMoE):
+            WxFP8BitPartitionedGroupMoE.from_wxa16(sub)
+            n_moe += 1
+        elif isinstance(sub, WxA16Linear):
+            if sub.bit_width != 8:
+                continue
+            if attn == "wxfp8":
+                WxFP8Linear.from_wxa16(sub)
+                n_attn += 1
+            elif attn == "wxa8":
+                if is_uniform_codebook(sub.codebook):
+                    WxA8Linear.from_wxa16(sub)
+                    n_attn += 1
+                else:
+                    n_kept += 1
+            # attn == "wxa16"：不动
+    mode_desc = {"wxa8": "（混合部署：attention 保 int8）",
+                 "wxfp8": "（full-fp8）", "wxa16": "（attention 保 W8A16）"}[attn]
+    print(f"Converted to WxFP8: {n_moe} MoE layers {mode_desc}, "
+          f"{n_attn} attention/shared linears")
+    if n_kept:
+        print(f"  ⚠ {n_kept} 个 8-bit linear 保持 W8A16：码本非均匀（Lloyd-Max）"
+              f"不能转 WxA8（int8 塌级）；换 attn='wxfp8' 可走 e4m3 LUT。")
+    return model
+
+
 def load_quantized_model(base_model_path: str = None, quant_dir: str = None,
                          standby_cpu: bool = False, seqlen: int = 2048,
                          inference_quant_mode: str = "wxa16"):
@@ -428,8 +479,10 @@ def load_quantized_model(base_model_path: str = None, quant_dir: str = None,
         quant_dir: 保存目录（含 model.safetensors + meta.json）
         standby_cpu: 加载后保持 CPU（逐层搬移的 sequential eval 用）
         seqlen: 模型序列长度（与原加载路径一致，固定 2048）
-        inference_quant_mode: "wxa16"（默认）或 "wxa8"。wxa8 在 restore 后
-            把 MoE 原地切到 INT8 激活路径（checkpoint 本身不变）
+        inference_quant_mode: "wxa16"（默认）/ "wxa8" / "wxfp8"。wxa8 在 restore 后
+            把 MoE 原地切到 INT8 激活路径；wxfp8 把 MoE 切到 e4m3 激活路径
+            （attention 默认混合部署保 wxa8，见 convert_model_to_wxfp8）。
+            checkpoint 本身不变
     """
     if base_model_path is None:
         # 优先从 meta.json 读 base_model 路径（旧 checkpoint 没拷 tokenizer 时也能用）
@@ -469,10 +522,13 @@ def load_quantized_model(base_model_path: str = None, quant_dir: str = None,
 
     restore_quant_metadata(model, meta, sd)
 
-    # WxA8 推理模式：MoE 原地切到 INT8 激活路径（checkpoint 格式不变，
-    # 同一份 2bpw checkpoint 可同时跑 wxa16 / wxa8）
+    # WxA8 / WxFP8 推理模式：MoE 原地切换（checkpoint 格式不变，
+    # 同一份 2bpw checkpoint 可同时跑 wxa16 / wxa8 / wxfp8）
     if inference_quant_mode == "wxa8":
         convert_model_to_wxa8(model)
+    elif inference_quant_mode == "wxfp8":
+        # 默认混合部署（attn 保 wxa8）；full-fp8 对比实验改传 attn="wxfp8"
+        convert_model_to_wxfp8(model, attn="wxa8")
     elif inference_quant_mode != "wxa16":
         raise ValueError(f"未知 inference_quant_mode: {inference_quant_mode}")
 

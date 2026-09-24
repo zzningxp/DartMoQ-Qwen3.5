@@ -554,10 +554,12 @@ def main():
                         help="CPU 侧瓶颈定位：逐层打印 wall/GPU/kwargs/move 拆分"
                              "（会在每层末尾 synchronize，只用于测量，别开它跑正式 eval）")
     parser.add_argument('--inference-quant-mode', type=str, default='wxa16',
-                        choices=['wxa16', 'wxa8'],
+                        choices=['wxa16', 'wxa8', 'wxfp8'],
                         help="推理量化模式：wxa16 (FP16 激活+FP16 计算，默认) / "
                              "wxa8 (INT8 激活+INT8 Tensor Core，MoE 部分；"
-                             "attention 保持 W8A16 直到 P3)")
+                             "attention 保持 W8A16 直到 P3) / "
+                             "wxfp8 (e4m3 激活+FP8 Tensor Core，MoE 部分；"
+                             "attention 默认混合部署保 wxa8)")
 
     args = parser.parse_args()
 

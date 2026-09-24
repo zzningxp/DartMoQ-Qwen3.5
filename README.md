@@ -2,11 +2,14 @@
 
 面向 Qwen3.5-35B-A3B MoE 模型的混合精度量化推理框架，及所有依赖 Qwen3.5 混合注意力机制模型，如 Qwen3.6/3.7/3.8 等。
 基于 [DartMoQ](https://github.com/zzningxp/DartMoQ) 算法，适配 Qwen3.5 MoE 的 grouped_gemm 权重格式，
-Triton kernel 量化推理支持两种精度模式（共用同一份 packed checkpoint）：
+Triton kernel 量化推理支持三种精度模式（共用同一份 packed checkpoint）：
 
 - **WxA16** ✅：FP16 激活张量 + FP16 Tensor Core，支持 w1a16/w2a16/w4a16/w8a16 混合精度权重
 - **WxA8** ✅：INT8 激活张量 + INT8 Tensor Core（MoE + attention 全路径）
-- WxA4（WGMMA int4）规划中
+- **WxFP8** ✅：e4m3 激活 + FP8 Tensor Core（MoE 路径；attention 混合部署保 WxA8。
+  定位是 WxFP4 的基础设施预备步骤）
+- WxFP4 🔮 规划中（e2m1 + 块缩放 MMA；sm_120 无 int4 tensor core，
+  早期 WGMMA int4 设想已被实测否定，详见 [roadmaps/wxfp4-plan-260924.md](roadmaps/wxfp4-plan-260924.md)）
 
 ## 核心特性
 
@@ -14,6 +17,8 @@ Triton kernel 量化推理支持两种精度模式（共用同一份 packed chec
 - **Triton 融合 kernel**：MoE 全路径 Triton 实现，反量化 + 矩阵乘 + epilogue 融合
 - **WxA8 INT8 激活推理**：per-token per-group 对称量化 + INT8 Tensor Core（IMMA、INT32 累加），
   码本转 INT8 在加载期完成，checkpoint 格式不变
+- **WxFP8 e4m3 激活推理**：per-token per-group e4m3 量化（satfinite 饱和）+ FP8 Tensor Core
+  原生 fp32 累加；码本 e4m3 LUT 与 cb_scale 网格搜索在加载期完成，checkpoint 格式不变
 - **Rotate+Quantize 融合**：分组旋转与激活量化融合为单个 Triton kernel，
   中间结果不落地（hoist 规模实测 18.75x vs 两段式）
 - **Group-First 布局**：权重按 group 连续存储，提升 L2 缓存命中率
@@ -38,6 +43,11 @@ Triton kernel 量化推理支持两种精度模式（共用同一份 packed chec
 
 MoE 单独贡献 -7.0%/-6.7%，attention 路径贡献 -13.2%/-16.8%。
 WxA8 全路径数字基于 260831-u8 checkpoint（attention 均匀码本，MoE 与 260824 同型）。
+
+> WxFP8（混合部署：MoE fp8 + attention wxa8）同 checkpoint 另批实测（git 870e1f2+）：
+> c4 62.93s（vs WxA8 +0.8%，速度中性）；wiki 55.43s 疑首轮 JIT 污染（待热缓存复跑确认）；
+> ppl wiki 7.8064 / c4 11.2769（vs WxA16 +0.011/+0.014，代价远小于预期）。
+> 详见 [roadmaps/wxfp8-plan-260924.md](roadmaps/wxfp8-plan-260924.md) §七 WF-5。
 
 > 端到端时间含约 20s 的 PPL 计算开销。MoE 层与 Linear Attention 的相对加速比见各模块说明。
 > ⚠ 首次运行 WxA8 会触发 Triton JIT 编译（逐 expert 形状边跑边编译，端到端可虚增 10%+），
@@ -108,10 +118,15 @@ python eval_qwen35.py --load-quantized ./quant_ckpt --inference-quant-mode wxa16
 
 # WxA8（INT8 激活 + INT8 Tensor Core，MoE 部分；attention 保持 W8A16 直到 P3）
 python eval_qwen35.py --load-quantized ./quant_ckpt --inference-quant-mode wxa8
+
+# WxFP8（e4m3 激活 + FP8 Tensor Core；MoE 走 fp8，attention 默认混合部署保 WxA8）
+python eval_qwen35.py --load-quantized ./quant_ckpt --inference-quant-mode wxfp8
 ```
 
 WxA8 与 WxA16 共用同一份 packed checkpoint（码本转 INT8 是加载期算的），
 `--load-quantized` 加载后 `qwen35_quant_io.convert_model_to_wxa8` 原地切换，零拷贝。
+WxFP8 同理（`convert_model_to_wxfp8`，码本 e4m3 LUT + cb_scale 搜索加载期算），
+三种模式读的是同一份 checkpoint，切换只是加载标志。
 
 ## 路线图
 
@@ -135,4 +150,14 @@ WxA8 与 WxA16 共用同一份 packed checkpoint（码本转 INT8 是加载期�
     （wiki -0.0008 / c4 +0.0045）
   - 待做：per-expert 循环开销（占 MoE forward wall 约 80%，多 expert 合并 kernel 方向）
   - 详见 [roadmaps/wxa8-plan-260829.md](roadmaps/wxa8-plan-260829.md)
-- **WxA4** 🔮 规划中（WGMMA int4，需 Machete 库或 CUTLASS）
+- **WxFP8** ✅ MoE 路径落地（e4m3 激活 + FP8 Tensor Core + 原生 fp32 累加；
+  WxFP4 的基础设施预备步骤）
+  - **码本 e4m3 化 + cb_scale 搜索**：浮点网格尺度不变性带来的 int8 没有的优化自由度，
+    2-bit 码本 relerr 0.00021（优于 int8 的 0.00054）
+  - **混合部署**：attention W8 走 e4m3 LUT 实测速度 0.58x + 精度 3.9x 双输，
+    故 attention 保 WxA8、MoE 走 fp8（MoE 形态速度 0.89~1.00x 中性）
+  - **端到端**：c4 与 WxA8 持平（+0.8%），ppl wiki +0.011 / c4 +0.014 vs WxA16
+    （激活 relerr 2.57% 的 ppl 代价远小于预期——旋转的离群值抑制在 ppl 层面兑现）
+  - 详见 [roadmaps/wxfp8-plan-260924.md](roadmaps/wxfp8-plan-260924.md)
+- **WxFP4** 🔮 规划中（e2m1 激活 + 块缩放 MMA；四条候选路线与决策点见
+  [roadmaps/wxfp4-plan-260924.md](roadmaps/wxfp4-plan-260924.md)）

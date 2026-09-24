@@ -602,11 +602,15 @@ def dartmoq_quant_grouped_gemm_moe(model, tokenizer, dataloader, args, test_ppl=
 
     if test_ppl:
         # 量化后的内存内 eval 也尊重 --inference-quant-mode：
-        # wxa8 时先原地切换（checkpoint 已在上方保存为 WxA16 格式，不受影响），
-        # 与 load 路径的 `load_quantized_model(inference_quant_mode="wxa8")` 语义一致
-        if getattr(args, 'inference_quant_mode', 'wxa16') == 'wxa8':
+        # wxa8/wxfp8 时先原地切换（checkpoint 已在上方保存为 WxA16 格式，不受影响），
+        # 与 load 路径的 `load_quantized_model(inference_quant_mode=...)` 语义一致
+        _iqm = getattr(args, 'inference_quant_mode', 'wxa16')
+        if _iqm == 'wxa8':
             from qwen35_quant_io import convert_model_to_wxa8
             convert_model_to_wxa8(model)
+        elif _iqm == 'wxfp8':
+            from qwen35_quant_io import convert_model_to_wxfp8
+            convert_model_to_wxfp8(model, attn="wxa8")
         print("\nEvaluating perplexity...")
         run_ppl_evaluation(model, tokenizer, args)
 

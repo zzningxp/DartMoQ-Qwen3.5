@@ -188,8 +188,12 @@ FP8 对应改造（WxFP8 要做的）：
 > 各测试脚本头部有 usage 行可随时复跑。此处只列**需要本人手动跑的大显存命令**。
 
 ```bash
-# WF-5 全模型 ppl（占大量显存，本人手动跑）
-conda run -n dart312 eval_qwen35.py models/<ckpt_dir> --inference-quant-mode wxfp8
+# WF-5 全模型 ppl（占大量显存，本人手动跑；混合部署：MoE fp8 + attention wxa8）
+conda run -n dart312 eval_qwen35.py models/qwen3.5-2bpw-260831-u8 --inference-quant-mode wxfp8
+
+# 对照组（如需同批比较）
+conda run -n dart312 eval_qwen35.py models/qwen3.5-2bpw-260831-u8 --inference-quant-mode wxa8
+conda run -n dart312 eval_qwen35.py models/qwen3.5-2bpw-260831-u8 --inference-quant-mode wxa16
 ```
 
 ---
@@ -222,6 +226,12 @@ conda run -n dart312 eval_qwen35.py models/<ckpt_dir> --inference-quant-mode wxf
 - 2026-09-24 WF-3：融合 GEMM kernel + attention 路径落地，contract 对拍 2.1e-04，
   MoE 形态 fp8/int8 = 0.89~1.00x（速度中性），attention 0.58x（LUT gather 代价）
   → 混合部署证据链闭合（§七 WF-3）。
+- 2026-09-24 WF-4：`quantization/wxfp8/` 包 + 三处入口接线 + convert_model_to_wxfp8
+  （默认混合部署）；test_quant_io 追加对拍段全绿（MoE 0.05042 / attn 0.03695，
+  均与预测一致）（§七 WF-4）。
+- 2026-09-24 WF-5：全模型 ppl（本人手动跑）：wiki +0.011 / c4 +0.014 vs wxa16
+  （代价远小于预期，ppl 门槛通过）；c4 速度与 wxa8 持平，wiki 疑首轮 JIT 污染
+  待复跑确认（§七 WF-5）。**wxfp8 六步全部完成**。
 
 ---
 
@@ -308,10 +318,47 @@ conda run -n dart312 eval_qwen35.py models/<ckpt_dir> --inference-quant-mode wxf
   最终由 WF-5 ppl 确认。MoE 切片 wrapper（gate_up 行切片 / down in_features
   切片）随 WF-4 包接线一起做（kernel 本身已支持切片语义）。
 
-### WF-4：`quantization/wxfp8/` 包 + 入口接线（未开始）
+### WF-4：`quantization/wxfp8/` 包 + 入口接线 ✅ 已完成（2026-09-24）
 
-- （待记）
+- 2026-09-24 落地清单：
+  - `turboquant_utils/triton_kernels_fp8.py`：补 gate_up 行切片 / down in_features
+    切片两个 wrapper（`wxfp8_matmul_grouped_slice_rows_gf` /
+    `wxfp8_matmul_grouped_slice_in_features_gf`，与 wxa8 对应版本逐行同构）
+  - `quantization/wxfp8/`（新包）：`WxFP8BitPartitionedGroupMoE`（覆盖
+    `_get_bit_context`/`_build_hoisted_rotations`/两个 matmul，与 wxa8 包逐点
+    对应）+ `WxFP8Linear`（attention；e4m3 LUT 对 Lloyd-Max 码本也开放——
+    int8 路线的均匀性安全阀在 fp8 下不需要；cb_scale 在 _ensure_gf 缓存）
+  - `qwen35_quant_io.py`：`convert_model_to_wxfp8(model, attn="wxa8")`——
+    **默认混合部署**（MoE fp8 + attention 保 wxa8，依据 §七 WF-3 的速度 0.58x
+    + 精度 3.9x 双输）；attn="wxfp8" 供 full-fp8 对比（CLI 未暴露，研究用改一行）；
+    `load_quantized_model` 的 mode 分支接线
+  - `run_qwen35.py` / `eval_qwen35.py`：`--inference-quant-mode` choices 增加
+    `wxfp8`；`qwen35_simple_wrapper.py` 内存内 eval 路径同步
+- 2026-09-24 实测（`test/test_quant_io.py` 追加 WxFP8 段，已有断言未动）：
+  - WxFP8 MoE forward relerr vs A16 = **0.05042**（预测 ~0.05：激活 2.57% ×
+    silu/topk 放大 ≈2x；对照 A8 0.65%→0.01336 的同比例关系）✓
+  - full-fp8 attn linear relerr = **0.03695**（WF-1 模拟预测 0.0367）✓
+  - 转换链路：WxA16→WxA8→WxFP8 连续 __class__ 切换（零拷贝）验证通过
+- 结论：wxfp8 全链路（checkpoint→加载→转换→forward）闭环，等价于 wxa8 当年
+  P2 完成时的状态。下一步 WF-5：全模型 ppl（本人手动跑，命令见 §四）。
 
-### WF-5：全模型 ppl 验证（未开始）
+### WF-5：全模型 ppl 验证 ✅ 已完成（2026-09-24，本人手动跑，git 870e1f2+）
 
-- （待记，ppl 数据 + 与 wxa8/wxa16 基线对比）
+| 模式 | wiki ppl | c4 ppl | wall(s) | t_wiki | t_c4 |
+|---|---|---|---|---|---|
+| wxa16 | 7.7955 | 11.2631 | 134.15 | 53.13 | 81.02 |
+| wxa8 | 7.7947 | 11.2676 | 106.58 | 44.16 | 62.42 |
+| **wxfp8（混合）** | **7.8064** | **11.2769** | 118.36 | 55.43 | 62.93 |
+
+- **精度结论：fp8 激活的 ppl 代价很小**——vs wxa16：wiki +0.0109（+0.14%）/
+  c4 +0.0138（+0.12%）；vs wxa8：wiki +0.0117 / c4 +0.0093。
+  对照当初悲观预测（0.1~0.5）实际只有 ~0.01 量级，与激活 relerr 比
+  （2.57% vs int8 0.65%，约 4x）的放大远小于预期——旋转对离群值的抑制
+  在 ppl 层面兑现。**float 激活方向通过 ppl 门槛**。
+- **速度结论：c4 与 wxa8 持平（62.93 vs 62.42，+0.8%）**，符合 kernel 级
+  0.89~1.00x 预测；wiki 55.43 异常偏慢（比 wxa8 +25%，甚至慢于 wxa16）——
+  **疑为 wxfp8 新 kernel 首轮 JIT 编译落在了 wiki 阶段**（wiki 先跑，
+  wxa8/wxa16 的 kernel 已有 triton cache 而 wxfp8 全新），待热缓存复跑确认。
+- 混合部署最终判定：**成立**（MoE fp8 + attention wxa8）。wxfp8 作为
+  WxFP4 基础设施的任务完成，WF4-P1 前置探测可以启动。
+- 待办：热缓存复跑一次 wxfp8 确认 wiki 时间（预期回落到 ~46s / 总 ~108s）。

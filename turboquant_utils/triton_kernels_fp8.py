@@ -11,6 +11,8 @@
 fp8 版保持同一契约：`codebook[i] ≈ cb_e4m3[i] * cb_scale`。
 """
 
+import math
+
 import torch
 import triton
 import triton.language as tl
@@ -419,4 +421,89 @@ def wxfp8_matmul_grouped_gf(
     return _launch_fp8(
         x_f8, x_scale, indices_packed_gf, cb_f8, norms_gf,
         group_size, num_groups, bit_width, "attn", cfg=cfg,
+    )
+
+
+def wxfp8_matmul_grouped_slice_rows_gf(
+    x_f8, x_scale, indices_packed_gf, cb_f8, norms_gf,
+    group_size, in_features, row_start, row_end, bit_width: int = 2,
+    norms_prescaled: bool = False,
+):
+    """gate_up 路径：行切片（输出维度切片）——对应 wxa8_matmul_grouped_slice_rows_gf。
+
+    Args:
+        x_f8: (B, in_features) e4m3，已旋转并量化（rotate_quantize_fused_fp8）
+        x_scale: (B, in_features // group_size) fp16（已折入 cb_scale）
+        indices_packed_gf: (num_groups, N_total, packed_per_group) uint8
+        cb_f8: (n_levels,) e4m3（build_fp8_codebook 产物）
+        norms_gf: (num_groups, N_total) fp16，与 WxA16 的 norms_gf 同源
+        row_start, row_end: 行切片范围
+        norms_prescaled: norms 是否已预乘 1/sqrt(group_size)。主路径恒为 True
+            （P6-2 预乘）；False 时这里补除，对齐 WxA16 语义。
+
+    Returns:
+        output: (B, row_end - row_start) fp16
+    """
+    if bit_width not in {1, 2, 4, 8}:
+        raise ValueError(f"bit_width must be 1/2/4/8, got {bit_width}")
+    if in_features % group_size != 0:
+        raise ValueError(
+            f"WxFP8 要求 in_features ({in_features}) 对齐 group_size ({group_size})")
+
+    num_groups = in_features // group_size
+    norms_slice = norms_gf[:, row_start:row_end]
+    if not norms_prescaled:
+        norms_slice = norms_slice.float() / math.sqrt(group_size)
+    return _launch_fp8(
+        x_f8, x_scale,
+        indices_packed_gf[:, row_start:row_end, :],
+        cb_f8,
+        norms_slice,
+        group_size, num_groups, bit_width, "gate_up",
+    )
+
+
+def wxfp8_matmul_grouped_slice_in_features_gf(
+    x_f8, x_scale, indices_packed_gf, cb_f8, norms_gf,
+    group_size, original_start, original_end, bit_width: int = 2,
+    norms_prescaled: bool = False,
+):
+    """down 路径：in_features 切片（group 维切片，整块连续）
+    ——对应 wxa8_matmul_grouped_slice_in_features_gf。
+
+    x_f8 已经是切片后的输入（每个 expert 自己的 act_out），且已用
+    seed_base = seed + original_start 旋转过再量化。
+
+    Args:
+        x_f8: (B, original_end - original_start) e4m3
+        x_scale: (B, num_groups_in_slice) fp16（已折入 cb_scale）
+        original_start, original_end: 原始全权重的 in_features 切片范围
+        norms_prescaled: 同 slice_rows_gf
+
+    Returns:
+        output: (B, N) fp16
+    """
+    if bit_width not in {1, 2, 4, 8}:
+        raise ValueError(f"bit_width must be 1/2/4/8, got {bit_width}")
+    if original_start % group_size != 0:
+        raise ValueError(
+            f"original_start ({original_start}) 必须对齐 group_size ({group_size})")
+
+    slice_in_features = original_end - original_start
+    if slice_in_features % group_size != 0:
+        raise ValueError(
+            f"切片宽度 ({slice_in_features}) 必须对齐 group_size ({group_size})")
+
+    g_start = original_start // group_size
+    g_end = original_end // group_size
+
+    norms_slice = norms_gf[g_start:g_end]
+    if not norms_prescaled:
+        norms_slice = norms_slice.float() / math.sqrt(group_size)
+    return _launch_fp8(
+        x_f8, x_scale,
+        indices_packed_gf[g_start:g_end],
+        cb_f8,
+        norms_slice,
+        group_size, g_end - g_start, bit_width, "down",
     )
