@@ -81,13 +81,14 @@ A16→A8 改了什么（`triton_kernels_a8.py`）：
   解决方案是 **uniform 码本 + IDENTITY_CB**（`idx - 128` 免查表，`triton_kernels_a8.py:120-124`）
 
 FP8 对应改造（WxFP8 要做的）：
-- `build_fp8_codebook`：fp16 码本 → e4m3。**低 bit（1/2/4，≤16 级）预计近无损**——每码本一个
-  `cb_scale = max|cb|/448` 折进激活 scale（同 `cb_step` 机制，复用 `extra_scale` 通道）；
-  16 级值经 scale 后落在 e4m3 网格上的失配预计 << 1%（WF-1 实测确认）
-- **W8 uniform 码本 → e4m3 是新的精度风险点**：e4m3 全网格只有 ~254 个值且零点附近密、
-  远处疏，均匀 256 级网格映射过去必有塌级（与当初 Lloyd-Max→int8 同类问题）。
-  缓解：直接存 256-entry **e4m3 LUT**（每 entry 是最近的 e4m3 表示），kernel 内查表，
-  塌级程度 WF-1 实测（当初 int8 化的对照数据：relerr 0.00075→0.0128）
+- `build_fp8_codebook`：fp16 码本 → e4m3。**浮点网格尺度不变 → 单一 cb_scale 可搜索**，
+  让少量质心尽量落在 e4m3 网格点上（int8 版无此自由度）。WF-1 已实测（§七）：
+  1-bit 精确、2-bit 0.00021（优于 int8 的 0.00054）、4-bit 0.011（int8 0.0036，差 3 倍
+  但绝对值小）、`cb_scale` 折进激活 scale（同 `cb_step` 机制，复用 `extra_scale` 通道）
+- **W8 uniform 码本 → e4m3 已实测确认是精度风险点**：码本占用 256→81 Byte（e4m3 有限值总共仅
+  254 个有限幅度，结构性塌级），码本 relerr 0.0231，attention 路径总 relerr 0.037
+  vs wxa8 的 0.009（~3.9×）→ 支持"attention 保 wxa8、MoE 上 wxfp8"的混合部署备选，
+  最终由 WF-5 ppl 决定
 - 结论：**码本需要一次 fp8 化改造，位置与 `build_int8_codebook` 对称（load 时），checkpoint 不动**
 
 **Q3：存储是否独立？——持久化存储不独立，运行时产物独立。**
@@ -152,12 +153,14 @@ FP8 对应改造（WxFP8 要做的）：
 
 ### 精度预期与风险
 
-| 项 | WxA8 实测 | WxFP8 预期 | 风险 |
+| 项 | WxA8 实测 | WxFP8 实测（WF-1） | 风险 |
 |---|---|---|---|
-| 激活 relerr | 0.65%（int8 per-group） | ~2.5%（e4m3 per-group，wxa8-plan:190 已测 2.57%） | **主风险**，~4× 退化 |
-| 低 bit 码本 relerr | 1bit 0.65% / 2bit 0.65% / 4bit 0.86% | 预计持平（≤16 级 e4m3 近无损） | 低，WF-1 实测 |
-| W8 uniform 码本 | 0%（int8 精确映射；spike 里 0.53% 是被否决的 Lloyd-Max→int8 路线） | 待实测（e4m3 LUT 塌级） | 中，attention 敏感 |
-| ppl | 基线 | 主观预测退化 0.1-0.5 | WF-5 实测；若不可接受，敏感层保留 A8 的混合方案（fp8 只铺 MoE），决策点在 WF-5 后 |
+| 激活 relerr | 0.65%（int8 per-group） | 2.57%（e4m3 per-group，复现 spike） | **主风险**，~4× 退化 |
+| 2-bit 码本 relerr | 0.00054 | **0.00021**（scale 搜索有效，优于 int8） | 已消除 |
+| 4-bit 码本 relerr | 0.0036 | 0.011（naive 0.025 的 2.3 折改善） | 低（绝对值小，且 4-bit 只覆盖少量 expert） |
+| W8 uniform 码本 | 0%（int8 精确映射） | 0.0231（码本占用 256→81 Byte，结构性） | 中-高，attention 敏感 → 混合部署备选 |
+| MoE 总 relerr（2-bit，Gaussian 模拟） | 0.0065 | 0.0257（激活主导，码本贡献 0.0003） | ppl 由 WF-5 定 |
+| attention 总 relerr（8-bit uni，模拟） | 0.0095 | 0.0367（~3.9×） | 同上；不可接受则 attention 保 wxa8 |
 
 ---
 
@@ -179,12 +182,12 @@ FP8 对应改造（WxFP8 要做的）：
 
 ---
 
-## 四、手动测试命令（WF-0 已就绪）
+## 四、手动测试命令
+
+> 小显存测试（能力探测、码本精度、后续 kernel 对齐等）由 Claude 自跑并在 §七 记录数据，
+> 各测试脚本头部有 usage 行可随时复跑。此处只列**需要本人手动跑的大显存命令**。
 
 ```bash
-# 能力探测（本文件 §1.1 表格的来源，约 1 分钟，显存 <2GB）
-conda run -n dart312 python test/test_wxfp8_capability_probe.py
-
 # WF-5 全模型 ppl（占大量显存，本人手动跑）
 conda run -n dart312 eval_qwen35.py models/<ckpt_dir> --inference-quant-mode wxfp8
 ```
@@ -213,6 +216,8 @@ conda run -n dart312 eval_qwen35.py models/<ckpt_dir> --inference-quant-mode wxf
 
 - 2026-09-24 WF-0：初版调研 + 本机能力实测 + web 生态调研（本文件）。
 - 2026-09-24：§三 补执行日志规则，新增 §七 执行日志区（本人要求：每做一步更新日志）。
+- 2026-09-24 WF-1：`build_fp8_codebook` 落地 + 码本/端到端精度实测（数据见 §七 WF-1）；
+  §1.3 与精度表按实测修正（4-bit 预测过乐观、W8 uni 塌级确认）。
 
 ---
 
@@ -230,9 +235,31 @@ conda run -n dart312 eval_qwen35.py models/<ckpt_dir> --inference-quant-mode wxf
   §1.2/§1.2b/§六。
 - 2026-09-24 姊妹文件：`wxfp4-plan-260924.md`（下游预研规划）。
 
-### WF-1：码本 fp8 化（未开始）
+### WF-1：码本 fp8 化 ✅ 已完成（2026-09-24）
 
-- （待记）
+- 2026-09-24 `build_fp8_codebook`：`turboquant_utils/triton_kernels_fp8.py` 落地。
+  与 `build_int8_codebook` 同契约（`cb ≈ lut × cb_scale`，折 extra_scale），
+  新增 **cb_scale 对数网格搜索**（coarse 512 点 ±1 octave + 两轮细化，load 时一次性，
+  浮点网格尺度不变性带来的 int8 没有的优化自由度）。
+- 2026-09-24 码本 relerr 实测（`test/test_wxfp8_codebook_prec.py`，口径=‖lut×s−cb‖/‖cb‖）：
+
+  | 码本 | int8 | fp8 naive | fp8 opt | int8 占用(Byte) | fp8 占用(Byte) |
+  |---|---|---|---|---|---|
+  | 1-bit LM | 0 | 0 | **0** | 2 | 2 |
+  | 2-bit LM | 0.00054 | 0.01347 | **0.00021** | 4 | 4 |
+  | 4-bit LM | 0.00360 | 0.02523 | **0.01097** | 16 | 16 |
+  | 8-bit LM | 0.00527 | 0.02631 | 0.02518 | 195 | 86 |
+  | 8-bit uni | 0.00394 | 0.02554 | **0.02305** | 254 | 81 |
+
+- 2026-09-24 端到端模拟（Gaussian B2048 K2048 N1024 group128，参考=理想量化计算；
+  锚点全对上：激活 int8 0.00646≈0.0065、LM8→int8 0.00527≈0.0053、
+  8bitLM 总 0.01277≈wxa8-plan 0.0128）：
+  - 2-bit（MoE 主力）：wxa8 0.00650 / wxfp8 0.02573（激活主导，码本贡献仅 0.00028）
+  - 4-bit：wxa8 0.00859 / wxfp8 0.03062
+  - 8-bit uni（attention 现役）：wxa8 0.00948 / wxfp8 0.03669（**3.9×，码本占用 256→81 Byte**）
+- 结论：①MoE 权重侧 fp8 化基本免费（2-bit 甚至优于 int8），2bpw checkpoint 可直接用；
+  ②attention W8→e4m3 有实质退化，混合部署（attention 保 wxa8）列为 WF-5 后的备选决策；
+  ③激活 e4m3 2.57% 是全局主误差源，ppl 影响待 WF-5。下一步 WF-2（激活量化 kernel）。
 
 ### WF-2：激活量化 fp8 kernel（未开始）
 
