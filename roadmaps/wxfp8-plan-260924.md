@@ -178,7 +178,7 @@ FP8 对应改造（WxFP8 要做的）：
 
 > 遵守项目规范：不自定版本号；每阶段 relerr/耗时数据记录在本文件，git 由本人操作。
 > **执行日志规则**：每完成一个阶段（或阶段内值得记录的中间结果），必须在 §七 执行日志
-> 对应小节追加一条（日期 + 做了什么 + 实测数据 + 结论/下一步），当天完成当天记。
+> 对应小节追加一条（日期 + 做了什么 + 实测数据 + 结论/下一步），再给一段 git comment 的信息，当天完成当天记。
 
 ---
 
@@ -218,6 +218,7 @@ conda run -n dart312 eval_qwen35.py models/<ckpt_dir> --inference-quant-mode wxf
 - 2026-09-24：§三 补执行日志规则，新增 §七 执行日志区（本人要求：每做一步更新日志）。
 - 2026-09-24 WF-1：`build_fp8_codebook` 落地 + 码本/端到端精度实测（数据见 §七 WF-1）；
   §1.3 与精度表按实测修正（4-bit 预测过乐观、W8 uni 塌级确认）。
+- 2026-09-24 WF-2：`_rotate_quantize_kernel_fp8` 落地 + 对拍/边界/填充度实测（§七 WF-2）。
 
 ---
 
@@ -261,9 +262,22 @@ conda run -n dart312 eval_qwen35.py models/<ckpt_dir> --inference-quant-mode wxf
   ②attention W8→e4m3 有实质退化，混合部署（attention 保 wxa8）列为 WF-5 后的备选决策；
   ③激活 e4m3 2.57% 是全局主误差源，ppl 影响待 WF-5。下一步 WF-2（激活量化 kernel）。
 
-### WF-2：激活量化 fp8 kernel（未开始）
+### WF-2：激活量化 fp8 kernel ✅ 已完成（2026-09-24）
 
-- （待记）
+- 2026-09-24 `_rotate_quantize_kernel_fp8` + `rotate_quantize_fused_fp8` +
+  `quantize_act_per_token_group_fp8`：与 int8 版（`triton_kernels_a8.py:428`）逐行对应，
+  只有量化尾不同（`round+clamp+int8` → `.to(tl.float8e4nv)`，satfinite 饱和天然安全，
+  无需 clamp）。scale=amax/448，EXTRA_SCALE 折叠机制不变。
+- 2026-09-24 实测（`test/test_wxfp8_act_quant_prec.py`）：
+  - 锚点复现：int8 0.00646 / e4m3 0.02573
+  - 融合 kernel 对拍：relerr 0.02573 == 参考实现；e4m3 字节差 37/4194304
+    （旋转 fp32 求和顺序差导致的 RTNE 边界翻转）；scale 最大差 2.4e-7；无 NaN/Inf
+  - 边界用例：全零行 dequant 精确为 0；1e4 离群值行 relerr 0.026（旋转摊平 →
+    QuaRot 效应符合设计）；幅度 1e-3 行（scale 深入 fp16 次正规区）relerr 0.0253
+    —— **fp16 次正规 scale 存储实测不是问题**（失真低于量化噪声底）
+  - GPU 填充度：B=2048 驻留 50%（1 wave）1.00 TB/s；B=16384 驻留 100%（4 wave）
+    1.38 TB/s（峰值的 77%，带宽受限符合预期，与 int8 版同结构同量级）
+- 结论：激活量化 fp8 化闭环，可直接供 WF-3 的 GEMM kernel 消费。下一步 WF-3。
 
 ### WF-3：wxfp8 GEMM kernels（未开始）
 
