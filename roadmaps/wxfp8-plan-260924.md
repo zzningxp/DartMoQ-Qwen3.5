@@ -1,0 +1,251 @@
+# WxFP8 路线规划（2026-09-24）
+
+> **定位**：WxFP8 **不是为了在 8-bit 上赢过 WxA8**——`wxa8-plan-260829.md:186-191` 已有决策记录， e4m3 在 kernel 速度（403 vs 526 TOPS）、激活精度（2.57% vs 0.65%）、码本精度（2.65% vs 0.53%） 三个轴上全败给 uniform-codebook int8。出自 test/test_wxa8_attn_fp8_spike.py（WxA8 P3 阶段在本机跑的决策 spike）。
+> 本路线的动机是：**为 WxFP4 建立浮点量化的基础设施**（scale 语义、浮点码本转换、浮点激活存储与 kernel 结构），fp4 阶段直接复用。SM120 上 int4 没有 tensor core（WxA4 规划中的 WGMMA int4 路线在 Triton 上不可行），**FP4 是激活侧唯一还能"存储减半 + MMA 吞吐翻倍"的方向**；而 fp4 的 scale/存储/量化框架与 fp8 同构，先把 fp8 走通是风险最低的预备步骤。
+
+---
+
+## 一、调研结论（本机实测，2026-09-24）
+
+环境：RTX 5090（sm_120，driver 570.169），torch 2.9.0+cu128，triton 3.5.0，conda dart312。
+
+### 1.1 硬件/软件能力实测表（探测脚本：`test/test_wxfp8_capability_probe.py`）
+
+| 能力 | 状态 | 实测数据 |
+|---|---|---|
+| Triton `tl.dot(fp8e4m3, fp8e4m3)` | ✅ | 353 TFLOPS @4096³（int8 448 / bf16 190，即 fp8 ≈ 0.79×int8 ≈ 1.86×bf16） |
+| Triton `tl.dot(fp8, bf16)` 混合 | ❌ | `Unsupported lhs dtype fp8e4nv`，不允许混合 dtype dot |
+| Triton `tl.dot_scaled(e2m1,e2m1)`（mxfp4） | ⚠ 仅功能 | 112 TFLOPS @4096³，低于 bf16 → 确认走**软件模拟**（upcast bf16），非原生 MX MMA |
+| cuBLASLt fp8（`torch._scaled_mm`）tensorwise | ✅ | 377 TFLOPS @4096³，rel_err 0.038 |
+| cuBLASLt fp8 rowwise | ✅ | rel_err 0.037 |
+| cuBLASLt fp8 **1x128 blockwise**（DeepSeek 风格） | ❌ | sm_120 校验不通过（报错枚举中无有效布局组合走通） |
+| cuBLASLt **mxfp8**（1x32 + e8m0 scale） | ⚠ 存疑 | 配置被接受、能出结果，但 rel_err 0.68 异常偏大 → 疑 scale 被按 swizzle 块布局解释，eager 侧无配套 swizzle 工具 |
+| cuBLASLt **nvfp4**（1x16 + e4m3 scale） | ⚠ 未走通 | dtype `float4_e2m1fn_x2` 已注册、`_scaled_mm` 错误信息枚举了该配置；但 eager `copy_` 未实现（无法从 float 转换）、4 种布局枚举均被形状校验拒绝 → 布局约定待考古（fp4 阶段任务） |
+| cuBLASLt int8（`_scaled_mm`） | ❌ | 不支持（无冲突：当前 WxA8 int8 走自写 Triton kernel） |
+| torch eager `.to(float8_e4m3fn)` | ⚠ 有坑 | 越界（>448）产生 **NaN 而非饱和**（500→nan） |
+| Triton `.to(tl.float8e4nv)` | ✅ | **饱和到 ±448**（satfinite），kernel 内量化天然安全 |
+
+关键结论：
+1. **主路径仍是 Triton**——fp8 `tl.dot` 在 sm_120 + triton 3.5.0 原生可用，走真 fp8 MMA（1.86×bf16
+   可证），且与 WxA8 同技术栈，kernel 结构可平移。
+2. **fp8 在 Triton 里比 int8 慢 ~20%**（353 vs 448）——与 wxa8-plan 旧记录一致，接受（fp4 铺路定位）。
+3. fp4 的三条候选路径全部不成熟：Triton `dot_scaled` naive 用法仅模拟（112 TFLOPS，无 TMA 所致，
+   §1.2）、cuBLASLt nvfp4 eager 未走通、CUTLASS 需大工程 → **佐证"先 fp8 铺基础设施、fp4 路径
+   边走边定"的路线**（fp4 四条候选路线详见 §1.2b，其中 Triton TMA+persistent 与 TE 两条可行性
+   高于最初预期）。
+
+### 1.2 生态调研（除 Triton 外的库；含 web 调研，来源见文末）
+
+| 库 | sm_120 (5090) 状态 | 对本项目的可用性 |
+|---|---|---|
+| cuBLASLt（经 `torch._scaled_mm`） | ✅ fp8 tensorwise/rowwise 实测可用；CUDA 12.9+ 另有 16/32/128 元素 1D 块缩放与 outer-vector fp8 缩放 | perf 参照系（实测 377 TFLOPS > Triton 353）；注意 Cloudrift 报告 cuBLAS 在 sm_120 曾欠调优（~60% 峰值） |
+| CUTLASS | ✅ 3.9.0（2025-04-24）起支持 SM120 kernel；SM12x block-scaled（MXFP8/NVFP4）kernel 存在，Colfax 有完整教程系列；⚠ SM120 smem 仅 ~100 KiB（SM100 tile 配置不可直接复用） | 后备；dense fp8 可用，grouped GEMM（MoE）在 sm_120 尚不成熟（vllm#43814 未合）；fp4 阶段的主要蓝图 |
+| DeepGEMM（DeepSeek） | ❌ 官方仅 SM90/SM100（#236：维护者无 sm_120 设备、无计划）；社区 PR #447 在侧分支待合 | 不可用；其 1x128 激活 + 128x128 权重的 scale 方案仍是设计参考 |
+| Marlin（vLLM） | fp8 Marlin = **W8A16 权重-only**，不是激活 fp8 路线；NVFP4 Marlin 可在 SM120 跑 | 非 wxfp8 候选 |
+| TensorRT-LLM | ✅ v0.17.0 起官方支持 RTX 50 系；fp8 w8a8 与 fp4/nvfp4 均可在 sm_120 跑 | engine 级，非 kernel 库；证明 NVIDIA 自家 sm_120 fp8/fp4 kernel 存在且快 |
+| vLLM | ✅ block fp8（per-128）SM120 kernel 已合（v0.10.1，#22131）；且正在调优 **Qwen3.5 专用** fp8 GEMM（#54182） | 佐证 per-128 块缩放 fp8 在 sm_120 的 CUTLASS 路线可行；int8 w8a8 被 vLLM 政策性关闭（非硬件限制） |
+| TransformerEngine | ✅ v2.15（2026-05）起 sm_120 硬件 NVFP4 可用（实测 1.77× bf16，TE#2968）；fp8 recipe 包装 `_scaled_mm` | **fp4 阶段的现成库候选**（"consumer Blackwell 上唯一有硬件 fp4 加速的上游路径"，forgather#38） |
+| FlashInfer | ✅ SM120/121（fp8/nvfp4 KV cache + GEMM） | attention 侧远期候选 |
+| torchao | fp8 rowwise 同 `_scaled_mm`；mxfp4/nvfp4 路径 gated 到 SM100+ | 量化策略参考，不直接引入 |
+
+**Triton 版本关键事实**（triton#7188）：fp8 `tl.dot` 在 **3.3.x 会静默降级 fp16 MMA**（PTX 里是
+`mma...f16.f16`），**3.4.0 起才是原生 `mma.sync...e4m3.e4m3`**（m16n8k32 族，与 int8 同族）。
+本机 triton 3.5.0 ✓（1.86×bf16 的实测比例亦印证原生路径）。⚠ 若环境里残留 `pytorch-triton`
+遮蔽新版会重新触发降级——运行时检查 `triton.__version__`。
+
+**Triton MX/fp4 路径的关键事实**（triton#8548, forgather#38）：`tl.dot_scaled` 在 sm_12x 上
+**必须 TMA descriptor + persistent 调度才走原生块缩放 MMA，否则静默 bf16 模拟**——这正是
+本机探测 112 TFLOPS（< bf16 190）的原因：naive kernel 无 TMA。vLLM #31089 的 SM120 MXFP4
+Triton GEMM（TMA+persistent）是可参考的实现。另：Triton `dot_scaled` 只支持 MX（1x32 + e8m0），
+**不支持 NVFP4**（1x16 + e4m3 scale）。
+
+### 1.2b FP4 路线前瞻（WF-6 的输入，本阶段不决策）
+
+5090 硬件有 FP4 tensor core（dense ≈ 2× fp8），但 sm_120 **没有 tcgen05/TMEM**（FA4、SM100
+kernel 均不可用），块缩放 MMA 要求编译目标 **sm_120a**（PyTorch 自动 gencode 会丢 `a` 后缀，
+pytorch#172807——经 stock PyTorch 走 fp4 很脆）。可用路线按工程量排序：
+
+1. **Triton TMA + persistent MXFP4**（vllm#31089 参考）——与我们技术栈最连续；
+2. **CUTLASS SM12x block-scaled**（Colfax 教程为蓝图，`mma.sync .kind::mxf8f6f4/.nvf4`）；
+3. **TransformerEngine v2.15 NVFP4 recipe**——现成库，1.77× bf16 实测，但引入 TE 依赖；
+4. cuBLASLt 块缩放 fp4（CUDA 12.9+；本机 torch eager 的 `_scaled_mm` fp4 仍未走通，§1.1）。
+
+### 1.3 与 WxA8/WxA16 的关系（本次调研的核心问题）
+
+**Q2：从 A16→A8 调过一次量化过程（码本），FP8 是否还要对应改一次？——是，且机制完全同构。**
+
+A16→A8 改了什么（`triton_kernels_a8.py`）：
+- `build_int8_codebook`（:526-550）：fp16 码本 → int8 网格，`cb_step = max|cb|/127` 折进激活
+  scale（`extra_scale` 通道，`wxa8/bit_partitioned_moe.py:73-78`）
+- attention W8 特殊处理：Lloyd-Max 256 级码本 → 均匀 int8 网格会塌成 ~195 级（W8→W6），
+  解决方案是 **uniform 码本 + IDENTITY_CB**（`idx - 128` 免查表，`triton_kernels_a8.py:120-124`）
+
+FP8 对应改造（WxFP8 要做的）：
+- `build_fp8_codebook`：fp16 码本 → e4m3。**低 bit（1/2/4，≤16 级）预计近无损**——每码本一个
+  `cb_scale = max|cb|/448` 折进激活 scale（同 `cb_step` 机制，复用 `extra_scale` 通道）；
+  16 级值经 scale 后落在 e4m3 网格上的失配预计 << 1%（WF-1 实测确认）
+- **W8 uniform 码本 → e4m3 是新的精度风险点**：e4m3 全网格只有 ~254 个值且零点附近密、
+  远处疏，均匀 256 级网格映射过去必有塌级（与当初 Lloyd-Max→int8 同类问题）。
+  缓解：直接存 256-entry **e4m3 LUT**（每 entry 是最近的 e4m3 表示），kernel 内查表，
+  塌级程度 WF-1 实测（当初 int8 化的对照数据：relerr 0.00075→0.0128）
+- 结论：**码本需要一次 fp8 化改造，位置与 `build_int8_codebook` 对称（load 时），checkpoint 不动**
+
+**Q3：存储是否独立？——持久化存储不独立，运行时产物独立。**
+
+- **权重 checkpoint（持久化）完全共享**：packed uint8 indices + fp16 码本 + fp16 norms，
+  A16/A8/FP8(/FP4) 同一份文件（`quantization/wxa8/__init__.py:1-4` 已明确此原则）。
+  fp8 化与 int8 化一样发生在 **load 时**，不落盘。
+- **激活（transient，本就不持久化）各自独立**：A8 = int8 + fp16 per-group scale；
+  FP8 = e4m3 + per-group scale；FP4 = packed e2m1 + 块 scale（32 或 16 元素/块）。
+  这不是"独立一套存储系统"，只是 kernel 输入 tensor 的 dtype 不同。
+- **kernel 文件独立**（惯例）：`triton_kernels_a8.py` → `triton_kernels_fp8.py`；
+  `quantization/wxa8/` → `quantization/wxfp8/`（`linear.py` + `bit_partitioned_moe.py` 平移结构）。
+- **FP4 阶段才出现真正的存储分化**：若走 Triton 模拟路径，激活 packed e2m1 只是 transient；
+  若走 cuBLASLt nvfp4，则 scale 需要 swizzle 布局——那是 fp4 阶段的决策，fp8 阶段不预设。
+
+### 1.4 待确认清单（web 调研返回后更新）
+
+- [x] DeepGEMM sm_120 支持状态 → **不支持**（#236，维护者无计划；社区 PR #447 待合）
+- [x] Triton 后续版本 sm_120 原生 MX 支持 → **有条件支持**：需 TMA + persistent（triton#8548）；
+      `dot_scaled` 不支持 NVFP4（仅 MX 1x32 + e8m0）；本机 3.5.0 落后当前 3.8.0 一年，升级与否
+      留作 fp4 阶段决策（遵守"不降级"原则，升级需独立验证）
+- [ ] cuBLASLt nvfp4 的 eager/PTX 级布局约定（fp4 阶段任务；TE/CUTLASS 路线可能绕开）
+- [ ] mxfp8 `_scaled_mm` 的 scale swizzle 要求（仅当 fp8 想用 1x32 块 scale 时才需要，非主路径）
+
+---
+
+## 二、技术方案（WxFP8）
+
+### 数据流（一层 MoE 为例，★ = 相对 WxA8 的改动点）
+
+```
+上一层输出 (FP16)
+    ↓
+[分组旋转]  per-group QR 正交旋转（group_size=128）            ← 不变
+    ↓
+[激活量化]  per-token per-group 对称量化 → ★ E4M3 + scale
+    scale = amax(group)/448（e4m3 max），Triton satfinite 饱和   ← 改输出 dtype 与 scale 语义
+    ↓
+[矩阵乘法]  ★ E4M3 激活 × E4M3 码本权重 → tl.dot 原生 FP32 累加
+    权重 unpack → ★ 查 E4M3 码本（或 W8 uniform 的 e4m3 LUT）    ← 改码本路径
+    ↓
+[反量化]   ★ acc_fp32 × act_scale[b,g] × norms_gf[n,g] → FP16
+    （含 cb_scale，同 extra_scale 机制；无 int32→fp32 组边界转换） ← 结构不变，去 int32 技巧
+    ↓
+[非线性/下一层]                                               ← 不变
+```
+
+### 核心要点
+
+- **A-FP8 = 参与矩阵运算的激活输入是 e4m3**（e4m3 而非 e5m2：尾数多 1 bit、max 448 配合
+  satfinite 更适合激活；e5m2 留作离线对照）
+- **累加器从"int32 组内 + fp32 组间"简化为原生 fp32 dot 累加**——`tl.dot(fp8,fp8)` 默认
+  fp32 acc，组边界 epilogue 仍乘 `xs_g * norm_g`，`_wxa8_fused_matmul_kernel_grouped_gf`
+  的骨架（行/列切片、hoisted 旋转、per-expert 三量化点）原样平移
+- **量化点不变**：gate_up hoisted（`_build_hoisted_rotations`）、down per-expert、attention
+  linear（`WxA8Linear.forward` 结构）——`_rotate_quantize_kernel` 输出改 e4m3，
+  `quantize_act_per_token_group` 参考实现同步改
+- **scale 粒度 = group 128**（与旋转/norms/现有 epilogue 对齐）；1x32 mx 风格留作对照实验
+  （cuBLASLt mxfp8 的 swizzle 问题未解，Triton 侧 dot_scaled 无加速，不作为主路径）
+- **速度预期**：GEMM 约 0.79×int8（353/448）→ wxfp8 全链路预计略慢于 wxa8，约 -10~-20%；
+  这是铺路成本，fp4 阶段回收（fp4 存储减半 + 若走通原生 MMA 再翻倍）
+
+### 精度预期与风险
+
+| 项 | WxA8 实测 | WxFP8 预期 | 风险 |
+|---|---|---|---|
+| 激活 relerr | 0.65%（int8 per-group） | ~2.5%（e4m3 per-group，wxa8-plan:190 已测 2.57%） | **主风险**，~4× 退化 |
+| 低 bit 码本 relerr | 1bit 0.65% / 2bit 0.65% / 4bit 0.86% | 预计持平（≤16 级 e4m3 近无损） | 低，WF-1 实测 |
+| W8 uniform 码本 | 0%（int8 精确映射；spike 里 0.53% 是被否决的 Lloyd-Max→int8 路线） | 待实测（e4m3 LUT 塌级） | 中，attention 敏感 |
+| ppl | 基线 | 主观预测退化 0.1-0.5 | WF-5 实测；若不可接受，敏感层保留 A8 的混合方案（fp8 只铺 MoE），决策点在 WF-5 后 |
+
+---
+
+## 三、实施步骤
+
+| 阶段 | 内容 | 产出 | 验证方式 |
+|---|---|---|---|
+| WF-0 | 本调研 + 能力探测脚本固化 | 本文件 + `test/test_wxfp8_capability_probe.py` | 已跑通（本文表格即输出） |
+| WF-1 | `build_fp8_codebook`（低 bit + W8 uniform LUT）+ 离线精度表 | `triton_kernels_fp8.py` 码本工具 | `test/test_wxfp8_codebook_prec.py`（对照 wxa8-plan:531-542 的 relerr 表格式） |
+| WF-2 | `_rotate_quantize_kernel` fp8 版（e4m3 输出 + satfinite + scale=amax/448） | 同上文件 | `test/test_wxfp8_act_quant_prec.py`（relerr + 饱和边界用例） |
+| WF-3 | wxfp8 GEMM kernels：先 attention 全矩阵，后 MoE gate_up/down 三量化点 | `triton_kernels_fp8.py` + tile 配置表 | `test/test_wxfp8_gemm_align.py`（与 fp16 参考逐 tile 对齐 + GPU 填充度/SM 占用分析，遵守 kernel 测试规范） |
+| WF-4 | `quantization/wxfp8/`（linear.py + bit_partitioned_moe.py）+ `--inference-quant-mode wxfp8` 入口 | 包 + run/eval 入口接线 | 单层 forward 对齐测试 |
+| WF-5 | 全模型 ppl 验证 | 结果记录进本文件 | **手动**：`eval_qwen35.py`（命令见 §四） |
+| WF-6 | （展望）WxFP4：kernel 路径三选一（cuBLASLt nvfp4 布局考古 / CUTLASS / Triton 模拟仅存储收益） | 新规划文件 | — |
+
+> 遵守项目规范：不自定版本号；每阶段 relerr/耗时数据记录在本文件，git 由本人操作。
+> **执行日志规则**：每完成一个阶段（或阶段内值得记录的中间结果），必须在 §七 执行日志
+> 对应小节追加一条（日期 + 做了什么 + 实测数据 + 结论/下一步），当天完成当天记。
+
+---
+
+## 四、手动测试命令（WF-0 已就绪）
+
+```bash
+# 能力探测（本文件 §1.1 表格的来源，约 1 分钟，显存 <2GB）
+conda run -n dart312 python test/test_wxfp8_capability_probe.py
+
+# WF-5 全模型 ppl（占大量显存，本人手动跑）
+conda run -n dart312 eval_qwen35.py models/<ckpt_dir> --inference-quant-mode wxfp8
+```
+
+---
+
+## 六、参考来源（web 调研）
+
+- Triton fp8 sm_120 修复与版本线：triton#7188（3.3.x 静默 fp16 降级 → 3.4.0 原生 e4m3 MMA）
+- Triton MX 需 TMA+persistent：triton#8548、forgather#38（GB10/sm_121，Triton 3.6 实测）
+- vLLM SM120 MXFP4 Triton GEMM：vllm#31089；SM120 block fp8 per-128：vllm#22131（v0.10.1）；
+  Qwen3.5 fp8 GEMM SM120 调优：vllm#54182；SM120 grouped GEMM 未合：vllm#43814/#43507
+- DeepGEMM 不支持 sm_120：DeepGEMM#236；社区 sm_120a PR：DeepGEMM#447（侧分支）
+- `_scaled_mm` 1x128 blockwise 为 sm90/sm100 CUTLASS 专属：pytorch#130359 背景；
+  公共 API RFC：pytorch#157950；gencode 丢 `a` 后缀：pytorch#172807
+- cuBLAS 12.9 块缩放：NVIDIA blog "Boosting Matrix Multiplication ... with cuBLAS 12.9"；
+  sm_120 欠调优：Cloudrift 博客
+- CUTLASS SM120 支持：CUTLASS changelog 3.9.0（2025-04-24）；NVFP4 SM12x 蓝图：
+  Colfax "NVFP4 Blockscaled GEMM on RTX PRO Blackwell (SM12x)" 及其优化续篇（2026-08）
+- TransformerEngine sm_120 NVFP4：TE#2956/#2968（v2.15，1.77× bf16）
+- TensorRT-LLM RTX 50 系支持：v0.17.0 release notes、TRT-LLM#5018
+- FP8/e4m3 数值与 PTX cvt.rn.satfinite：OCP FP8 spec（arXiv:2209.05433）、PTX ISA
+- 5090 FP4 硬件与 sm_120 缺失 tcgen05/TMEM：NVIDIA RTX Blackwell 架构白皮书
+
+## 五、变更记录
+
+- 2026-09-24 WF-0：初版调研 + 本机能力实测 + web 生态调研（本文件）。
+- 2026-09-24：§三 补执行日志规则，新增 §七 执行日志区（本人要求：每做一步更新日志）。
+
+---
+
+## 七、执行日志
+
+> 条目格式：`- 日期 事项：做了什么 → 实测数据 → 结论/下一步`。数据必须抄实测输出，不写主观估计。
+
+### WF-0：调研 + 能力探测 ✅ 已完成
+
+- 2026-09-24 能力探测：固化 `test/test_wxfp8_capability_probe.py` 并跑通 →
+  §1.1 表格全项（tl.dot fp8 353 TFLOPS / int8 447 / mxfp4 dot_scaled 110=模拟 /
+  _scaled_mm tensorwise+rowwise OK、1x128 ❌、mxfp8 存疑 0.68、nvfp4 未走通 /
+  torch NaN vs Triton satfinite）→ 关键结论见 §1.1"关键结论"三条。
+- 2026-09-24 web 生态调研：DeepGEMM ❌ sm_120、Triton MX 需 TMA+persistent、TE v2.15 NVFP4 可用 →
+  §1.2/§1.2b/§六。
+- 2026-09-24 姊妹文件：`wxfp4-plan-260924.md`（下游预研规划）。
+
+### WF-1：码本 fp8 化（未开始）
+
+- （待记）
+
+### WF-2：激活量化 fp8 kernel（未开始）
+
+- （待记）
+
+### WF-3：wxfp8 GEMM kernels（未开始）
+
+- （待记）
+
+### WF-4：`quantization/wxfp8/` 包 + 入口接线（未开始）
+
+- （待记）
+
+### WF-5：全模型 ppl 验证（未开始）
+
+- （待记，ppl 数据 + 与 wxa8/wxa16 基线对比）
