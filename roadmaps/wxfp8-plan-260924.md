@@ -219,6 +219,9 @@ conda run -n dart312 eval_qwen35.py models/<ckpt_dir> --inference-quant-mode wxf
 - 2026-09-24 WF-1：`build_fp8_codebook` 落地 + 码本/端到端精度实测（数据见 §七 WF-1）；
   §1.3 与精度表按实测修正（4-bit 预测过乐观、W8 uni 塌级确认）。
 - 2026-09-24 WF-2：`_rotate_quantize_kernel_fp8` 落地 + 对拍/边界/填充度实测（§七 WF-2）。
+- 2026-09-24 WF-3：融合 GEMM kernel + attention 路径落地，contract 对拍 2.1e-04，
+  MoE 形态 fp8/int8 = 0.89~1.00x（速度中性），attention 0.58x（LUT gather 代价）
+  → 混合部署证据链闭合（§七 WF-3）。
 
 ---
 
@@ -279,9 +282,31 @@ conda run -n dart312 eval_qwen35.py models/<ckpt_dir> --inference-quant-mode wxf
     1.38 TB/s（峰值的 77%，带宽受限符合预期，与 int8 版同结构同量级）
 - 结论：激活量化 fp8 化闭环，可直接供 WF-3 的 GEMM kernel 消费。下一步 WF-3。
 
-### WF-3：wxfp8 GEMM kernels（未开始）
+### WF-3：wxfp8 GEMM kernels ✅ kernel + attention 路径完成（2026-09-24）
 
-- （待记）
+- 2026-09-24 `_wxfp8_fused_matmul_kernel_grouped_gf` + `_launch_fp8` +
+  `wxfp8_matmul_grouped_gf`（attention 全矩阵）：与 int8 版
+  （`triton_kernels_a8.py:35`）逐行对应；累加器改 group 内原生 fp32 dot；
+  无 IDENTITY_CB（e4m3 网格对 idx 非线性，W8 也必须查 LUT）。
+  实现细节：fp8 指针的 masked load 不能给整型 `other`（int32→fp8e4nv
+  不可转换）→ 不给 other（被 mask 行列不写出，安全）。
+  tile 配置表先以 WxA8 表为种子（`_WXFP8_CONFIG_*`，待扫回填）。
+- 2026-09-24 实测（`test/test_wxfp8_gemm_align.py`）：
+  - contract 对拍（torch fp32 复算 kernel 数学契约）：
+    bit=2/4/8×4 形态全部 **2.1e-04**（fp16 scale 存储 + 累加序差异）；vs-理想量化 0.00021；
+    vs-fp32 与 WF-1 模拟一致（2bit 0.341 / 4bit 0.101 / attn 0.038）
+  - tile 扫描：6 组配置全部对齐（relerr 恒 2.07e-04）；attn 最优 (128,128,128,8,3) 223 TFLOPS
+  - **性能定位（关键发现）**：
+    | 形态 | fp8 | int8 | 比值 | 原因 |
+    |---|---|---|---|---|
+    | attn B16384 N4096 K2048 bit8 | 223 TF | 385 TO | **0.58x** | int8 走 IDENTITY_CB 免查表，fp8 必须逐元素查 256 项 LUT |
+    | MoE B2048 N1024 K2048 bit2 | 177 TF | 200 TO | **0.89x**（最优 cfg；1.00x@128,64,128） | 双方都查 LUT，公平 |
+  - 填充度：attn 最优 cfg 4096 CTA / 170 SM = 24.1 CTA/SM，驻留 100%（4 wave）
+- 结论：①kernel 数学正确性闭环；②**MoE 路径 fp8 速度中性（0.89~1.00x）**，
+  达到"fp4 铺路"的设计预期；③attention W8 fp8 三输（速度 0.58x + 精度 3.9x +
+  LUT 复杂度）——**混合部署（attention 保 wxa8、MoE 上 wxfp8）证据链闭合**，
+  最终由 WF-5 ppl 确认。MoE 切片 wrapper（gate_up 行切片 / down in_features
+  切片）随 WF-4 包接线一起做（kernel 本身已支持切片语义）。
 
 ### WF-4：`quantization/wxfp8/` 包 + 入口接线（未开始）
 

@@ -218,3 +218,205 @@ def rotate_quantize_fused_fp8(x: torch.Tensor, rot: torch.Tensor,
         num_warps=4, num_stages=3,
     )
     return x_f8, x_scale
+
+
+# ===========================================================================
+# WF-3：融合反量化 + FP8 matmul kernel（group-first 布局）
+# ===========================================================================
+
+@triton.jit
+def _wxfp8_fused_matmul_kernel_grouped_gf(
+    # Input
+    x_ptr,            # (B, K_total) e4m3   —— 已旋转并量化（rotate_quantize_fused_fp8）
+    xs_ptr,           # (B, NUM_GROUPS) fp16 —— per-token per-group 激活 scale（含 cb_scale）
+    # Quantized weight (group-first 布局)
+    indices_ptr,      # (NUM_GROUPS_TOTAL, N, PACKED_PER_GROUP) uint8
+    codebook_ptr,     # (n_levels,) e4m3 —— build_fp8_codebook 的 LUT
+    norms_ptr,        # (NUM_GROUPS_TOTAL, N) fp16 —— 与 WxA16/WxA8 的 norms_gf 同源
+                      #   （1/sqrt(gs) 已预乘；码本的 cb_scale 折在激活 scale 里）
+    # Output
+    output_ptr,       # (B, N) fp16
+    # Shape
+    B, N,
+    K_total,              # 总 K = num_groups * group_size
+    INDICES_G0_STRIDE,    # indices 第 0 维 stride = N * PACKED_PER_GROUP
+    NORMS_G0_STRIDE,      # norms 第 0 维 stride = N
+    XS_ROW_STRIDE,        # xs 第 0 维 stride = NUM_GROUPS_TOTAL
+    # Constexpr config
+    GROUP_SIZE: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,
+    BIT_WIDTH: tl.constexpr,
+    N_LEVELS: tl.constexpr,
+    BLOCK_B: tl.constexpr = 256,
+    BLOCK_N: tl.constexpr = 32,
+    BLOCK_K: tl.constexpr = 128,
+):
+    """WxFP8 multi-group fused dequant + FP8 matmul kernel（group-first 布局）。
+
+    与 _wxa8_fused_matmul_kernel_grouped_gf（triton_kernels_a8.py:35）逐行对应，
+    数学结构相同，三处不同：
+      1. 激活 tile 是 e4m3（1 byte，与 int8 同访存量）
+      2. 码本是 e4m3 LUT（build_fp8_codebook 产物）。无 IDENTITY_CB 路径——
+         e4m3 网格对 idx 非线性，8-bit 均匀码本也必须查表
+         （attention W8 的 LUT 塌级问题见 roadmap §1.3，混合部署为备选）
+      3. 累加器：group 内直接 fp32 dot 累加（int8 版是 int32 组内 + 出组转 fp32），
+         出 group 乘 (xs_g × norm_g) 的 epilogue 结构不变
+
+    注: indices_ptr / norms_ptr 指向切片后的起始位置（第 0 个待处理 group 的
+    起点），kernel 内 g 从 0 到 NUM_GROUPS-1；xs_ptr 指向完整 (B, NUM_GROUPS_TOTAL)
+    起点（同 int8 版约定，见其 docstring）。
+    """
+    pid_b = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    rb = pid_b * BLOCK_B + tl.arange(0, BLOCK_B)
+    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_b = rb < B
+    mask_n = rn < N
+
+    total_acc = tl.zeros((BLOCK_B, BLOCK_N), dtype=tl.float32)
+
+    ELEMENTS_PER_BYTE = 8 // BIT_WIDTH
+    PACKED_PER_GROUP = GROUP_SIZE // ELEMENTS_PER_BYTE
+
+    row_base = rn * PACKED_PER_GROUP  # (BLOCK_N,)
+
+    for g in range(NUM_GROUPS):
+        g_start = g * GROUP_SIZE
+        g_base = g * INDICES_G0_STRIDE
+
+        norm_g = tl.load(norms_ptr + g * NORMS_G0_STRIDE + rn, mask=mask_n, other=0.0)
+        xs_g = tl.load(xs_ptr + rb * XS_ROW_STRIDE + g, mask=mask_b, other=0.0)
+
+        acc_g = tl.zeros((BLOCK_B, BLOCK_N), dtype=tl.float32)
+
+        for k_start in range(0, GROUP_SIZE, BLOCK_K):
+            rk = k_start + tl.arange(0, BLOCK_K)
+            mask_k = rk < GROUP_SIZE
+
+            # 激活 tile：e4m3。masked load 不给 other（int 字面量无法转 fp8e4nv；
+            # 被 mask 的行/列只影响不会写出的输出行列，K 方向 gs=128 整除 BLOCK_K 无尾部）
+            inp_off = rb[:, None] * K_total + (g_start + rk)[None, :]
+            x_tile = tl.load(x_ptr + inp_off,
+                             mask=mask_b[:, None] & mask_k[None, :])
+
+            w_mask = mask_n[:, None] & mask_k[None, :]
+            if BIT_WIDTH == 8:
+                byte_off = g_base + row_base[:, None] + rk[None, :]
+                idx = tl.load(indices_ptr + byte_off, mask=w_mask, other=0).to(tl.int32)
+            else:
+                BIT_MASK = (1 << BIT_WIDTH) - 1
+                byte_col = rk // ELEMENTS_PER_BYTE
+                pos_in_byte = rk % ELEMENTS_PER_BYTE
+                byte_off = g_base + row_base[:, None] + byte_col[None, :]
+                packed = tl.load(indices_ptr + byte_off, mask=w_mask, other=0).to(tl.uint8)
+                shift = pos_in_byte * BIT_WIDTH
+                idx = ((packed >> shift[None, :]) & BIT_MASK).to(tl.int32)
+
+            # 码本查表 → e4m3 权重 tile（不给 other，理由同上）
+            w_f8 = tl.load(codebook_ptr + idx, mask=w_mask)
+            acc_g += tl.dot(x_tile, tl.trans(w_f8))
+
+        # 出 group：乘 (激活 scale × 权重 scale)，累加进总累加器
+        total_acc += acc_g * xs_g[:, None] * norm_g[None, :]
+
+    tl.store(
+        output_ptr + rb[:, None] * N + rn[None, :],
+        total_acc.to(output_ptr.dtype.element_ty),
+        mask=mask_b[:, None] & mask_n[None, :],
+    )
+
+
+# ---------------------------------------------------------------------------
+# tile 配置表：先用 WxA8 表作为种子（结构同、访存量同量级），标注待扫。
+# 格式: (BLOCK_B, BLOCK_N, BLOCK_K, num_warps, num_stages)
+# ⚠ fp8 dot 与 int8 dot 的 MMA 吞吐不同（~0.79x），最优点可能偏移，
+#   接线后按 kernel_autotune 流程补扫（对齐 wxa8 表的实测注释风格）。
+# ---------------------------------------------------------------------------
+_WXFP8_CONFIG_ATTN = {
+    "small": {
+        8: (64, 128, 128, 8, 3),
+    },
+    "large": {
+        8: (128, 128, 128, 8, 3),
+    },
+}
+_WXFP8_CONFIG_GATE_UP = {
+    "small": {
+        1: (64, 32, 128, 8, 3), 2: (64, 32, 128, 8, 4), 4: (64, 32, 128, 8, 3),
+    },
+    "large": {
+        1: (256, 32, 128, 4, 2), 2: (256, 32, 128, 4, 2), 4: (256, 32, 128, 4, 2),
+    },
+}
+_WXFP8_CONFIG_DOWN = {
+    "small": {
+        1: (64, 32, 128, 8, 3), 2: (64, 32, 128, 8, 3), 4: (64, 32, 128, 8, 2),
+    },
+    "large": {
+        1: (128, 32, 128, 4, 2), 2: (256, 32, 128, 4, 2), 4: (256, 32, 128, 4, 2),
+    },
+}
+_B_THRESHOLD_SMALL = 256
+_WXFP8_DEFAULT_CONFIG = (64, 32, 128, 4, 2)
+
+
+def get_wxfp8_config(bit_width: int, direction: str = "gate_up", B: int | None = None):
+    """取指定 bit-width / 方向 / B 档位的 fp8 tile 配置（当前为 WxA8 种子值，待扫）。"""
+    if direction == "attn":
+        table = _WXFP8_CONFIG_ATTN
+    elif direction == "down":
+        table = _WXFP8_CONFIG_DOWN
+    else:
+        table = _WXFP8_CONFIG_GATE_UP
+    size_key = "small" if (B is not None and B <= _B_THRESHOLD_SMALL) else "large"
+    return table[size_key].get(bit_width, _WXFP8_DEFAULT_CONFIG)
+
+
+def _launch_fp8(x_f8, x_scale, indices_slice, cb_f8, norms_slice,
+                group_size, num_groups, bit_width, direction, cfg=None):
+    """kernel 启动公共入口（对应 int8 版 _launch）。"""
+    B = x_f8.shape[0]
+    N = indices_slice.shape[1]
+    K_total = x_f8.shape[1]
+
+    out = torch.empty(B, N, dtype=torch.float16, device=x_f8.device)
+
+    BLOCK_B, BLOCK_N, BLOCK_K, num_warps, num_stages = (
+        cfg if cfg is not None
+        else get_wxfp8_config(bit_width, direction=direction, B=B))
+
+    grid = (triton.cdiv(B, BLOCK_B), triton.cdiv(N, BLOCK_N))
+    _wxfp8_fused_matmul_kernel_grouped_gf[grid](
+        x_f8, x_scale, indices_slice, cb_f8, norms_slice, out,
+        B, N, K_total,
+        indices_slice.stride(0), norms_slice.stride(0), x_scale.stride(0),
+        GROUP_SIZE=group_size, NUM_GROUPS=num_groups,
+        BIT_WIDTH=bit_width, N_LEVELS=cb_f8.shape[0],
+        BLOCK_B=BLOCK_B, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        num_warps=num_warps, num_stages=num_stages,
+    )
+    return out
+
+
+def wxfp8_matmul_grouped_gf(
+    x_f8, x_scale, indices_packed_gf, cb_f8, norms_gf,
+    group_size, num_groups, bit_width: int, cfg=None,
+):
+    """attention 路径：完整矩阵（无切片）——对应 wxa8_matmul_grouped_gf。
+
+    Args:
+        x_f8: (B, K_total) float8_e4m3fn（rotate_quantize_fused_fp8 产物）
+        x_scale: (B, num_groups) fp16（已折 cb_scale）
+        indices_packed_gf: (num_groups, N, packed_per_group) uint8
+        cb_f8: (n_levels,) float8_e4m3fn（build_fp8_codebook 产物）
+        norms_gf: (num_groups, N) fp16，需已预乘 1/sqrt(group_size)
+
+    Returns:
+        output: (B, N) fp16
+    """
+    if bit_width not in {1, 2, 4, 8}:
+        raise ValueError(f"bit_width must be 1/2/4/8, got {bit_width}")
+    return _launch_fp8(
+        x_f8, x_scale, indices_packed_gf, cb_f8, norms_gf,
+        group_size, num_groups, bit_width, "attn", cfg=cfg,
+    )
