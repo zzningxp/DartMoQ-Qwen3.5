@@ -31,12 +31,14 @@ def main():
                         help="Use WxA16 real quantization (stored packed format, not fake quant). "
                              "--save-quantized 时自动启用，无需重复指定")
     parser.add_argument("--inference-quant-mode", type=str, default="wxa16",
-                        choices=["wxa16", "wxa8", "wxfp8"],
+                        choices=["wxa16", "wxa8", "wxfp8", "wxfp4"],
                         help="推理量化模式：wxa16 (FP16 激活+FP16 计算，默认) / "
                              "wxa8 (INT8 激活+INT8 Tensor Core，MoE 部分；"
                              "attention 保持 W8A16 直到 P3) / "
                              "wxfp8 (e4m3 激活+FP8 Tensor Core，MoE 部分；"
-                             "attention 默认混合部署保 wxa8)")
+                             "attention 默认混合部署保 wxa8) / "
+                             "wxfp4 (保守版：bit1/4 expert e2m1+FP4 MX MMA，"
+                             "bit2 与 attention 维持 wxa8；需 dart312-t38 环境)")
     parser.add_argument("--save-quantized", type=str, default=None, help="Save quantized checkpoint (packed format) to this directory after quantization")
     parser.add_argument("--eval-batch-size", type=int, default=32, help="Batch size for normal (non-sequential) PPL evaluation")
     parser.add_argument("--load-quantized", type=str, default=None, help="Load quantized checkpoint from this directory, skip calibration & quantization, directly run PPL eval")

@@ -28,38 +28,51 @@ E2M1_MAX = 6.0
 
 
 def build_e2m1_codebook(codebook: torch.Tensor):
-    """把 fp16/fp32 码本转成 e2m1 nibble LUT，返回 (nib_lut, pow2_scale)。
+    """把 fp16/fp32 码本转成 e2m1 nibble LUT（连续 scale 搜索 + residual 分解）。
 
-    满足 `codebook[i] ≈ e2m1_value(nib_lut[i]) * pow2_scale`，且 pow2_scale
-    是 2 的整数幂——这样 W 侧的 per-32 e8m0 块缩放可以取全局常量
-    （block_scale = 0x7F + log2(pow2_scale)），分解链与 wxfp8 的
-    `cb ≈ lut × cb_scale`（折进激活 extra_scale）完全同构，norms 侧不动。
+    分解链：`codebook[i] ≈ e2m1_value(nib[i]) × 2^E0 × residual`
+      - 2^E0：进 W 侧 e8m0 通道（常量块缩放，byte = 127 + E0）
+      - residual：任意常数，折进 norms_gf（fp16，epilogue 兜底）——
+        e8m0 只能取 2 的幂，非 2 幂残差必须走这条路（与 wxfp8 的
+        cb_scale 折激活 scale 同构，只是 fp4 的激活通道装不下任意常数）
 
-    scale 搜索空间限制为 2^e（e ∈ [-31, 31]）：e2m1 浮点网格尺度不变，
-    但只有 7 个幅度，比 e4m3 的搜索（连续 scale）余量小；
-    2-bit 码本 4 级的最优比值匹配误差实测见 test（预期 ~5-10%，
-    被 2-bit 量化噪声本身 ~34% 淹没，端到端影响可忽略）。
+    scale 用连续搜索（对数粗扫 + 两轮细化）：1-bit 的 ±a 可精确落格
+    （residual 吸收非 2 幂因子），各 bit 误差实测见 test_wxfp4_gemm_align。
     """
+    import math
     cb = codebook.float()
     cb_max = cb.abs().max()
     if cb_max <= 0:
         raise ValueError("码本全零，无法转 e2m1")
     grid = torch.tensor(E2M1_GRID, device=cb.device)
 
-    best_e, best_err = 0, float("inf")
-    best_lut = None
-    for e in range(-31, 32):
-        s = 2.0 ** e
-        if s > cb_max * 4:  # 网格最左非零 0.5×s 已超码本最大值太多，跳过粗扫头部
-            continue
+    def fit(s):
         y = (cb / s).clamp(-E2M1_MAX, E2M1_MAX)
         mag = torch.argmin((y.abs().unsqueeze(-1) - grid).abs(), dim=-1)
-        nib = (mag & 0x7) | ((y < 0).to(torch.uint8) << 3)
+        nib = ((mag & 0x7) | (((y < 0).to(torch.uint8) << 3).long())).to(torch.uint8)
         rec = grid[mag] * y.sign() * s
-        err = ((rec - cb).norm() / cb.norm()).item()
+        return nib, ((rec - cb).norm() / cb.norm()).item()
+
+    s0 = cb_max / E2M1_MAX
+    best_s, best_err = s0, float("inf")
+    best_lut = None
+    coarse = [s0 * (2.0 ** (i / 16.0)) for i in range(-16, 17)]
+    for s in coarse:
+        nib, err = fit(s)
         if err < best_err:
-            best_e, best_err, best_lut = e, err, nib
-    return best_lut.contiguous(), 2.0 ** best_e, best_e
+            best_s, best_err, best_lut = s, err, nib
+    for _ in range(2):
+        span = 2.0 ** (1 / 16)
+        lo, hi = best_s / span, best_s * span
+        fine = [lo * (hi / lo) ** (i / 64.0) for i in range(65)]
+        for s in fine:
+            nib, err = fit(s)
+            if err < best_err:
+                best_s, best_err, best_lut = s, err, nib
+
+    e0 = math.floor(math.log2(best_s))
+    residual = best_s / (2.0 ** e0)
+    return best_lut.contiguous(), e0, residual, best_err
 
 
 def quantize_act_e2m1_per32(x_rot: torch.Tensor):
@@ -263,6 +276,8 @@ def _wxfp4_fused_matmul_kernel_swapped_gf(
     output_ptr,   # (B, N) fp16
     B, N, K_total,
     INDICES_G0_STRIDE, NORMS_G0_STRIDE,
+    WS_STRIDE,          # w_s 行 stride（全局 K//32；切片时按全局布局免拷贝）
+    WS_KOFF,            # w_s 的 k-block 全局偏移（down 切片 = original_start//32）
     GROUP_SIZE: tl.constexpr,
     NUM_GROUPS: tl.constexpr,
     BIT_WIDTH: tl.constexpr,
@@ -339,8 +354,9 @@ def _wxfp4_fused_matmul_kernel_swapped_gf(
             nib3 = tl.reshape(nib, (BLOCK_N, BLOCK_K // 2, 2))
             w_byte = tl.sum(nib3.to(tl.int32) * pk_w[None, None, :], axis=2).to(tl.uint8)
 
-            # lhs scale (BN, BK/32)
-            ws_off = rn[:, None] * (K_total // 32) + (g_start + k_start) // 32 + rk_sc[None, :]
+            # lhs scale (BN, BK/32)——按全局 w_s 布局寻址（WS_STRIDE/WS_KOFF）
+            ws_off = rn[:, None] * WS_STRIDE + WS_KOFF \
+                + (g_start + k_start) // 32 + rk_sc[None, :]
             ws_tile = tl.load(w_s_ptr + ws_off,
                               mask=mask_n[:, None]
                               & ((k_start // 32 + rk_sc) < (GROUP_SIZE // 32))[None, :],
@@ -377,11 +393,91 @@ def wxfp4_matmul_grouped_gf_swapped(
         a_packed_t, a_s, indices_packed_gf, nib, w_s, norms_gf, out,
         B, N, K_total,
         indices_packed_gf.stride(0), norms_gf.stride(0),
+        w_s.stride(0), 0,
         GROUP_SIZE=group_size, NUM_GROUPS=num_groups, BIT_WIDTH=bit_width,
         BLOCK_B=BLOCK_B, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
         num_warps=num_warps, num_stages=num_stages,
     )
     return out
+
+
+def _launch_swapped(x_f4_t, x_s, indices_slice, nib, w_s, norms_slice,
+                    group_size, num_groups, bit_width, ws_stride, ws_koff, cfg=None):
+    """swapped kernel 的通用启动入口（供切片 wrapper 使用）。"""
+    B = x_f4_t.shape[1]
+    N = indices_slice.shape[1]
+    K_total = x_f4_t.shape[0] * 2
+    out = torch.empty(B, N, dtype=torch.float16, device=x_f4_t.device)
+    if cfg is None:
+        BLOCK_B = 32 if B <= 256 else 128
+        BLOCK_N, BLOCK_K, nw, ns = 128, 128, (4 if B <= 256 else 8), 2
+    else:
+        BLOCK_B, BLOCK_N, BLOCK_K, nw, ns = cfg
+    grid = (triton.cdiv(B, BLOCK_B), triton.cdiv(N, BLOCK_N))
+    _wxfp4_fused_matmul_kernel_swapped_gf[grid](
+        x_f4_t, x_s, indices_slice, nib, w_s, norms_slice, out,
+        B, N, K_total,
+        indices_slice.stride(0), norms_slice.stride(0), ws_stride, ws_koff,
+        GROUP_SIZE=group_size, NUM_GROUPS=num_groups, BIT_WIDTH=bit_width,
+        BLOCK_B=BLOCK_B, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        num_warps=nw, num_stages=ns,
+    )
+    return out
+
+
+def wxfp4_matmul_grouped_slice_rows_gf_swapped(
+    x_f4_t, x_s, indices_packed_gf, nib, w_s, norms_gf,
+    group_size, in_features, row_start, row_end, bit_width,
+    norms_prescaled=False,
+):
+    """gate_up 路径：行切片（输出维切片，对应 wxa8 的 slice_rows_gf）。
+
+    Args:
+        x_f4_t: (in_features//2, B) uint8 预转置（rotate_quantize_fused_fp4 产物）
+        x_s: (B, in_features//32) uint8
+        w_s: (N_total, in_features//32) uint8（全矩阵，行切片 view 免拷贝）
+        norms_gf: (num_groups, N_total) fp16（**已含 residual 折算**）
+    """
+    if bit_width not in {1, 2, 4}:
+        raise ValueError(f"WxFP4 支持 bit 1/2/4，got {bit_width}")
+    num_groups = in_features // group_size
+    norms_slice = norms_gf[:, row_start:row_end]
+    if not norms_prescaled:
+        norms_slice = norms_slice.float() / math.sqrt(group_size)
+    return _launch_swapped(
+        x_f4_t, x_s, indices_packed_gf[:, row_start:row_end, :], nib,
+        w_s[row_start:row_end], norms_slice,
+        group_size, num_groups, bit_width,
+        w_s.stride(0), 0)
+
+
+def wxfp4_matmul_grouped_slice_in_features_gf_swapped(
+    x_f4_t, x_s, indices_packed_gf, nib, w_s, norms_gf,
+    group_size, original_start, original_end, bit_width,
+    norms_prescaled=False,
+):
+    """down 路径：in_features 切片（group 维切片，对应 wxa8 的 slice_in_features_gf）。
+
+    Args:
+        x_f4_t: (slice//2, B) uint8——per-expert 量化产物（局部 k）
+        x_s: (B, slice//32) uint8
+        w_s: (N, K_total//32) uint8 全矩阵（WS_STRIDE/WS_KOFF 全局寻址免拷贝）
+        norms_gf: (K_total//group_size, N) fp16（已含 residual 折算）
+    """
+    if bit_width not in {1, 2, 4}:
+        raise ValueError(f"WxFP4 支持 bit 1/2/4，got {bit_width}")
+    if original_start % group_size != 0:
+        raise ValueError(f"original_start ({original_start}) 必须对齐 group_size")
+    g_start = original_start // group_size
+    g_end = original_end // group_size
+    norms_slice = norms_gf[g_start:g_end]
+    if not norms_prescaled:
+        norms_slice = norms_slice.float() / math.sqrt(group_size)
+    return _launch_swapped(
+        x_f4_t, x_s, indices_packed_gf[g_start:g_end], nib,
+        w_s, norms_slice,
+        group_size, g_end - g_start, bit_width,
+        w_s.stride(0), original_start // 32)
 
 
 # ===========================================================================

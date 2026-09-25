@@ -468,6 +468,38 @@ def convert_model_to_wxfp8(model, attn: str = "wxa8"):
     return model
 
 
+def convert_model_to_wxfp4(model):
+    """保守版 WxFP4：bit 1/4 expert 走 e2m1 激活 + FP4 MX MMA，
+    bit 2 主力 expert 维持 WxA8（int8），attention/shared 8-bit linear 走
+    WxA8（仅均匀码本，同 convert_model_to_wxa8 规则）。
+
+    存储 checkpoint 通用（fp4 产物全部加载期构建）；零张量拷贝、零显存增长
+    （fp4 的 w_s 常量与 nibble LUT 共计 ~百 KB/层）。
+    ⚠ 只能在 dart312-t38（triton 3.8）环境 forward。
+    """
+    from quantization.wxa8.linear import WxA8Linear, is_uniform_codebook
+    from quantization.wxfp4 import WxFP4BitPartitionedGroupMoE
+
+    n_moe = n_attn = n_kept = 0
+    for sub in model.modules():
+        if isinstance(sub, WxA16BitPartitionedGroupMoE):
+            WxFP4BitPartitionedGroupMoE.from_wxa16(sub)
+            n_moe += 1
+        elif isinstance(sub, WxA16Linear):
+            if sub.bit_width != 8:
+                continue
+            if is_uniform_codebook(sub.codebook):
+                WxA8Linear.from_wxa16(sub)
+                n_attn += 1
+            else:
+                n_kept += 1
+    print(f"Converted to WxFP4（保守版）: {n_moe} MoE layers"
+          f"（bit1/4→fp4，bit2→wxa8）, {n_attn} attention/shared linears→wxa8")
+    if n_kept:
+        print(f"  ⚠ {n_kept} 个 8-bit linear 保持 W8A16（Lloyd-Max 码本）")
+    return model
+
+
 def load_quantized_model(base_model_path: str = None, quant_dir: str = None,
                          standby_cpu: bool = False, seqlen: int = 2048,
                          inference_quant_mode: str = "wxa16"):
@@ -522,13 +554,17 @@ def load_quantized_model(base_model_path: str = None, quant_dir: str = None,
 
     restore_quant_metadata(model, meta, sd)
 
-    # WxA8 / WxFP8 推理模式：MoE 原地切换（checkpoint 格式不变，
-    # 同一份 2bpw checkpoint 可同时跑 wxa16 / wxa8 / wxfp8）
+    # WxA8 / WxFP8 / WxFP4 推理模式：MoE 原地切换（checkpoint 格式不变，
+    # 同一份 2bpw checkpoint 可同时跑 wxa16 / wxa8 / wxfp8 / wxfp4）
     if inference_quant_mode == "wxa8":
         convert_model_to_wxa8(model)
     elif inference_quant_mode == "wxfp8":
         # 默认混合部署（attn 保 wxa8）；full-fp8 对比实验改传 attn="wxfp8"
         convert_model_to_wxfp8(model, attn="wxa8")
+    elif inference_quant_mode == "wxfp4":
+        # 保守版：bit1/4 expert→fp4，bit2→wxa8，attention→wxa8。
+        # ⚠ 只能在 dart312-t38（triton 3.8）环境 forward
+        convert_model_to_wxfp4(model)
     elif inference_quant_mode != "wxa16":
         raise ValueError(f"未知 inference_quant_mode: {inference_quant_mode}")
 

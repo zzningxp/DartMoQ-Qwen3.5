@@ -114,6 +114,12 @@ TE#2956/#2968、DeepGEMM#236/#447、pytorch#172807、PTX ISA mma kind::mxf8f6f4/
 - 2026-09-25 WF4-2 迭代 3-1/3-2：fp4 激活量化融合 kernel（对拍 1 字节差，
   mini 链路 0.00021，1.02 TB/s）+ TMA/persistent 专家 GEMM（dense 492 TF =
   参照 90%，vs fp8 1.39-1.44x）。剩 3-3 集成。
+- 2026-09-25 WF4-4 / 3-3 保守版集成完成：码本 v2（1-bit 精确、4-bit -27%）+
+  切片 wrapper + `quantization/wxfp4/` + 入口接线 + test_quant_io 全绿
+  （隔离验证背书）；3-4 激进版立项（入口条件三条）。待本人手动跑 t38 eval。
+- 2026-09-25 WF4-4 eval：**保守版 ppl 与 wxa8 持平（wiki +0.0007 / c4 +0.0035）
+  且全面优于 wxfp8**；c4 比 wxa8 快 4.9%；t38 依赖 pin 对齐（transformers
+  5.17→5.13 踩坑修复）。3-4 条件 1 ✅、2/3 ❌ 继续挂起。
 
 ---
 
@@ -282,6 +288,75 @@ TE#2956/#2968、DeepGEMM#236/#447、pytorch#172807、PTX ISA mma kind::mxf8f6f4/
 
 - （待记；动 checkpoint 前需本人确认）
 
-### WF4-4：集成 + eval ppl（未开始）
+### WF4-4：集成（保守版，2026-09-25 本人拍板）
 
-- （待记，ppl 数据 + 与 wxfp8/wxa8 基线对比）
+> **保守版定义**：fp4 只上 4-bit expert（等尺寸零膨胀）+ 1-bit expert
+> （连续 scale 下 2 级码本可精确落 e2m1）；**2-bit 主力维持 wxa8**；
+> attention 维持 wxa8。先跑通 eval 拿 ppl/速度基线，再决定是否扩大。
+>
+> **激进版（全 expert 迁移）暂缓的三条理由**（重新评估的条件也在此）：
+> 1. 精度：2-bit GEMM relerr 0.65%→~12%（18×，fp8 先例只有 4×），押在主力上
+>    且进入未验证量级——保守版 ppl 良好是前提
+> 2. 显存：离线展开 2×膨胀（9.5→19GB 可能放不下）或 per-forward 转换
+>    （256 expert × 2-4us ≈ 0.5-1ms/层 ≈ 整个 MoE wall）——需要转换 kernel
+>    亚微秒化或新 checkpoint 形态
+> 3. 速度：小 B + Python 循环占 80% 的现状下，fp4 的 MMA/带宽收益大部分
+>    兑现不了——需要循环开销消解（P5 系）或普通 MoE 大 B 部署
+>
+> ⚠ **运行环境**：wxfp4 kernel 只在 dart312-t38（triton 3.8）下可编译；
+> 主流程 eval 需用 `conda run -n dart312-t38 eval_qwen35.py ...`（t38 需补装
+> transformers/datasets 等 eval 依赖）。
+
+**3-4 激进版（全 expert 迁移，2026-09-25 立项）**：2-bit 主力也迁 fp4。
+入口条件（三条全满足再动工，均已在上方论证）：
+1. 3-3 保守版 ppl 落地良好（验证 ~12% GEMM relerr 的 ppl 代价可接受）
+2. 显存/转换问题有解（转换 kernel 亚微秒化，或 2-bit 离线 e2m1 重量化
+   的新 checkpoint 形态——动 checkpoint 需本人确认）
+3. 循环开销消解有进展（P5 系合并 kernel）或部署场景换成普通 MoE 大 B
+内容：2-bit expert 的 e2m1 迁移路径（码本 LUT 或直量化）、全 expert 的
+激活 fp4 化（含 gate_up hoisted 路径）、ppl/速度对照 3-3 基线。
+
+- 2026-09-25 **3-3 保守版集成完成**：
+  - `build_e2m1_codebook` 升级 v2：连续 scale 搜索 + **residual 分解**
+    （`cb ≈ nib × 2^E0 × residual`，residual 折 norms 副本）——
+    **1-bit 精确落格 relerr 0**、4-bit 0.10396→0.07602（-27%）、2-bit 0.0305
+  - swapped kernel 加 WS_STRIDE/WS_KOFF 全局寻址（切片免拷贝）+
+    `_launch_swapped` + gate_up 行切片 / down in_features 切片 wrapper
+  - `quantization/wxfp4/`：`WxFP4BitPartitionedGroupMoE`（继承 WxA8 类，
+    bit∈{1,4} 分派 fp4 / bit2 走 wxa8 原路径；hoisted 量化按 bit 分派；
+    fp4 ctx 产物：nib LUT / 常量 w_s / norms×residual 副本——不动共享 buffer）
+  - `convert_model_to_wxfp4` + `--inference-quant-mode wxfp4` 三处入口接线
+  - 实测（test_quant_io.py 追加 WxFP4 段，t38 env）：转换链路
+    save→load→convert→forward 全通；**隔离验证：FP4_BITS 置空精确复现
+    wxa8 的 0.01336**（接线正确性背书）；保守版 relerr 0.21473 =
+    bit4 expert 的预期 e2m1 误差（0.115⊕0.076 过 silu/router，骨架 bit4
+    占比偏高）；attention 回 wxa8 精确（0.00651 = A8 基线）；
+    wxa8/wxa16 段在 triton 3.8 下同时验证兼容
+  - t38 env 已补齐 eval 依赖（numpy/scipy/safetensors/transformers/
+    datasets/accelerate），`import eval_qwen35` 验证通过
+- **2026-09-25 WF4-4 eval 完成（本人手动跑，t38 env，git 966e25a+）**：
+
+  | 模式 | wiki ppl | c4 ppl | wall | t_wiki | t_c4 |
+  |---|---|---|---|---|---|
+  | wxa16（0923 基线，dart312） | 7.7955 | 11.2631 | 134.15 | 53.13 | 81.02 |
+  | wxa8（0923 基线，dart312） | 7.7947 | 11.2676 | 106.58 | 44.16 | 62.42 |
+  | wxfp8（0923 基线，dart312） | 7.8064 | 11.2769 | 118.36 | 55.43 | 62.93 |
+  | **wxfp4 保守版（t38）** | **7.7954** | **11.2711** | 119.47 | 60.1 | 59.37 |
+
+  - **精度结论：保守版 ppl 与 wxa8 持平且全面优于 wxfp8**——vs wxa8：
+    wiki +0.0007 / c4 +0.0035；vs wxfp8：wiki -0.0110 / c4 -0.0058（均更好）。
+    机理自洽：保守版的激活误差暴露面严格小于 wxfp8（bit2 主力保 int8 的
+    0.65%，仅 bit1/4 走 e2m1；1-bit 码本精确落格），bit4 expert 的 ~0.12
+    GEMM relerr 在 ppl 层面无感——**误差→ppl 不敏感性再次成立**。
+    **3-4 入口条件 1（保守版 ppl 良好）：✅ 满足**。
+  - 速度：c4 59.37s **比 wxa8 基线还快 4.9%**（bit1/4 expert 激活存储减半的
+    gather 收益 + 噪声）；wiki 60.1s 疑首轮 JIT 污染（同 wxfp8 首跑模式，
+    wiki 先跑吃全部编译）——**t_wiki 需热缓存复跑确认**。另注意基线是
+    dart312 env（跨 env 计时，wxa8 的 t38 对照未跑，严格计时需补）。
+  - 中途踩坑（已修）：t38 的 transformers 装 5.17.0 导致
+    `chunk_gated_delta_rule` 实例属性消失 → patch_delta_rule 崩；
+    **pin 回 5.13.0+datasets 4.8.5（与 dart312 一致）解决**——t38 env
+    的依赖必须对齐主环境版本。
+  - 3-4 判定：条件 1 ✅ / 条件 2（显存/转换方案）❌ / 条件 3（循环开销或
+    大 B 场景）❌ → **激进版继续挂起**，待条件 2/3；当前 wxfp4 保守版
+    已可作为"fp 模式"的 ppl 最优选投产使用。

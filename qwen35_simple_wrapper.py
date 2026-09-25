@@ -611,6 +611,9 @@ def dartmoq_quant_grouped_gemm_moe(model, tokenizer, dataloader, args, test_ppl=
         elif _iqm == 'wxfp8':
             from qwen35_quant_io import convert_model_to_wxfp8
             convert_model_to_wxfp8(model, attn="wxa8")
+        elif _iqm == 'wxfp4':
+            from qwen35_quant_io import convert_model_to_wxfp4
+            convert_model_to_wxfp4(model)
         print("\nEvaluating perplexity...")
         run_ppl_evaluation(model, tokenizer, args)
 
