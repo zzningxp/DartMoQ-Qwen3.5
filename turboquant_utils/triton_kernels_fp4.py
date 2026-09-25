@@ -536,3 +536,188 @@ def wxfp4_expert_matmul(a_packed_t, a_s, w_packed, w_s, global_scale=1.0,
         num_warps=num_warps, num_stages=num_stages,
     )
     return c
+
+
+# ===========================================================================
+# WF4-2 迭代 3-1：rotate + quantize 融合 kernel（fp4 / 纯 MX）
+# ===========================================================================
+
+@triton.jit
+def _rotate_quantize_kernel_fp4(
+    x_ptr,        # (B, K_total) fp16 未旋转激活
+    rot_ptr,      # (NUM_GROUPS, G0_STRIDE) fp16 每 group 一个旋转矩阵
+    x_f4_ptr,     # (K_total//2, B) uint8 —— e2m1 预转置输出（专家 GEMM rhs 布局）
+    x_s_ptr,      # (B, K_total//32) uint8 —— e8m0（byte = exp + 127）
+    B, K_total,
+    ROT_G0_STRIDE,
+    GROUP_SIZE: tl.constexpr,    # 旋转组（128）；MX 块 32 在组内细分
+    NUM_GROUPS: tl.constexpr,
+    BLOCK_B: tl.constexpr = 32,
+):
+    """分组旋转 + per-32 块 e8m1/e8m0 量化（纯 MX，与 _rotate_quantize_kernel_fp8
+    对应的 fp4 变体）。
+
+    与 fp8 版的三处差异：
+      1. scale 粒度：旋转组 128 内按 32 细分（4 个 MX 块/组）
+      2. 输出：e2m1 nibble 打包（偶 k 低半字节）+ e8m0 字节；无 extra_scale
+         通道——cb_scale 类常量只能进 GEMM epilogue（e8m0 是纯 2 的幂，
+         折不进任意常量，这是与 fp8 版 fp16 scale 的本质差异）
+      3. 存储直接写预转置 (K/2, B)（专家 GEMM 的 rhs 布局），每 tile 一次
+         tl.trans（带宽型 kernel，代价可忽略，实测见 test）
+
+    数学：x_rot = x @ P_g（fp32 累加，同 fp8 版约定）；
+    对每个 32 块：e = ceil(log2(amax/6))，nibble = nearest_grid(x/2^e)。
+    """
+    pid_g = tl.program_id(0)
+    pid_b = tl.program_id(1)
+    rb = pid_b * BLOCK_B + tl.arange(0, BLOCK_B)
+    mask_b = rb < B
+
+    x_off = rb[:, None] * K_total + pid_g * GROUP_SIZE + tl.arange(0, GROUP_SIZE)[None, :]
+    x_tile = tl.load(x_ptr + x_off, mask=mask_b[:, None], other=0.0)
+
+    acc = tl.zeros((BLOCK_B, GROUP_SIZE), dtype=tl.float32)
+    rj = tl.arange(0, GROUP_SIZE)
+    rk = tl.arange(0, GROUP_SIZE)
+    p_off = pid_g * ROT_G0_STRIDE + rj[:, None] * GROUP_SIZE + rk[None, :]
+    p_tile = tl.load(rot_ptr + p_off)
+    acc += tl.dot(x_tile, tl.trans(p_tile), out_dtype=tl.float32)
+
+    # ---- 按 32 子块量化 ----
+    NBLK: tl.constexpr = GROUP_SIZE // 32
+    acc3 = tl.reshape(acc, (BLOCK_B, NBLK, 32))
+    amax = tl.max(tl.abs(acc3), axis=2)                      # (BLOCK_B, NBLK)
+    amax = tl.maximum(amax, 1e-30)
+    e = tl.ceil(tl.log2(amax / 6.0))
+    e = tl.minimum(tl.maximum(e, -127.0), 127.0)
+    # e8m0 存出（自然 (B, K/32) 布局）
+    sb_off = rb[:, None] * (K_total // 32) + pid_g * NBLK + tl.arange(0, NBLK)[None, :]
+    tl.store(x_s_ptr + sb_off, (e + 127.0).to(tl.int32).to(tl.uint8), mask=mask_b[:, None])
+
+    y = acc3 / tl.exp2(e)[:, :, None]
+    y = tl.minimum(tl.maximum(y, -6.0), 6.0)
+    # e2m1 网格最近邻（断点 0.25/0.75/1.25/1.75/2.5/3.5/5）
+    ay = tl.abs(y)
+    mag = tl.where(ay < 0.25, 0,
+          tl.where(ay < 0.75, 1,
+          tl.where(ay < 1.25, 2,
+          tl.where(ay < 1.75, 3,
+          tl.where(ay < 2.5, 4,
+          tl.where(ay < 3.5, 5,
+          tl.where(ay < 5.0, 6, 7))))))).to(tl.uint8)
+    sign = (y < 0).to(tl.uint8)
+    nib = (mag & 0x7) | (sign << 3)                           # (BLOCK_B, NBLK, 32)
+
+    nib2 = tl.reshape(nib, (BLOCK_B, GROUP_SIZE // 2, 2))
+    lo, hi = tl.split(nib2)
+    byte = (lo | (hi << 4)).to(tl.uint8)                      # (BLOCK_B, GS/2)
+
+    # 预转置写出：x_f4[(g*GS/2 + j), b]
+    rj2 = tl.arange(0, GROUP_SIZE // 2)
+    f4_off = (pid_g * (GROUP_SIZE // 2) + rj2)[:, None] * B + rb[None, :]
+    tl.store(x_f4_ptr + f4_off, tl.trans(byte), mask=mask_b[None, :])
+
+
+def rotate_quantize_fused_fp4(x: torch.Tensor, rot: torch.Tensor,
+                              group_size: int, num_groups: int):
+    """分组旋转 + e2m1/e8m0 量化（fp4 融合 kernel 的 wrapper）。
+
+    Returns:
+        x_f4: (K_total//2, B) uint8 —— 预转置（专家 GEMM rhs 布局）
+        x_s:  (B, K_total//32) uint8
+    """
+    B, K_total = x.shape
+    if K_total != num_groups * group_size:
+        raise ValueError(f"K_total ({K_total}) != num_groups*group_size "
+                         f"({num_groups * group_size})")
+    if rot.shape != (num_groups, group_size, group_size):
+        raise ValueError(f"rot 形状应为 {(num_groups, group_size, group_size)}, "
+                         f"得到 {tuple(rot.shape)}")
+    x_f4 = torch.empty((K_total // 2, B), dtype=torch.uint8, device=x.device)
+    x_s = torch.empty((B, K_total // 32), dtype=torch.uint8, device=x.device)
+    BLOCK_B = 32
+    grid = (num_groups, triton.cdiv(B, BLOCK_B))
+    _rotate_quantize_kernel_fp4[grid](
+        x, rot, x_f4, x_s, B, K_total, rot.stride(0),
+        GROUP_SIZE=group_size, NUM_GROUPS=num_groups, BLOCK_B=BLOCK_B,
+        num_warps=4, num_stages=3,
+    )
+    return x_f4, x_s
+
+
+# ===========================================================================
+# WF4-2 迭代 3-2：专家 GEMM 的 TMA + persistent 变体（大 B 优化项）
+# ===========================================================================
+
+@triton.jit
+def _wxfp4_expert_matmul_tma_kernel(
+    a_desc,     # (K_total//2, B) uint8 rhs —— box (BK/2, BM)
+    a_s_ptr,    # (B, K_total//32) uint8 指针（TMA 16B 约束，不走 TMA）
+    w_desc,     # (N, K_total//2) uint8 lhs —— box (BN, BK/2)
+    w_s_ptr,    # (N, K_total//32) uint8 指针
+    c_desc,     # (B, N) fp16 —— box (BM, BN)
+    B, N, K_total,
+    GLOBAL_SCALE,
+    BLOCK_B: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr, NUM_SMS: tl.constexpr,
+):
+    """TMA + persistent 版专家 MX GEMM（与 _wxfp4_expert_matmul_kernel 数学等价）。
+
+    数据走 TMA（a/w/c）、scale 走指针（box 内维 4~8 字节违反 TMA 16B 对齐，
+    WF4-P1 实测约束）；persistent 调度 + group-M swizzle。
+    """
+    start_pid = tl.program_id(0)
+    num_pid_b = tl.cdiv(B, BLOCK_B)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    num_in_group = GROUP_M * num_pid_b
+    num_tiles = num_pid_b * num_pid_n
+
+    rk_sc = tl.arange(0, BLOCK_K // 32)
+
+    for tid in tl.range(start_pid, num_tiles, NUM_SMS, flatten=True):
+        group_id = tid // num_in_group
+        first_pid = group_id * GROUP_M
+        group_sz = min(num_pid_n - first_pid, GROUP_M)
+        pid_n = first_pid + ((tid % num_in_group) % group_sz)
+        pid_b = (tid % num_in_group) // group_sz
+
+        rb = pid_b * BLOCK_B + tl.arange(0, BLOCK_B)
+        rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        mask_b = rb < B
+        mask_n = rn < N
+
+        acc = tl.zeros((BLOCK_N, BLOCK_B), dtype=tl.float32)
+        for k in range(0, K_total, BLOCK_K):
+            a_tile = a_desc.load([k // 2, pid_b * BLOCK_B])      # (BK/2, BM)
+            w_tile = w_desc.load([pid_n * BLOCK_N, k // 2])      # (BN, BK/2)
+            as_off = rb[:, None] * (K_total // 32) + k // 32 + rk_sc[None, :]
+            as_tile = tl.load(a_s_ptr + as_off, mask=mask_b[:, None], other=0)
+            ws_off = rn[:, None] * (K_total // 32) + k // 32 + rk_sc[None, :]
+            ws_tile = tl.load(w_s_ptr + ws_off, mask=mask_n[:, None], other=0)
+            acc = tl.dot_scaled(w_tile, ws_tile, "e2m1", a_tile, as_tile, "e2m1", acc)
+
+        acc = acc * GLOBAL_SCALE
+        c_desc.store([pid_b * BLOCK_B, pid_n * BLOCK_N],
+                     tl.trans(acc).to(c_desc.dtype))
+
+
+def wxfp4_expert_matmul_tma(a_packed_t, a_s, w_packed, w_s, global_scale=1.0,
+                            BLOCK_B=128, BLOCK_N=128, BLOCK_K=128,
+                            num_warps=8, num_stages=3):
+    """TMA+persistent 版 wrapper（参数语义同 wxfp4_expert_matmul）。"""
+    from triton.tools.tensor_descriptor import TensorDescriptor
+    B = a_packed_t.shape[1]
+    N = w_packed.shape[0]
+    K_total = a_packed_t.shape[0] * 2
+    c = torch.empty(B, N, dtype=torch.float16, device=a_packed_t.device)
+    NUM_SMS = torch.cuda.get_device_properties(a_packed_t.device).multi_processor_count
+    a_desc = TensorDescriptor.from_tensor(a_packed_t, [BLOCK_K // 2, BLOCK_B])
+    w_desc = TensorDescriptor.from_tensor(w_packed, [BLOCK_N, BLOCK_K // 2])
+    c_desc = TensorDescriptor.from_tensor(c, [BLOCK_B, BLOCK_N])
+    _wxfp4_expert_matmul_tma_kernel[(NUM_SMS,)](
+        a_desc, a_s, w_desc, w_s, c_desc, B, N, K_total, global_scale,
+        BLOCK_B=BLOCK_B, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        GROUP_M=8, NUM_SMS=NUM_SMS,
+        num_warps=num_warps, num_stages=num_stages,
+    )
+    return c

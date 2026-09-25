@@ -111,6 +111,9 @@ TE#2956/#2968、DeepGEMM#236/#447、pytorch#172807、PTX ISA mma kind::mxf8f6f4/
   契约对拍 0.00021；down 反超 fp8（1.15×）、gate_up 差 4us（launch 量级）、
   dense 372 TF（TMA 参照 68%）；debug 记录：全局 scale 乘反（g² 偏差）曾被
   误判为 lhs scale bug，已澄清并留档。
+- 2026-09-25 WF4-2 迭代 3-1/3-2：fp4 激活量化融合 kernel（对拍 1 字节差，
+  mini 链路 0.00021，1.02 TB/s）+ TMA/persistent 专家 GEMM（dense 492 TF =
+  参照 90%，vs fp8 1.39-1.44x）。剩 3-3 集成。
 
 ---
 
@@ -257,12 +260,23 @@ TE#2956/#2968、DeepGEMM#236/#447、pytorch#172807、PTX ISA mma kind::mxf8f6f4/
   - 结论：**专家级主路径（普通 MoE）数值与性能闭环**——小 B 与 fp8 互有胜负
     （±15-30%），大 B 场景 319-372 TF 显著超过 fp8 的 353 门槛一半以上；
     剩余优化空间 = A 侧 TMA + persistent（372→546）
-- 下一步（WF4-2 迭代 3 或直接 WF4-4）：
-  1. A 侧 TMA + persistent（可选：普通 MoE 大 B 场景的收益项）
-  2. 激活 rotate+quantize fp4 融合 kernel（目前 A 量化是 torch 参考，主流程
-     接线前必须 kernel 化——WF-2 的 fp4 变体）
-  3. WF4-4 集成：quantization/wxfp4/ + 入口 + eval（含本项目 checkpoint 的
-     适配器路径决策）
+- 2026-09-25 优化迭代 3（本人指示按 1→2→3 顺序执行）：
+  - **3-1 激活量化融合 kernel 完成**（`_rotate_quantize_kernel_fp4` +
+    `rotate_quantize_fused_fp4`）：旋转组 128 内按 32 细分 MX 块；输出直接写
+    预转置 (K/2, B)（专家 GEMM rhs 布局，每 tile 一次 tl.trans）；
+    e2m1 最近邻用阈值链（7 层 where，免 gather）。实测（test_wxfp4_act_quant.py）：
+    对拍字节差 1/2M（RTNE 边界翻转）、dequant relerr 0.11538（参考口径 0.1155）、
+    边界用例全过（全零精确 0 / 离群 0.119 旋转摊平 / 无 NaN）；
+    **mini 链路（fused 量化→expert GEMM）vs torch 全参考 0.00021**——预转置
+    布局对接闭环；吞吐 B16384 时 1.02 TB/s（带宽受限，与 fp8 版同量级）
+  - **3-2 TMA + persistent 专家 GEMM 完成**（`_wxfp4_expert_matmul_tma_kernel`）：
+    数据走 TMA（a (BK/2,BM) / w (BN,BK/2) / c (BM,BN)），scale 指针（16B 约束），
+    persistent + group-M swizzle。实测（test_wxfp4_expert_gemm.py [4b]）：
+    对拍 0.00021 ✓；**B2048 389 TF / B8192 510 TF / dense 4096³ 492 TF**
+    （指针版 372 → +32%，达纯 TMA 参照 546 的 90%；vs fp8 353 为 1.39-1.44x）
+  - 3-3（WF4-4 集成）待做：`quantization/wxfp4/` + 入口 + eval；含本项目
+    bit-partitioned checkpoint 的适配器路径设计（1/2-bit expert 的 e2m1 膨胀
+    与转换 kernel、4-bit expert 直量化、attention 维持 wxa8 的边界划分）
 
 ### WF4-3：全 fp4 路线（未开始，若 DP-2 选中）
 
