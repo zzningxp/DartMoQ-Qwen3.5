@@ -18,7 +18,7 @@
 | 5090 FP4 硬件 | ✅ 5th-gen tensor core，FP4 dense = 2× FP8；无 tcgen05/TMEM（FA4、SM100 kernel 不可用）；smem 仅 ~100 KiB | RTX Blackwell 白皮书 |
 | 块缩放 MMA 指令 | `mma.sync .kind::mxf8f6f4`（MXFP8/6/4，e8m0 scale）与 `.kind::nvf4`（NVFP4，e4m3 scale），**要求编译目标 sm_120a**（带 `a` 后缀） | PTX ISA；Colfax SM12x 系列 |
 | PyTorch gencode 坑 | PyTorch 自动 gencode 丢 `a` 后缀 → stock PyTorch 走块缩放 fp4 很脆（`_scaled_mm` fp4 在 cu128/5090 eager 未走通，实测） | pytorch#172807；本机探测 |
-| Triton `tl.dot_scaled` | ✅ 功能可用（实测 e2m1×e2m1 数值正确）；**naive 写法 110 TFLOPS = bf16 软件模拟**；需 **TMA descriptor + persistent 调度**才走原生块缩放 MMA；**只支持 MX（1x32+e8m0），不支持 NVFP4** | 本机探测；triton#8548；forgather#38 |
+| Triton `tl.dot_scaled` | ✅ **原生可用（triton 3.8.0 + ptxas 12.8 组合，实测 546 TFLOPS @4096³ = 1.55× fp8）**；四个前置条件见执行日志 WF4-P1（3.5.0 有布局 bug、ptxas-blackwell 13.3 的 cubin 被 570 驱动拒载、rhs scale 转置布局、scale 不走 TMA）；**只支持 MX（1x32+e8m0），不支持 NVFP4** | 本机 WF4-P1 实测（2026-09-24/25） |
 | Triton 参考实现 | vLLM #31089：SM120 MXFP4 Triton GEMM（TMA+persistent），可作为 kernel 蓝图 | vllm#31089 |
 | CUTLASS | ✅ 3.9.0+ 支持 SM120，SM12x block-scaled（NVFP4）kernel + Colfax 完整教程 | CUTLASS changelog；Colfax |
 | TransformerEngine | ✅ v2.15 起 sm_120 硬件 NVFP4 可用，实测 1.77× bf16（consumer Blackwell 唯一上游可用路径） | TE#2956/#2968；forgather#38 |
@@ -94,6 +94,14 @@ TE#2956/#2968、DeepGEMM#236/#447、pytorch#172807、PTX ISA mma kind::mxf8f6f4/
 
 - 2026-09-24 WF4-0：初版预研规划（与 wxfp8-plan 同日，作为其下游阶段的独立文件）。
 - 2026-09-24：新增执行日志区（本人要求：每做一步更新日志）。
+- 2026-09-24 WF4-P1：② e2m1 relerr 实测（格式地板 ~10%）；① dot_scaled 被
+  triton 3.5.0 sm_120 布局 bug 阻断（正确 rhs=(K/2,N) 布局考古 + 全变体复现），
+  早先"功能可用"结论作废并同步修正相关文档（执行日志）。
+- 2026-09-25 WF4-P1：**原生 MXFP4 打通**——隔离 env `dart312-t38`（triton 3.8.0 +
+  ptxas-blackwell 换 12.8）下 546 TFLOPS @4096³（1.55× fp8），无需升级驱动/CUDA；
+  四个坑与完整配方见执行日志与 memory/sm120a-mxfp4-triton-recipe。
+- 2026-09-25 WF4-P1 补测：指针加载也是原生 MMA（W 侧查表结构可对接）；mixed
+  e2m1×e4m3 走模拟（57-67 TF）→ DP-2 改为全 e2m1 + kernel 内 nibble 映射主线。
 
 ---
 
@@ -107,10 +115,67 @@ TE#2956/#2968、DeepGEMM#236/#447、pytorch#172807、PTX ISA mma kind::mxf8f6f4/
   （dot_scaled 功能正确 c[0,0]=128.00@cfg 64x128x256；吞吐 110 TFLOPS=软件模拟；
   nvfp4 `_scaled_mm` 四种布局枚举均被拒，eager copy_ 未实现）。
 
-### WF4-P1：前置探测（未开始，可与 wxfp8 WF-1..5 并行）
+### WF4-P1：前置探测（进行中，2026-09-24）
 
-- （待记：① Triton TMA+persistent MXFP4 原型吞吐；② e2m1+32 块 e8m0 激活 relerr 离线；
-  ③ TE v2.15 试用（可选））
+- 2026-09-24 ② e2m1 激活量化 relerr（`test/test_wxfp4_p1_probe.py` §1，高斯=旋转后代理）：
+  | 格式 | relerr |
+  |---|---|
+  | int8 per-128（wxa8 基线） | 0.00646 |
+  | e4m3 per-128（wxfp8 基线） | 0.02573 |
+  | **e2m1 per-32 + e8m0（MXFP4）** | **0.11545** |
+  | e2m1 per-16 + e4m3（NVFP4） | 0.09514 |
+  | e2m1 per-128 + fp16（上界参考） | 0.10887 |
+
+  结论：e2m1 格式地板 ~10%（7 个非零幅度的结构性代价），缩放粒度加密改善有限
+  （MX→NVFP4 0.115→0.095）；fp4 激活误差 ≈ e4m3 的 4x、int8 的 16x。
+  但 wxfp8 的先例是"4x 误差只换 +0.01 ppl"，fp4 的 ppl 代价要实测才知道
+  （可能进入不同 regime，DP-3 的关键输入）。
+- 2026-09-24 ① TMA+persistent MXFP4 GEMM（§2）：**被编译器阻断**。
+  - 布局考古：`dot_scaled` 的 rhs 必须是 **(K/2, N)**（沿 K 打包、N 作列，
+    semantic.py:1612 `K_RHS, N = rhs.shape`）；早先所有 naive 探测传的是 (N, K/2)——
+    方形形状下侥幸过类型校验，数值检查也因均匀填充数据误判通过，**全部作废**
+  - 正确布局后：最小用例（无循环无 TMA）、TMA+persistent、纯指针 × 全部 tile 配置
+    均在 `TritonGPUAccelerateMatmul` pass 崩溃（`convert_layout` 形状断言，
+    PassManager::run failed）→ **triton 3.5.0 在 sm_120 无法编译正确布局的 dot_scaled**
+  - smem 约束顺带确认：(128,128,256,3s) 需 102464B > 101376B 上限（SM120 ~99KB），
+    大 tile 需降 stages 或 BK
+  - 能力探测脚本（test_wxfp8_capability_probe.py）与 wxfp8-plan §1.1/§1.2 的
+    dot_scaled 相关结论已同步修正
+- 2026-09-25 ① **突破：Triton 3.8 + ptxas 12.8 组合下原生 MXFP4 MMA 跑通，546 TFLOPS @4096³**
+  （对照：fp8 353 / int8 447 / bf16 190 —— 即 **1.55× fp8、2.87× bf16**，数值精确）。
+  破解过程（四层问题依次剥开，均有实测依据）：
+  1. **布局**（3.5/3.8 通用约定，semantic.py）：rhs 的 value 是 **(K/2, N)**（沿 K 打包、
+     N 作列），但 rhs 的 **scale 是 (N, K/32)**——scale 与 value 转置；
+     lhs 为 value (M, K/2) + scale (M, K/32)。早先全部探测传反，作废
+  2. **Triton 版本**：3.5.0 在正确布局下 AccelerateMatmul pass 崩溃（前述）；3.8.0 的
+     PTX 正确产出 `.target sm_120a` + `mma.sync...kind::mxf4nvf4...ue8m0`（原生指令）
+  3. **ptxas 版本才是 cubin 拒载真因**：triton 3.8 wheel 对 arch≥100 调
+     `bin/ptxas-blackwell`（**CUDA 13.3**），其 cubin 被 570 驱动拒载（invalid image）；
+     **换成 CUDA 12.8 的 ptxas 后编译/加载/计算全部正确——无需升级驱动或 CUDA**
+     （sm_120a 正是 12.8 引入；做法：探测 env 里 `ptxas-blackwell` 软链到 dart312
+     triton 3.5 自带的 12.8 ptxas）
+  4. **scale 不能走 TMA**：box 最内维 BK/32=4~8 字节不满足 TMA 16B 对齐 →
+     cuTensorMapEncodeTiled 报 invalid argument；数据走 TMA、scale 走普通指针即可
+  - 环境备忘：探测 env `dart312-t38`（torch 2.9.0+cu128 + triton 3.8.0 + ptxas-blackwell
+    软链 12.8）；`TRITON_PTAXAS_BLACKWELL_PATH` 环境变量实测不生效，直接换二进制才有效
+  - 最优 cfg (64,128,256,4w,3s) 546 TF / (128,128,128,8w,4s) 537 TF；smem 约束：大 tile
+    需 ≤2 stages（SM120 ~99KB，(128,256,128,3s) 需 113KB 超限）
+  - **判定**：546/353 = 1.55×（未到理论 2×，scale 指针加载与配置未调优有空间）→
+    **DP-1 倾向 MXFP4/Triton 路线成立**；DP-2（mixed vs 全 fp4）待精度数据与 ppl 决策
+- 2026-09-25 补测（两个关键架构事实）：
+  1. **纯指针加载（非 TMA）同样产出原生 mxf4nvf4**（k_min PTX 16 处）→ 权重侧
+     "packed 索引 + kernel 内 LUT 查表"结构可直接对接 dot_scaled，TMA 仅为 A 侧
+     性能优化项
+  2. **mixed A=e2m1 × W=e4m3 走 bf16 模拟**（实测 57-67 TF，数值亦异常）→
+     Triton 3.8 的原生 mxf4nvf4 只在 e2m1×e2m1 时触发，混合格式无硬件路径
+- **DP-2 修正（基于上述数据）**：mixed 路线经 Triton 不可行；主线改为
+  **全 e2m1×e2m1 + kernel 内码本索引→e2m1 nibble 映射**：
+  - 1/2-bit expert：码本 2/4 级可精确落入 e2m1（含 per-32 e8m0 块缩放 +
+    epilogue 的 fp16 norms 兜底，数学链待 WF4-2 展开）
+  - 4-bit expert：16 级 → e2m1 7 幅度塌缩（少量 expert，误差量化后接受与否 ppl 定）
+  - attention W8：维持 wxa8（混合部署结论不变）
+  - W 侧离线展开为 e2m1 张量的方案否决（2-bit expert 显存 2× 膨胀，
+    9.5GB→19GB 不可接受），必须 kernel 内转换
 
 ### WF4-1：DP-1/DP-2 决策复审（未开始）
 

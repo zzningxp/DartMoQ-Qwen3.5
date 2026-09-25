@@ -15,7 +15,7 @@
 |---|---|---|
 | Triton `tl.dot(fp8e4m3, fp8e4m3)` | ✅ | 353 TFLOPS @4096³（int8 448 / bf16 190，即 fp8 ≈ 0.79×int8 ≈ 1.86×bf16） |
 | Triton `tl.dot(fp8, bf16)` 混合 | ❌ | `Unsupported lhs dtype fp8e4nv`，不允许混合 dtype dot |
-| Triton `tl.dot_scaled(e2m1,e2m1)`（mxfp4） | ⚠ 仅功能 | 112 TFLOPS @4096³，低于 bf16 → 确认走**软件模拟**（upcast bf16），非原生 MX MMA |
+| Triton `tl.dot_scaled(e2m1,e2m1)`（mxfp4） | ❌ 编译失败 | **triton 3.5.0 sm_120 布局 bug**：正确 rhs=(K/2,N) 布局（semantic.py:1612 约定）下 AccelerateMatmul pass 崩溃（convert_layout 断言），最小用例即复现；早先"功能可用/110 TF=模拟"的记录是错误布局内核，**已作废**（见 wxfp4-plan WF4-P1） |
 | cuBLASLt fp8（`torch._scaled_mm`）tensorwise | ✅ | 377 TFLOPS @4096³，rel_err 0.038 |
 | cuBLASLt fp8 rowwise | ✅ | rel_err 0.037 |
 | cuBLASLt fp8 **1x128 blockwise**（DeepSeek 风格） | ❌ | sm_120 校验不通过（报错枚举中无有效布局组合走通） |
@@ -29,10 +29,10 @@
 1. **主路径仍是 Triton**——fp8 `tl.dot` 在 sm_120 + triton 3.5.0 原生可用，走真 fp8 MMA（1.86×bf16
    可证），且与 WxA8 同技术栈，kernel 结构可平移。
 2. **fp8 在 Triton 里比 int8 慢 ~20%**（353 vs 448）——与 wxa8-plan 旧记录一致，接受（fp4 铺路定位）。
-3. fp4 的三条候选路径全部不成熟：Triton `dot_scaled` naive 用法仅模拟（112 TFLOPS，无 TMA 所致，
-   §1.2）、cuBLASLt nvfp4 eager 未走通、CUTLASS 需大工程 → **佐证"先 fp8 铺基础设施、fp4 路径
-   边走边定"的路线**（fp4 四条候选路线详见 §1.2b，其中 Triton TMA+persistent 与 TE 两条可行性
-   高于最初预期）。
+3. fp4 的候选路径在当前栈全部受阻：Triton `dot_scaled` 正确布局下编译崩溃（3.5.0 sm_120
+   布局 bug，WF4-P1 实测）、cuBLASLt nvfp4 eager 未走通、CUTLASS 需大工程 → **佐证"先 fp8 铺
+   基础设施、fp4 路径边走边定"的路线**（fp4 候选路线详见 §1.2b；Triton 升级探测是下一个
+   分叉点，见 wxfp4-plan WF4-P1）。
 
 ### 1.2 生态调研（除 Triton 外的库；含 web 调研，来源见文末）
 
@@ -53,11 +53,12 @@
 本机 triton 3.5.0 ✓（1.86×bf16 的实测比例亦印证原生路径）。⚠ 若环境里残留 `pytorch-triton`
 遮蔽新版会重新触发降级——运行时检查 `triton.__version__`。
 
-**Triton MX/fp4 路径的关键事实**（triton#8548, forgather#38）：`tl.dot_scaled` 在 sm_12x 上
-**必须 TMA descriptor + persistent 调度才走原生块缩放 MMA，否则静默 bf16 模拟**——这正是
-本机探测 112 TFLOPS（< bf16 190）的原因：naive kernel 无 TMA。vLLM #31089 的 SM120 MXFP4
-Triton GEMM（TMA+persistent）是可参考的实现。另：Triton `dot_scaled` 只支持 MX（1x32 + e8m0），
-**不支持 NVFP4**（1x16 + e4m3 scale）。
+**Triton MX/fp4 路径的关键事实**（triton#8548, forgather#38 + 本机 WF4-P1 实测）：
+`tl.dot_scaled` 在 sm_12x 上**要求 TMA descriptor + persistent 调度才可能走原生块缩放
+MMA**；且本机实测 triton 3.5.0 在**正确 rhs=(K/2,N) 布局下直接编译崩溃**（布局 bug，
+最小用例复现，见 wxfp4-plan WF4-P1）——原生 MX 在当前栈被编译器阻断，
+出路是升级 Triton 或绕开 dot_scaled（vLLM #31089 的 SM120 MXFP4 Triton GEMM 是参考）。
+另：Triton `dot_scaled` 只支持 MX（1x32 + e8m0），**不支持 NVFP4**（1x16 + e4m3 scale）。
 
 ### 1.2b FP4 路线前瞻（WF-6 的输入，本阶段不决策）
 
@@ -66,6 +67,7 @@ kernel 均不可用），块缩放 MMA 要求编译目标 **sm_120a**（PyTorch 
 pytorch#172807——经 stock PyTorch 走 fp4 很脆）。可用路线按工程量排序：
 
 1. **Triton TMA + persistent MXFP4**（vllm#31089 参考）——与我们技术栈最连续；
+   ✅ 已实测走通（wxfp4-plan WF4-P1：triton 3.8 + ptxas 12.8 组合 546 TFLOPS）；
 2. **CUTLASS SM12x block-scaled**（Colfax 教程为蓝图，`mma.sync .kind::mxf8f6f4/.nvf4`）；
 3. **TransformerEngine v2.15 NVFP4 recipe**——现成库，1.77× bf16 实测，但引入 TE 依赖；
 4. cuBLASLt 块缩放 fp4（CUDA 12.9+；本机 torch eager 的 `_scaled_mm` fp4 仍未走通，§1.1）。
