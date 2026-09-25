@@ -8,8 +8,11 @@ Triton kernel 量化推理支持三种精度模式（共用同一份 packed chec
 - **WxA8** ✅：INT8 激活张量 + INT8 Tensor Core（MoE + attention 全路径）
 - **WxFP8** ✅：e4m3 激活 + FP8 Tensor Core（MoE 路径；attention 混合部署保 WxA8。
   定位是 WxFP4 的基础设施预备步骤）
-- WxFP4 🔮 规划中（e2m1 + 块缩放 MMA；sm_120 无 int4 tensor core，
-  早期 WGMMA int4 设想已被实测否定，详见 [roadmaps/wxfp4-plan-260924.md](roadmaps/wxfp4-plan-260924.md)）
+- **WxFP4** ✅ 保守版落地（bit1/4 expert：e2m1 激活 + FP4 MX MMA；bit2 主力与
+  attention 维持 WxA8。⚠ 需 dart312-t38 环境——triton ≥3.8 + ptxas 12.8，
+  见路线图）。Triton 原生 `mma.kind::mxf4nvf4`，dense 492 TF（1.39× fp8）；
+  另含面向普通 MoE 的专家级纯 MX GEMM 路径
+
 
 ## 核心特性
 
@@ -19,6 +22,9 @@ Triton kernel 量化推理支持三种精度模式（共用同一份 packed chec
   码本转 INT8 在加载期完成，checkpoint 格式不变
 - **WxFP8 e4m3 激活推理**：per-token per-group e4m3 量化（satfinite 饱和）+ FP8 Tensor Core
   原生 fp32 累加；码本 e4m3 LUT 与 cb_scale 网格搜索在加载期完成，checkpoint 格式不变
+- **WxFP4 e2m1 激活推理**：bit1/4 expert 走 e2m1 + per-32 e8m0（MX 原生格式，
+  `mma.kind::mxf4nvf4` 块缩放 MMA）；码本→nibble LUT 连续 scale 搜索
+  （1-bit 精确落格）+ residual 折 norms，全部加载期完成，checkpoint 格式不变
 - **Rotate+Quantize 融合**：分组旋转与激活量化融合为单个 Triton kernel，
   中间结果不落地（hoist 规模实测 18.75x vs 两段式）
 - **Group-First 布局**：权重按 group 连续存储，提升 L2 缓存命中率
@@ -48,6 +54,11 @@ WxA8 全路径数字基于 260831-u8 checkpoint（attention 均匀码本，MoE �
 > c4 62.93s（vs WxA8 +0.8%，速度中性）；wiki 55.43s 疑首轮 JIT 污染（待热缓存复跑确认）；
 > ppl wiki 7.8064 / c4 11.2769（vs WxA16 +0.011/+0.014，代价远小于预期）。
 > 详见 [roadmaps/wxfp8-plan-260924.md](roadmaps/wxfp8-plan-260924.md) §七 WF-5。
+
+> **WxFP4 保守版**（bit1/4 expert fp4 + bit2/attention wxa8，t38 env，git 966e25a+）：
+> ppl wiki 7.7954 / c4 11.2711——**与 WxA8 持平（+0.0007/+0.0035）且全面优于 WxFP8**；
+> c4 59.37s（**比 WxA8 快 4.9%**）；wiki 60.1s 疑首轮 JIT 污染待复跑。
+> 详见 [roadmaps/wxfp4-plan-260924.md](roadmaps/wxfp4-plan-260924.md) WF4-4。
 
 > 端到端时间含约 20s 的 PPL 计算开销。MoE 层与 Linear Attention 的相对加速比见各模块说明。
 > ⚠ 首次运行 WxA8 会触发 Triton JIT 编译（逐 expert 形状边跑边编译，端到端可虚增 10%+），
@@ -121,12 +132,17 @@ python eval_qwen35.py --load-quantized ./quant_ckpt --inference-quant-mode wxa8
 
 # WxFP8（e4m3 激活 + FP8 Tensor Core；MoE 走 fp8，attention 默认混合部署保 WxA8）
 python eval_qwen35.py --load-quantized ./quant_ckpt --inference-quant-mode wxfp8
+
+# WxFP4 保守版（bit1/4 expert e2m1+FP4 MX MMA；bit2 与 attention 维持 WxA8）
+# ⚠ 必须用 dart312-t38 环境（triton 3.8 + ptxas 12.8；依赖版本已对齐主环境）
+conda run -n dart312-t38 eval_qwen35.py --load-quantized ./quant_ckpt --inference-quant-mode wxfp4
 ```
 
 WxA8 与 WxA16 共用同一份 packed checkpoint（码本转 INT8 是加载期算的），
 `--load-quantized` 加载后 `qwen35_quant_io.convert_model_to_wxa8` 原地切换，零拷贝。
 WxFP8 同理（`convert_model_to_wxfp8`，码本 e4m3 LUT + cb_scale 搜索加载期算），
-三种模式读的是同一份 checkpoint，切换只是加载标志。
+WxFP4 同理（`convert_model_to_wxfp4`，nibble LUT + 常量 e8m0 + norms×residual 副本
+加载期算），四种模式读的是同一份 checkpoint，切换只是加载标志。
 
 ## 路线图
 
@@ -159,5 +175,16 @@ WxFP8 同理（`convert_model_to_wxfp8`，码本 e4m3 LUT + cb_scale 搜索加�
   - **端到端**：c4 与 WxA8 持平（+0.8%），ppl wiki +0.011 / c4 +0.014 vs WxA16
     （激活 relerr 2.57% 的 ppl 代价远小于预期——旋转的离群值抑制在 ppl 层面兑现）
   - 详见 [roadmaps/wxfp8-plan-260924.md](roadmaps/wxfp8-plan-260924.md)
-- **WxFP4** 🔮 规划中（e2m1 激活 + 块缩放 MMA；四条候选路线与决策点见
-  [roadmaps/wxfp4-plan-260924.md](roadmaps/wxfp4-plan-260924.md)）
+- **WxFP4** ✅ 保守版全链路落地（e2m1 激活 + 块缩放 MMA + Triton 原生 mxf4nvf4）
+  - **打通 sm_120 原生 FP4 MMA**：triton 3.8 + ptxas 12.8 组合实测 546 TFLOPS @4096³
+    （1.55× fp8；四个坑与配方见 roadmap/memory：rhs scale 转置布局、scale 不走 TMA 等）
+  - **专家级通用纯 MX GEMM**（面向普通 MoE）：纯预打包操作数 + TMA/persistent，
+    dense 492 TF（1.39× fp8）；W 直量化 e2m1+per-32 e8m0 + 全局 scale 搜索
+  - **保守版混合部署**：bit1/4 expert 走 fp4（码本→nibble LUT 连续 scale，
+    **1-bit 精确落格**；residual 折 norms 副本，不动共享 buffer）、bit2 主力与
+    attention 维持 WxA8——隔离验证（FP4_BITS 置空精确复现 wxa8）背书接线
+  - **端到端**：ppl 与 WxA8 持平（wiki +0.0007 / c4 +0.0035）且全面优于 WxFP8；
+    c4 比 WxA8 快 4.9%
+  - 激进版（全 expert 迁移，3-4）已立项挂起，入口条件三条见 roadmap；
+    普通结构 MoE 大 B 部署可基本绕开全部条件
+  - 详见 [roadmaps/wxfp4-plan-260924.md](roadmaps/wxfp4-plan-260924.md)
