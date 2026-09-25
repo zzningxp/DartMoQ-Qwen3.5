@@ -102,6 +102,15 @@ TE#2956/#2968、DeepGEMM#236/#447、pytorch#172807、PTX ISA mma kind::mxf8f6f4/
   四个坑与完整配方见执行日志与 memory/sm120a-mxfp4-triton-recipe。
 - 2026-09-25 WF4-P1 补测：指针加载也是原生 MMA（W 侧查表结构可对接）；mixed
   e2m1×e4m3 走模拟（57-67 TF）→ DP-2 改为全 e2m1 + kernel 内 nibble 映射主线。
+- 2026-09-25 WF4-2 bring-up：fp4 GEMM kernel 契约对拍 0.00021 ✓，MoE 形态 177 TF
+  （与 wxfp8 持平，546 上限的 32%），优化方向已列（执行日志）。
+- 2026-09-25 WF4-2 迭代 1：swapped-operand 落地（修转置编址 bug，对拍 ✓）；
+  真实 per-expert 形状重定向优化目标（down 已持平 fp8，gate_up 0.33x 待转换消解；
+  dense 吞吐对 MoE wall 无意义——循环开销占 80%）。
+- 2026-09-25 WF4-2 迭代 2：专家级通用纯 MX GEMM（普通 MoE 主路径）闭环——
+  契约对拍 0.00021；down 反超 fp8（1.15×）、gate_up 差 4us（launch 量级）、
+  dense 372 TF（TMA 参照 68%）；debug 记录：全局 scale 乘反（g² 偏差）曾被
+  误判为 lhs scale bug，已澄清并留档。
 
 ---
 
@@ -181,9 +190,79 @@ TE#2956/#2968、DeepGEMM#236/#447、pytorch#172807、PTX ISA mma kind::mxf8f6f4/
 
 - （待记：用 WF4-P1 + wxfp8 WF-5 数据定格式与 W 侧操作数）
 
-### WF4-2：mixed（A=e2m1 × W=e4m3）kernel（未开始）
+### WF4-2：mixed（A=e2m1 × W=e4m3）kernel（进行中，2026-09-25 bring-up 完成）
 
-- （待记）
+> DP-2 已修正为全 e2m1 主线（见 WF4-P1 补测），本阶段实际实现为
+> A=e2m1+per-32 e8m0 × W=码本索引→e2m1 nibble（kernel 内转换）。
+
+- 2026-09-25 `turboquant_utils/triton_kernels_fp4.py` bring-up 版落地：
+  - `build_e2m1_codebook`：码本→nibble LUT + **2 的幂约束** scale 搜索
+    （分解链 `w ≈ nib[idx] × 2^E0 × norms_gf`，与 wxfp8 的 LUT+cb_scale 同构，
+    W 侧 e8m0 通道全常量）
+  - `quantize_act_e2m1_per32`：torch 参考（MX 原生格式）
+  - `_wxfp4_fused_matmul_kernel_grouped_gf`：W 侧 unpack→LUT→`tl.split` 拼 byte
+    →`tl.trans`→dot_scaled；A/scale 指针加载；per-group norms epilogue
+  - ⚠ 只能在 dart312-t38（triton 3.8）下编译运行
+- 2026-09-25 实测（`test/test_wxfp4_gemm_align.py`，t38 env）：
+  - **契约对拍 0.00021 ✓**（整条分解链数学正确）
+  - 端到端 vs fp32 = 0.35941（预测 ~0.36 ✓：W2 量化 0.34 ⊕ 激活 e2m1 0.115）；
+    vs 理想量化 0.04155（码本→e2m1 增量，好于预期 0.05-0.09）
+  - 码本→e2m1 转换 relerr（pow2 约束）：1-bit 0.060 / 2-bit 0.031 / 4-bit 0.104
+    ⚠ 4-bit 偏高——连续 scale + 残差折进 norms（norms×residual 常数因子）
+    是现成的改进路径，待做
+  - **吞吐 @ MoE 形态（B2048 N1024 K2048 bit2）：最优 177 TF**（(128,128,128,8w,1s)）
+    = wxfp8 同形状持平；离 546 上限还有 3.1× 空间——瓶颈在 W 侧 kernel 内转换
+    （reshape/split/trans 的 smem 布局转换，ns≥2 即超 135KB smem）
+- 下一步（WF4-2 优化迭代）：
+  1. swapped-operand 设计：W 作 lhs（自然方向免 trans），A 在量化时预转置存储
+  2. 拼包替代：reshape+split → 乘法归约（byte = Σ nib×[1,16]）
+  3. 码本 LUT 连续 scale + norms 折残差（救 4-bit 的 0.104）
+  4. A 侧 TMA + persistent（对齐 546 参照 kernel 的结构）
+- 2026-09-25 优化迭代 1（swapped-operand + 乘法归约拼包）完成：
+  - 修复转置布局编址 bug：A 预转置后 group 偏移必须乘行 stride B
+    （`(g+k)//2` 是字节序号不是地址；group0 偏移 0 侥幸正确——诊断方法：
+    逐 group 单独激活对拍，group1-only 复现）
+  - swapped 对拍 0.00021 ✓；但 dense B=2048 吞吐不变（177 TF）——trans 不是瓶颈，
+    W 转换的 smem 布局转换才是（ns≥2 恒超限 147-286KB）
+  - **真实 per-expert 形状实测（修正优化方向的关键数据）**：
+    | 形状 | fp4 | fp8 | 比值 |
+    |---|---|---|---|
+    | gate_up Be=32/64 (N1024 K2048) | 37-39us | 13-15us | **0.33-0.40x** |
+    | down Be=32/64 (N2048 K512) | 12us | 12us | **0.96-1.00x（持平）** |
+  - **结论修正**：dense 177→546 的优化对本项目当前 MoE 几乎无意义——真实 MoE 是
+    per-expert 小 B（~16-64 行，单 B-tile，W 转换零重复），且 per-expert Python
+    循环占 MoE wall ~80%（P4 profile 结论），GEMM 微秒差被循环开销淹没。
+    fp4 在 MoE 的实际价值 = 激活存储减半（gather/scatter 字节减半）+
+    未来大 B 场景；**down 已达 fp8 持平，gate_up 需转换开销消解（0.33x）**
+- 2026-09-25 优化迭代 2（专家级通用纯 MX GEMM，普通 MoE 主路径）完成：
+  - `quantize_weight_e2m1`（W 直量化 e2m1+per-32 e8m0 + 全局 scale 搜索；
+    返回 epilogue 乘法因子 1/g）+ `_wxfp4_expert_matmul_kernel` /
+    `wxfp4_expert_matmul`（纯预打包操作数、零 kernel 内转换、group-M swizzle）
+  - **debug 记录**：契约对拍一度恒差 0.111，先误判为"lhs 真实 scale 被 Triton
+    错误应用"（常数 scale 隔离实验 0.0 的假象）；后经"kernel 输出 = 0.3076×参考
+    的常数比例 + A=精确 1.0 探针"定位真因——**全局 scale 乘反**（packed 代表
+    w·g，epilogue 应乘 1/g 而非 g，输出偏 g²）。修正后两取向均正确，
+    定稿 W-lhs（dense 373 vs 302 TF 更快）
+  - 全局 scale 搜索对 MX 的增益实测可忽略（0.1155→0.1151）：e8m0 的 2 的幂
+    浪费是逐块无偏的，全局因子无法吸收（与 NVFP4 的 e4m3+全局两级缩放本质
+    不同）——保留参数但非必需
+  - 实测（`test/test_wxfp4_expert_gemm.py`）：契约对拍 **0.00021** ✓；
+    vs fp32 0.1625（=预测 0.163）；吞吐见下
+    | 形态 | fp4 | 对照 |
+    |---|---|---|
+    | per-expert down Be64 | 10.4us | **fp8 12us 的 1.15×（反超）** |
+    | per-expert gate_up Be64 | 17.4us | fp8 13us（差 4us，launch 量级） |
+    | B=2048 N1024 K2048 | 319 TF | — |
+    | dense 4096³ | **372 TF** | TMA 参照 546（68%） |
+  - 结论：**专家级主路径（普通 MoE）数值与性能闭环**——小 B 与 fp8 互有胜负
+    （±15-30%），大 B 场景 319-372 TF 显著超过 fp8 的 353 门槛一半以上；
+    剩余优化空间 = A 侧 TMA + persistent（372→546）
+- 下一步（WF4-2 迭代 3 或直接 WF4-4）：
+  1. A 侧 TMA + persistent（可选：普通 MoE 大 B 场景的收益项）
+  2. 激活 rotate+quantize fp4 融合 kernel（目前 A 量化是 torch 参考，主流程
+     接线前必须 kernel 化——WF-2 的 fp4 变体）
+  3. WF4-4 集成：quantization/wxfp4/ + 入口 + eval（含本项目 checkpoint 的
+     适配器路径决策）
 
 ### WF4-3：全 fp4 路线（未开始，若 DP-2 选中）
 
