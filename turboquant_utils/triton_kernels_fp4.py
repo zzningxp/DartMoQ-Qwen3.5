@@ -20,6 +20,8 @@ DP-2 定稿后的主线：全 e2m1×e2m1（mixed e2m1×e4m3 实测走 bf16 模�
   A 侧：x ≈ e2m1_nibble × 2^(per-32 块 e8m0)（MX 原生格式，无 fp16 scale）
 """
 
+import math
+
 import torch
 
 # e2m1 网格（nibble 低 3 位 = 幅度索引）
@@ -73,6 +75,39 @@ def build_e2m1_codebook(codebook: torch.Tensor):
     e0 = math.floor(math.log2(best_s))
     residual = best_s / (2.0 ** e0)
     return best_lut.contiguous(), e0, residual, best_err
+
+
+def fold_indices_to_e2m1(indices_packed_gf: torch.Tensor, nib: torch.Tensor,
+                         bit_width: int, group_size: int):
+    """W 侧 load 期折叠：packed 码本索引 → packed e2m1（WFF-1，
+    roadmaps/wxfp4-fold-plan-260927.md）。
+
+    把 kernel 内逐 tile 的「unpack → nib LUT → 拼 byte」挪到 ctx 构建期一次完成，
+    GEMM kernel 走 W_FOLDED 分支直读。同一 LUT 同一映射，输出与 legacy 构造
+    bit-exact（byte = nib[k] | nib[k+1]<<4，偶 k 低 nibble）。
+
+    显存：bit4 零膨胀（4→4 bit）；bit1 ×4 / bit2 ×2——fp4 线内仅 bit1/4 小池，
+    全模型 +47MB 上限（fold plan §二）。
+
+    Args:
+        indices_packed_gf: (G, N, group_size // (8//bit_width)) uint8
+            （group-first 布局，与 kernel legacy 路径同一 buffer）
+        nib: (2^bit_width,) uint8 码本索引 → e2m1 nibble（build_e2m1_codebook 产物）
+        bit_width: 1/2/4（bit2 当前不在 fp4 线，参数保留给 3-4 激进版）
+        group_size: 量化组大小
+    Returns:
+        (G, N, group_size // 2) uint8 —— e2m1 沿组内 K 打包（偶 k 低 nibble）
+    """
+    from turboquant_utils.quantize import unpack_nbit
+    if bit_width not in {1, 2, 4}:
+        raise ValueError(f"fold 支持 bit 1/2/4，got {bit_width}")
+    G, N, _ = indices_packed_gf.shape
+    n_elem = G * N * group_size
+    # unpack_nbit 的 byte 内 low-bit-first 与 kernel 的 >> (pos*bit)) & mask 同约定
+    idx = unpack_nbit(indices_packed_gf.reshape(-1), bit_width, n_elem)
+    nb = nib.to(indices_packed_gf.device)[idx.long()].reshape(-1, 2)  # (n/2, 2) uint8
+    out = (nb[:, 0] | (nb[:, 1] << 4)).reshape(G, N, group_size // 2)
+    return out.contiguous()
 
 
 def quantize_act_e2m1_per32(x_rot: torch.Tensor):
@@ -281,6 +316,7 @@ def _wxfp4_fused_matmul_kernel_swapped_gf(
     GROUP_SIZE: tl.constexpr,
     NUM_GROUPS: tl.constexpr,
     BIT_WIDTH: tl.constexpr,
+    W_FOLDED: tl.constexpr = False,   # WFF-1：indices_ptr 直读已折叠 e2m1
     BLOCK_B: tl.constexpr = 128,
     BLOCK_N: tl.constexpr = 128,
     BLOCK_K: tl.constexpr = 128,
@@ -292,6 +328,10 @@ def _wxfp4_fused_matmul_kernel_swapped_gf(
       - rhs = A 预转置存储后的 (BK/2, BM) tile，直接加载
       - acc 为 (BN, BM)，store 时一次转置写出（每 tile 一次，代价远小于逐 k trans）
       - 乘法归约拼包：byte = Σ_{j∈{0,1}} nib3[...,j] × (16j+1)，替代 reshape+split
+      - WFF-1 W_FOLDED：W 侧 ctx 期已折叠为 e2m1（fold_indices_to_e2m1），
+        本 kernel 直读（byte 域寻址同 A 侧），跳过 unpack/LUT/拼包整块——
+        indices_ptr 传 folded buffer、INDICES_G0_STRIDE 传其 stride(0)，
+        nib_ptr 不读（wrapper 传占位）
     """
     pid_b = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -336,23 +376,31 @@ def _wxfp4_fused_matmul_kernel_swapped_gf(
                               & ((k_start // 32 + rk_sc) < (GROUP_SIZE // 32))[None, :],
                               other=0)
 
-            # --- lhs = W：unpack → nibble LUT → 乘法归约拼包（免 trans 免 split）---
-            w_mask = mask_n[:, None] & mask_k[None, :]
-            if BIT_WIDTH == 8:
-                byte_off = g_base + row_base[:, None] + rk[None, :]
-                idx = tl.load(indices_ptr + byte_off, mask=w_mask, other=0).to(tl.int32)
+            # --- lhs = W：W_FOLDED 直读（WFF-1）或 unpack → nibble LUT → 乘法归约拼包 ---
+            if W_FOLDED:
+                # ctx 期已折叠的 e2m1 (G, N, GS//2)：byte = nib[2j] | nib[2j+1]<<4
+                # 已拼好，byte 域寻址（mask_kp），写法同 A 侧 packed 加载
+                row_f = rn * (GROUP_SIZE // 2)
+                wf_off = g_base + row_f[:, None] + (k_start // 2 + rk_pk)[None, :]
+                w_byte = tl.load(indices_ptr + wf_off,
+                                 mask=mask_n[:, None] & mask_kp[None, :], other=0)
             else:
-                BIT_MASK = (1 << BIT_WIDTH) - 1
-                byte_col = rk // ELEMENTS_PER_BYTE
-                pos_in_byte = rk % ELEMENTS_PER_BYTE
-                byte_off = g_base + row_base[:, None] + byte_col[None, :]
-                packed_w = tl.load(indices_ptr + byte_off, mask=w_mask, other=0).to(tl.uint8)
-                shift = pos_in_byte * BIT_WIDTH
-                idx = ((packed_w >> shift[None, :]) & BIT_MASK).to(tl.int32)
-            nib = tl.load(nib_ptr + idx, mask=w_mask, other=0)      # (BN, BK) uint8
+                w_mask = mask_n[:, None] & mask_k[None, :]
+                if BIT_WIDTH == 8:
+                    byte_off = g_base + row_base[:, None] + rk[None, :]
+                    idx = tl.load(indices_ptr + byte_off, mask=w_mask, other=0).to(tl.int32)
+                else:
+                    BIT_MASK = (1 << BIT_WIDTH) - 1
+                    byte_col = rk // ELEMENTS_PER_BYTE
+                    pos_in_byte = rk % ELEMENTS_PER_BYTE
+                    byte_off = g_base + row_base[:, None] + byte_col[None, :]
+                    packed_w = tl.load(indices_ptr + byte_off, mask=w_mask, other=0).to(tl.uint8)
+                    shift = pos_in_byte * BIT_WIDTH
+                    idx = ((packed_w >> shift[None, :]) & BIT_MASK).to(tl.int32)
+                nib = tl.load(nib_ptr + idx, mask=w_mask, other=0)      # (BN, BK) uint8
 
-            nib3 = tl.reshape(nib, (BLOCK_N, BLOCK_K // 2, 2))
-            w_byte = tl.sum(nib3.to(tl.int32) * pk_w[None, None, :], axis=2).to(tl.uint8)
+                nib3 = tl.reshape(nib, (BLOCK_N, BLOCK_K // 2, 2))
+                w_byte = tl.sum(nib3.to(tl.int32) * pk_w[None, None, :], axis=2).to(tl.uint8)
 
             # lhs scale (BN, BK/32)——按全局 w_s 布局寻址（WS_STRIDE/WS_KOFF）
             ws_off = rn[:, None] * WS_STRIDE + WS_KOFF \
@@ -402,8 +450,13 @@ def wxfp4_matmul_grouped_gf_swapped(
 
 
 def _launch_swapped(x_f4_t, x_s, indices_slice, nib, w_s, norms_slice,
-                    group_size, num_groups, bit_width, ws_stride, ws_koff, cfg=None):
-    """swapped kernel 的通用启动入口（供切片 wrapper 使用）。"""
+                    group_size, num_groups, bit_width, ws_stride, ws_koff, cfg=None,
+                    w_folded=False):
+    """swapped kernel 的通用启动入口（供切片 wrapper 使用）。
+
+    w_folded=True 时 indices_slice 应传 fold_indices_to_e2m1 产物（切片后同布局），
+    nib 传任意 uint8 占位张量（W_FOLDED constexpr 分支不读）。
+    """
     B = x_f4_t.shape[1]
     N = indices_slice.shape[1]
     K_total = x_f4_t.shape[0] * 2
@@ -419,6 +472,7 @@ def _launch_swapped(x_f4_t, x_s, indices_slice, nib, w_s, norms_slice,
         B, N, K_total,
         indices_slice.stride(0), norms_slice.stride(0), ws_stride, ws_koff,
         GROUP_SIZE=group_size, NUM_GROUPS=num_groups, BIT_WIDTH=bit_width,
+        W_FOLDED=w_folded,
         BLOCK_B=BLOCK_B, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
         num_warps=nw, num_stages=ns,
     )
@@ -428,7 +482,7 @@ def _launch_swapped(x_f4_t, x_s, indices_slice, nib, w_s, norms_slice,
 def wxfp4_matmul_grouped_slice_rows_gf_swapped(
     x_f4_t, x_s, indices_packed_gf, nib, w_s, norms_gf,
     group_size, in_features, row_start, row_end, bit_width,
-    norms_prescaled=False,
+    norms_prescaled=False, w_e2m1_gf=None,
 ):
     """gate_up 路径：行切片（输出维切片，对应 wxa8 的 slice_rows_gf）。
 
@@ -437,6 +491,9 @@ def wxfp4_matmul_grouped_slice_rows_gf_swapped(
         x_s: (B, in_features//32) uint8
         w_s: (N_total, in_features//32) uint8（全矩阵，行切片 view 免拷贝）
         norms_gf: (num_groups, N_total) fp16（**已含 residual 折算**）
+        w_e2m1_gf: (num_groups, N_total, group_size//2) uint8 可选——
+            fold_indices_to_e2m1 产物；非 None 时走 W_FOLDED 直读分支
+            （nib 被忽略，可传任意 uint8 占位）
     """
     if bit_width not in {1, 2, 4}:
         raise ValueError(f"WxFP4 支持 bit 1/2/4，got {bit_width}")
@@ -444,17 +501,22 @@ def wxfp4_matmul_grouped_slice_rows_gf_swapped(
     norms_slice = norms_gf[:, row_start:row_end]
     if not norms_prescaled:
         norms_slice = norms_slice.float() / math.sqrt(group_size)
+    if w_e2m1_gf is not None:
+        w_src = w_e2m1_gf[:, row_start:row_end, :]
+        nib_arg = w_src          # 占位（W_FOLDED 分支不读）
+    else:
+        w_src = indices_packed_gf[:, row_start:row_end, :]
+        nib_arg = nib
     return _launch_swapped(
-        x_f4_t, x_s, indices_packed_gf[:, row_start:row_end, :], nib,
-        w_s[row_start:row_end], norms_slice,
+        x_f4_t, x_s, w_src, nib_arg, w_s[row_start:row_end], norms_slice,
         group_size, num_groups, bit_width,
-        w_s.stride(0), 0)
+        w_s.stride(0), 0, w_folded=w_e2m1_gf is not None)
 
 
 def wxfp4_matmul_grouped_slice_in_features_gf_swapped(
     x_f4_t, x_s, indices_packed_gf, nib, w_s, norms_gf,
     group_size, original_start, original_end, bit_width,
-    norms_prescaled=False,
+    norms_prescaled=False, w_e2m1_gf=None,
 ):
     """down 路径：in_features 切片（group 维切片，对应 wxa8 的 slice_in_features_gf）。
 
@@ -463,6 +525,8 @@ def wxfp4_matmul_grouped_slice_in_features_gf_swapped(
         x_s: (B, slice//32) uint8
         w_s: (N, K_total//32) uint8 全矩阵（WS_STRIDE/WS_KOFF 全局寻址免拷贝）
         norms_gf: (K_total//group_size, N) fp16（已含 residual 折算）
+        w_e2m1_gf: (K_total//group_size, N, group_size//2) uint8 可选——
+            fold_indices_to_e2m1 产物；非 None 时走 W_FOLDED 直读分支
     """
     if bit_width not in {1, 2, 4}:
         raise ValueError(f"WxFP4 支持 bit 1/2/4，got {bit_width}")
@@ -473,11 +537,17 @@ def wxfp4_matmul_grouped_slice_in_features_gf_swapped(
     norms_slice = norms_gf[g_start:g_end]
     if not norms_prescaled:
         norms_slice = norms_slice.float() / math.sqrt(group_size)
+    if w_e2m1_gf is not None:
+        w_src = w_e2m1_gf[g_start:g_end]
+        nib_arg = w_src          # 占位（W_FOLDED 分支不读）
+    else:
+        w_src = indices_packed_gf[g_start:g_end]
+        nib_arg = nib
     return _launch_swapped(
-        x_f4_t, x_s, indices_packed_gf[g_start:g_end], nib,
+        x_f4_t, x_s, w_src, nib_arg,
         w_s, norms_slice,
         group_size, g_end - g_start, bit_width,
-        w_s.stride(0), original_start // 32)
+        w_s.stride(0), original_start // 32, w_folded=w_e2m1_gf is not None)
 
 
 # ===========================================================================

@@ -120,6 +120,12 @@ TE#2956/#2968、DeepGEMM#236/#447、pytorch#172807、PTX ISA mma kind::mxf8f6f4/
 - 2026-09-25 WF4-4 eval：**保守版 ppl 与 wxa8 持平（wiki +0.0007 / c4 +0.0035）
   且全面优于 wxfp8**；c4 比 wxa8 快 4.9%；t38 依赖 pin 对齐（transformers
   5.17→5.13 踩坑修复）。3-4 条件 1 ✅、2/3 ❌ 继续挂起。
+- 2026-09-27：W 侧 LUT 开销消解立项，独立文件 `wxfp4-fold-plan-260927.md`（WFF-x）：
+  bit1/4 expert 的 idx→e2m1 映射挪到 ctx 构建期一次 fold，kernel 直读 e2m1，
+  bit-exact 不变；bit4 零膨胀、bit1 全模型 +47MB。与 WF4-P1「离线展开否决」
+  的边界已在彼文件 §二 澄清（该否决针对 bit2 大池 9.5→19GB，bit1/4 小池
+  账面 +47MB）。WF4-2 迭代 1 的遗留项"gate_up 转换开销消解（0.33x）"
+  由该路线承接。
 
 ---
 

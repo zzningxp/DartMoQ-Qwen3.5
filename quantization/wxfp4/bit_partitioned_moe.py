@@ -26,6 +26,7 @@ from turboquant_utils.rotation import generate_batch_rotation_matrices
 from turboquant_utils.triton_kernels_a8 import rotate_quantize_fused
 from turboquant_utils.triton_kernels_fp4 import (
     build_e2m1_codebook,
+    fold_indices_to_e2m1,
     rotate_quantize_fused_fp4,
     wxfp4_matmul_grouped_slice_in_features_gf_swapped,
     wxfp4_matmul_grouped_slice_rows_gf_swapped,
@@ -83,6 +84,11 @@ class WxFP4BitPartitionedGroupMoE(WxA8BitPartitionedGroupMoE):
             c["gate_up_ws"] = torch.full(
                 (n_gu, k_gu // 32), 127 + e0, dtype=torch.uint8, device=device)
             gu["norms_gf"] = (gu["norms_gf"].float() * resid).half().contiguous()
+            # WFF-1：索引 → e2m1 load 期折叠（kernel 直读 W_FOLDED 分支，bit-exact；
+            # bit4 零膨胀 / bit1 ×4 小池，全模型 +47MB 上限，见 fold plan §二）。
+            # 新增 key 不替换 indices_packed_gf——共享 buffer 原样保留
+            gu["indices_e2m1_gf"] = fold_indices_to_e2m1(
+                gu["indices_packed_gf"], c["gate_up_nib"], bit, gs_gu)
 
             gs_dn = c["down_group_size"]
             dn = c["down"]
@@ -93,6 +99,8 @@ class WxFP4BitPartitionedGroupMoE(WxA8BitPartitionedGroupMoE):
             c["down_ws"] = torch.full(
                 (n_dn, k_dn // 32), 127 + e0_d, dtype=torch.uint8, device=device)
             dn["norms_gf"] = (dn["norms_gf"].float() * resid_d).half().contiguous()
+            dn["indices_e2m1_gf"] = fold_indices_to_e2m1(
+                dn["indices_packed_gf"], c["down_nib"], bit, gs_dn)
 
         self._fp4_ctx_ready = ctx
         return ctx
@@ -181,6 +189,7 @@ class WxFP4BitPartitionedGroupMoE(WxA8BitPartitionedGroupMoE):
                 2 * start, 2 * end,
                 bit,
                 norms_prescaled=ctx["gate_up_norms_prescaled"],
+                w_e2m1_gf=gu.get("indices_e2m1_gf"),
             )
         del inp_f4, inp_s
         return gate_up_out, expert_tokens
@@ -211,6 +220,7 @@ class WxFP4BitPartitionedGroupMoE(WxA8BitPartitionedGroupMoE):
                 start, end,
                 bit,
                 norms_prescaled=ctx["down_norms_prescaled"],
+                w_e2m1_gf=dn.get("indices_e2m1_gf"),
             )
         del act_f4, act_s
         if down_out.dtype != ctx["act_dtype"]:
