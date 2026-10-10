@@ -440,6 +440,7 @@ def analyze_turboquant_outlier_activation_aware(
     flat_states = hidden_states.reshape(-1, hidden_states.shape[-1]).float()
 
     all_rates = []
+    expert_times = []  # 每专家耗时，循环结束聚合成一行输出，避免 256 行刷屏
     if if_dense:
         assert ori_expert_num == 1, "dense model n == 1"
 
@@ -474,15 +475,19 @@ def analyze_turboquant_outlier_activation_aware(
         all_rates.append(rates)
 
         tick1 = time.time()
-        print(
-            f"TurboQuant {mode} outlier, layer {layer_idx} expert {expert_idx} "
-            f"bits: {wbits} time: {tick1 - tick0:.4f}",
-            flush=True,
-        )
+        expert_times.append(tick1 - tick0)
 
         # Clean up after each expert
         del rates
         gc.collect()
+
+    print(
+        f"TurboQuant {mode} outlier, layer {layer_idx}: {ori_expert_num} experts, "
+        f"bits: {wbits}, total {sum(expert_times):.2f}s, "
+        f"avg {sum(expert_times) / len(expert_times) * 1000:.1f}ms, "
+        f"max {max(expert_times) * 1000:.1f}ms",
+        flush=True,
+    )
 
     if save_path:
         rates = all_rates[0]

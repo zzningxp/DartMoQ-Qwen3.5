@@ -61,6 +61,19 @@ class WxA16Weights(nn.Module):
         self._down_rotation = None
         self._down_orig_dtype = None
 
+    def _apply(self, fn, *args, **kwargs):
+        """设备迁移后清空 packed 缓存 dict。
+
+        property getter 缓存的 dict 里的张量是注册时的旧设备对象，
+        layer.to('cpu') 只替换 buffer 本身，缓存 dict 仍引用旧 GPU 张量
+        （逐层量化会泄漏整份 packed 权重，122B 实测 ~612MB/层）。
+        清空后下次访问按新 buffer 重建，设备自动跟随。
+        """
+        ret = super()._apply(fn, *args, **kwargs)
+        self._gate_up_packed = None
+        self._down_packed = None
+        return ret
+
     @property
     def gate_up_packed(self):
         """获取 gate_up_packed 字典，同时恢复元数据"""
@@ -131,7 +144,10 @@ class WxA16Weights(nn.Module):
             for key, value in gate_up_packed.items():
                 if isinstance(value, torch.Tensor):
                     self.register_buffer(f"gate_up_{key}", value)
-            self._gate_up_packed = gate_up_packed
+            # 不保留原始 dict 引用：dict 里的张量不会随 layer.to('cpu') 迁移，
+            # 逐层量化会在 GPU 上泄漏整份 packed 权重（122B 实测 ~612MB/层）。
+            # property getter 按需从 buffer（已随模块迁移）重建等价 dict
+            self._gate_up_packed = None
             # 保存元数据
             self._gate_up_seed = gate_up_packed.get('seed')
             self._gate_up_group_size = gate_up_packed.get('group_size')
@@ -145,7 +161,8 @@ class WxA16Weights(nn.Module):
             for key, value in down_packed.items():
                 if isinstance(value, torch.Tensor):
                     self.register_buffer(f"down_{key}", value)
-            self._down_packed = down_packed
+            # 同 gate_up：不保留原始 dict 引用，避免 GPU 逐层泄漏
+            self._down_packed = None
             # 保存元数据
             self._down_seed = down_packed.get('seed')
             self._down_group_size = down_packed.get('group_size')
@@ -305,6 +322,32 @@ class WxA16BitPartitionedGroupMoE(nn.Module):
         self._expert_offsets_cpu = {}  # bit_str -> List[int] (CPU 常驻，避免每 forward .item() D2H 同步)
 
         self.bit_list = []
+
+    # 设备相关运行时缓存属性清单：_apply（设备迁移）时统一清空。
+    # 各推理子类（WxA8/WxFP8/WxFP4）扩展 bit context 时会缓存各自的
+    # *_ctx_ready 引用（持有 packed dict -> gf 张量），逐层 GPU<->CPU 往返
+    # 不清就泄漏（122B sequential 实测 +0.63~0.71GB/层，0930.8）。
+    # 新子类增加缓存属性时务必登记到这里的元组。
+    _DEVICE_CACHE_ATTRS = ("_bit_ctx_cache", "_bit_ctx_device",
+                           "_a8_ctx_ready", "_fp8_ctx_ready", "_fp4_ctx_ready")
+    _DEVICE_FLAG_ATTRS = ("_gf_built",)  # 布尔标志：复位为 False（None 会绕过 hasattr 检查）
+
+    def _apply(self, fn, *args, **kwargs):
+        """设备迁移后清空全部设备相关运行时缓存。
+
+        - ctx 缓存（含 packed dict 引用与 GPU codebook 副本）不随
+          layer.to('cpu') 迁移，必须显式清空，否则逐层泄漏整份 packed 权重；
+        - _gf_built 必须复位：清掉缓存后若标志仍为 True，下次 forward
+          会跳过 gf 重建直接 KeyError('indices_packed_gf')（0930.4 实测）。
+        """
+        ret = super()._apply(fn, *args, **kwargs)
+        for attr in self._DEVICE_CACHE_ATTRS:
+            if hasattr(self, attr):
+                setattr(self, attr, None)
+        for attr in self._DEVICE_FLAG_ATTRS:
+            if hasattr(self, attr):
+                setattr(self, attr, False)
+        return ret
 
     @classmethod
     @torch.no_grad()
@@ -731,7 +774,10 @@ class WxA16BitPartitionedGroupMoE(nn.Module):
 
         # P5-1: 懒构建 group-first 布局（首次 forward 时一次性转换）
         # 不修改 state_dict 格式，纯运行时优化，内存占用与原布局相同（只是排列不同）
-        if not hasattr(self, '_gf_built'):
+        # 守卫必须查真值而非 hasattr：_apply（设备迁移）把 _gf_built 复位为
+        # False（属性仍存在），hasattr 会误判已构建、跳过重建，第二个数据集
+        # 起直接 KeyError('indices_packed_gf')（0930.8 c4 实测）
+        if not getattr(self, '_gf_built', False):
             self._gf_built = True
             for w in self.bit_weights.values():
                 # 先触发 property 重建（from_metadata 路径下 _packed 为 None）

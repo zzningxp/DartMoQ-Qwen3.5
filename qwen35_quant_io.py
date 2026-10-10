@@ -215,15 +215,8 @@ def _print_size_breakdown(sd: dict, total_bytes: int):
     print(f"    合计: {total_bytes / 1024**3:.2f}GB")
 
 
-def save_quantized_model(model, save_dir: str, base_model_path: str = None,
-                         quant_args: dict = None, verbose: bool = True) -> dict:
-    """把量化后的模型保存为 safetensors + meta.json。
-
-    只做 CPU 拷贝，不修改模型自身的设备状态（保存后 eval 不受影响）。
-    """
-    tick0 = time.time()
-    os.makedirs(save_dir, exist_ok=True)
-
+def _copy_checkpoint_aux_files(save_dir, base_model_path, verbose=True):
+    """拷贝原模型 config/tokenizer 与项目本地 modeling 文件，目录自给自足。"""
     # 拷贝原模型 config.json（量化流程原地改过 model.config，不能用 save_pretrained）
     # 同时拷贝 tokenizer 和 modeling 文件，让 checkpoint 目录自给自足
     if base_model_path:
@@ -243,6 +236,17 @@ def save_quantized_model(model, save_dir: str, base_model_path: str = None,
         shutil.copy(local_modeling, os.path.join(save_dir, "modeling_qwen3_5_moe.py"))
         if verbose:
             print(f"Copied modeling_qwen3_5_moe.py from project")
+
+
+def save_quantized_model(model, save_dir: str, base_model_path: str = None,
+                         quant_args: dict = None, verbose: bool = True) -> dict:
+    """把量化后的模型保存为 safetensors + meta.json。
+
+    只做 CPU 拷贝，不修改模型自身的设备状态（保存后 eval 不受影响）。
+    """
+    tick0 = time.time()
+    os.makedirs(save_dir, exist_ok=True)
+    _copy_checkpoint_aux_files(save_dir, base_model_path, verbose)
 
     # 收集元数据并写 meta.json
     meta = collect_quant_metadata(
@@ -302,7 +306,7 @@ def _split_path(root, path: str):
 
 
 def _materialize_meta_buffers(model) -> list:
-    """物化 assign 加载后残留的 meta 非持久 buffer。
+    """回填 assign 加载后残留的 meta 非持久 buffer。
 
     rotary_emb.inv_freq / original_inv_freq 是 persistent=False buffer，
     load_state_dict 不参与 strict 匹配也不会回填，forward 里 .to(device)
@@ -323,9 +327,9 @@ def _materialize_meta_buffers(model) -> list:
         else:
             unknown.append(name)
     if handled:
-        print(f"Materialized meta buffers: {handled}")
+        print(f"Backfilled meta buffers: {handled}")
     if unknown:
-        print(f"  [WARN] 仍有 meta buffer 未物化: {unknown}（首次 forward 可能报错）", flush=True)
+        print(f"  [WARN] 仍有 meta buffer 未回填: {unknown}（首次 forward 可能报错）", flush=True)
     return handled
 
 
@@ -500,6 +504,83 @@ def convert_model_to_wxfp4(model):
     return model
 
 
+def _checkpoint_total_bytes(quant_dir) -> int:
+    """checkpoint 权重总字节（两卡自动判定用，含分 shard 与单文件两种形态）。"""
+    idx_path = os.path.join(quant_dir, "model.safetensors.index.json")
+    if os.path.isfile(idx_path):
+        with open(idx_path, "r", encoding="utf-8") as f:
+            doc = json.load(f)
+        total = doc.get("metadata", {}).get("total_size")
+        if total:
+            return int(total)
+        total = 0
+        for fname in set(doc["weight_map"].values()):
+            total += os.path.getsize(os.path.join(quant_dir, fname))
+        return total
+    return os.path.getsize(os.path.join(quant_dir, "model.safetensors"))
+
+
+def _split_model_two_gpu(model, split_idx=None, verbose=True):
+    """把模型对半切分到两张 GPU：层 [0, split) → cuda:0，其余 → cuda:1。
+
+    embed/rotary → cuda:0（入口侧），final norm/lm_head → cuda:1（出口侧），
+    每轮前向只有切分边界一次跨卡搬运（hidden ~batch×seq×dim，实测数量级可忽略）。
+    标准 transformers forward 不会自动搬激活，边界层注册 forward_pre_hook
+    搬运 hidden 与全部 tensor kwargs（attention_mask/position_ids/position_embeddings）。
+    """
+    dev0 = torch.device("cuda:0")
+    dev1 = torch.device("cuda:1")
+    layers = model.model.layers
+    n = len(layers)
+    if split_idx is None:
+        split_idx = n // 2
+    if not (0 < split_idx < n):
+        raise ValueError(f"invalid split_idx {split_idx} for {n} layers")
+
+    model.model.embed_tokens.to(dev0)
+    if hasattr(model.model, "rotary_emb"):
+        model.model.rotary_emb.to(dev0)
+    for i, layer in enumerate(layers):
+        layer.to(dev0 if i < split_idx else dev1)
+    model.model.norm.to(dev1)
+    model.lm_head.to(dev1)
+
+    boundary = layers[split_idx]
+
+    def _move_shared(t, dev):
+        """就地迁移 kwargs 里的共享张量。
+
+        attention_mask / position_embeddings 是顶层 forward 创建一次、同一
+        对象传给所有层的（modeling_qwen3_5_moe.py 层循环直传），仅靠 hook
+        返回值搬不动下游层的视角 —— 必须在边界处把原始对象 .data 重绑定
+        到新存储，后续 dev1 上的层才拿到迁移后的张量。执行是顺序的，
+        边界前的层早已消费完毕，无正确性风险。
+        """
+        if isinstance(t, torch.Tensor):
+            if t.device != dev:
+                t.data = t.to(dev)
+            return t
+        if isinstance(t, (tuple, list)):
+            for x in t:
+                _move_shared(x, dev)
+            return t
+        return t
+
+    def _transfer_hook(module, args, kwargs):
+        # hidden 每层是新张量，普通搬运即可
+        if args and isinstance(args[0], torch.Tensor) and args[0].device != dev1:
+            args = (args[0].to(dev1),) + tuple(args[1:])
+        kwargs = {k: _move_shared(v, dev1) for k, v in kwargs.items()}
+        return args, kwargs
+
+    boundary.register_forward_pre_hook(_transfer_hook, with_kwargs=True)
+    if verbose:
+        print(f"Two-GPU split: layers [0,{split_idx}) -> {dev0}, "
+              f"[{split_idx},{n}) -> {dev1} | embed/rotary -> {dev0} | "
+              f"norm/lm_head -> {dev1} | boundary hook @ layer {split_idx}")
+    return model
+
+
 def load_quantized_model(base_model_path: str = None, quant_dir: str = None,
                          standby_cpu: bool = False, seqlen: int = 2048,
                          inference_quant_mode: str = "wxa16"):
@@ -534,23 +615,32 @@ def load_quantized_model(base_model_path: str = None, quant_dir: str = None,
     tokenizer = AutoTokenizer.from_pretrained(base_model_path, trust_remote_code=True)
 
     print("Building model structure on meta device (no weights loaded)...")
-    model = AutoModelForCausalLM.from_pretrained(
-        base_model_path,
-        device_map="meta",
-        dtype=torch.bfloat16,
-        low_cpu_mem_usage=True,
-        trust_remote_code=True,
-    )
+    # 共用流式路径的结构构建：base 是 W8A8 int8 checkpoint 时剥掉
+    # compression_config，避免 compressed-tensors 模块替换破坏 key 对齐
+    from qwen35_stream_io import build_meta_structure
+    model = build_meta_structure(base_model_path)
     print(f"Meta structure built in {time.time() - tick0:.2f}s")
 
     meta_path = os.path.join(quant_dir, "meta.json")
     with open(meta_path, "r", encoding="utf-8") as f:
         meta = json.load(f)
 
+    # 分 shard checkpoint（StreamingSaver 产出）合并读取；旧单文件路径不变
     sd_path = os.path.join(quant_dir, "model.safetensors")
-    print(f"Loading quantized tensors: {sd_path} ({os.path.getsize(sd_path) / 1024**3:.2f}GB)...")
-    sd = load_file(sd_path)
-    print(f"Loaded {len(sd)} tensors in {time.time() - tick0:.2f}s")
+    idx_path = os.path.join(quant_dir, "model.safetensors.index.json")
+    if os.path.isfile(idx_path):
+        with open(idx_path, "r", encoding="utf-8") as f:
+            wm = json.load(f)["weight_map"]
+        shard_names = sorted(set(wm.values()))
+        sd = {}
+        for fname in shard_names:
+            sd.update(load_file(os.path.join(quant_dir, fname)))
+        print(f"Loaded {len(sd)} tensors from {len(shard_names)} shards "
+              f"in {time.time() - tick0:.2f}s")
+    else:
+        print(f"Loading quantized tensors: {sd_path} ({os.path.getsize(sd_path) / 1024**3:.2f}GB)...")
+        sd = load_file(sd_path)
+        print(f"Loaded {len(sd)} tensors in {time.time() - tick0:.2f}s")
 
     restore_quant_metadata(model, meta, sd)
 
@@ -578,11 +668,37 @@ def load_quantized_model(base_model_path: str = None, quant_dir: str = None,
     model._model_path = base_model_path
     model.eval()
 
+    # 设备策略全自动（不暴露 CLI flag）：
+    #   双卡 + 装不进单卡  -> 两卡对半切分（batch eval）
+    #   单卡 + 装不进单卡  -> 回退 standby CPU（调用方转 sequential eval）
+    #   装得进单卡        -> 常规单卡
+    do_split = False
+    if not standby_cpu and torch.cuda.is_available():
+        total = _checkpoint_total_bytes(quant_dir)
+        single = torch.cuda.get_device_properties(0).total_memory
+        if total > 0.85 * single:
+            if torch.cuda.device_count() >= 2:
+                do_split = True
+                print(f"Auto two-GPU: checkpoint {total / 1024**3:.1f}GB > "
+                      f"85% of single-GPU {single / 1024**3:.1f}GB, "
+                      f"{torch.cuda.device_count()} GPUs available")
+            else:
+                print(f"Auto standby CPU: checkpoint {total / 1024**3:.1f}GB > "
+                      f"85% of single-GPU {single / 1024**3:.1f}GB and only 1 GPU "
+                      f"available — falling back to CPU standby (sequential eval)")
+                standby_cpu = True
+
     if not standby_cpu:
-        print(f"Moving quantized model to {DEV}...")
-        model.to(DEV)
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        if do_split:
+            _split_model_two_gpu(model, verbose=True)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        else:
+            print(f"Moving quantized model to {DEV}...")
+            model.to(DEV)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+    model._two_gpu_split = bool(do_split)
 
     print(f"Quantized model loaded in {time.time() - tick0:.2f}s")
     return model, tokenizer

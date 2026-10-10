@@ -93,6 +93,20 @@ class WxA8Linear(WxA16Linear):
         linear._gf_built = False
         return linear
 
+    def _apply(self, fn, *args, **kwargs):
+        """设备迁移后清空 gf 缓存与标志。
+
+        _indices_gf/_norms_gf 是普通属性（非 buffer），不随 layer.to()
+        迁移；sequential eval 逐层 GPU<->CPU 往返时若不清，gf 会逐层
+        泄漏在 GPU 上（~89MB/层），且下次 forward 会读旧设备张量。
+        """
+        ret = super()._apply(fn, *args, **kwargs)
+        self._indices_gf = None
+        self._norms_gf = None
+        if hasattr(self, "_gf_built"):
+            self._gf_built = False
+        return ret
+
     def _ensure_gf(self, device):
         """lazy 转 group-first 布局 + 预乘 1/sqrt(group_size)（对齐 MoE 的
         _build_group_first 思路；不注册 buffer，state_dict 格式不变）。"""

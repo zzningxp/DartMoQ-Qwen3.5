@@ -1,6 +1,6 @@
 # DartMoQ-Qwen3.5
 
-面向 Qwen3.5-35B-A3B MoE 模型的混合精度量化推理框架，及所有依赖 Qwen3.5 混合注意力机制模型，如 Qwen3.6/3.7/3.8 等。
+面向 Qwen3.5 MoE 模型的混合精度量化推理框架，及所有依赖 Qwen3.5 混合注意力机制模型，如 Qwen3.6/3.7/3.8 等。已支持 Qwen3.5-35B-A3B（子专家级切分搜索），Qwen3.5-122B-A10B（专家级 bit 搜索 + 流式量化）。
 基于 [DartMoQ](https://github.com/zzningxp/DartMoQ) 算法，适配 Qwen3.5 MoE 的 grouped_gemm 权重格式，
 Triton kernel 量化推理支持三种精度模式（共用同一份 packed checkpoint）：
 
@@ -36,41 +36,74 @@ Triton kernel 量化推理支持三种精度模式（共用同一份 packed chec
   （WxA16 与 WxA8 各有独立的调优表）
 - **Linear Attention 深度优化**：chunk delta rule 全路径 Triton 融合
   - pad-skip、WY 闭式解、cast 缩减、wy_prep 融合、kernel 自动调优
+- **122B 级模型流式量化**：meta 空结构 + 逐层流式反量化载入/落盘（`--standby-layer-meta`），
+  bf16 全量载入需 ~244GB 的模型全程 CPU RAM 峰值 ~45GB；W8A8 int8 输入逐层读盘、
+  GPU 反量化，产物分 shard 落盘，visual/mtp 原样存档
+- **评测设备自适应**：按 checkpoint 大小自动选设备策略——双卡对半切分 batch eval
+  （单边界 pre-hook 跨卡搬运、bs 自动收敛），单卡装不下自动回退 standby CPU +
+  sequential，超出内存的基模型走流式评测（算一层读一层），无需任何设备 flag
 
 
 ## 性能
 
-> Qwen3.5-35B-A3B, bpw2, RTX 5090, sequential eval, HEAD 6eabe23
+### Qwen3.5-35B-A3B（bpw2，RTX 5090，sequential eval，各模式分属不同 git 批次）
 
-| 数据集 | WxA16 | **WxA8** | 加速比 | ppl |
+| 数据集 | fp16 基线 | WxA16 | **WxA8** | WxFP4 | WxFP8 |
+|---|---|---|---|---|---|
+| wikitext2（256 samples） | 87.19 s | 53.12 s | **45.08 s** | 60.10 s † | 55.43 s † |
+| c4（145 samples） | 90.52 s | 76.71 s | 61.84 s | **59.37 s** | 62.93 s |
+| **合计（vs 基线）** | 177.7 s | 129.8 s（-26.9%） | **106.9 s（-39.8%）** | 119.5 s †（-32.8%） | 118.4 s †（-33.4%） |
+| ppl（wiki / c4） | 6.5852 / 9.6725 | 7.7955 / 11.2631 | 7.7947 / 11.2676 | 7.7954 / 11.2711 | 7.8064 / 11.2769 |
+
+† wiki 的 WxFP4/WxFP8 疑首轮 Triton JIT 污染（未复跑确认），c4 数字干净；合计与
+百分比受此影响仅供参考。
+
+- WxA8 vs WxA16：wiki -15.1% / c4 -19.4%，ppl 持平；MoE 单独贡献 -7.0%/-6.7%，
+  attention 路径贡献 -13.2%/-16.8%。WxA8 全路径数字基于 260831-u8 checkpoint
+  （attention 均匀码本，MoE 与 260824 同型），与 WxA16（6eabe23）跨批次
+- **W 侧折叠直存 e2m1 后（当前代码形态）**：同批次对照合计 **WxFP4 100.79s
+  < WxA8 107.82s < WxFP8 112.24s**——WxFP4 在 35B 上为最快模式（vs WxA8 -6.5%），
+  ppl 逐位一致（wiki 7.7972 / c4 11.2708）；gate_up kernel 2.0-2.4×
+  （B64 40.2→16.6us；B2048 bit1 185→367 TF）。
+  与上表跨批次数字并存，对比以同批次为准
+- 35B 上 WxFP4 能登顶而 122B 不能：35B 的 bit1/4 专家占比更高，fp4 路径覆盖
+  更多权重；122B 为 2-bit 主导（见下节）
+- 端到端时间含约 20s 的 PPL 计算开销；首次运行 WxA8 触发 Triton JIT 编译
+  （逐 expert 形状边跑边编译，端到端可虚增 10%+），测速前先捂热磁盘缓存
+- 各批次明细：[roadmaps/wxfp8-plan-260924.md](roadmaps/wxfp8-plan-260924.md) §七 WF-5、
+  [roadmaps/wxfp4-plan-260924.md](roadmaps/wxfp4-plan-260924.md) WF4-4、
+  [roadmaps/wxfp4-fold-plan-260927.md](roadmaps/wxfp4-fold-plan-260927.md)
+
+### Qwen3.5-122B-A10B（bpw2，RTX 5090，sequential eval，git da4bd33+）
+
+输入为 W8A8 int8 checkpoint（磁盘 119GB）；fp16 基线 = int8 权重逐层反量化 bf16 后的
+原生前向（W16A16）；量化 checkpoint 2bpw 磁盘 40GB。评测口径与基线完全对齐：
+同逐层循环、同 hidden states 全缓存、同 batch（16/层内分批，delta rule 的 fp32
+瞬时峰值随 bs 线性增长，是所有模式的共同上限）。
+
+| 数据集 | fp16 基线 | WxA16 | **WxA8** | WxFP4 | WxFP8 |
+|---|---|---|---|---|---|
+| wikitext2 | 121.18 s | 137.03 s | **83.01 s** | 85.21 s | 90.14 s |
+| c4 | 152.25 s | 193.67 s | **123.18 s** | 125.93 s | 130.86 s |
+| **合计（vs 基线）** | 273.4 s | 330.7 s（+21%） | **206.2 s（-25%）** | 211.1 s（-23%） | 221.0 s（-19%） |
+| ppl（wiki / c4） | 5.0766 / 8.9142 | 6.037 / 10.032 | 6.040 / 10.037 | 6.037 / 10.041 | 6.043 / 10.042 |
+
+- **WxA8 最快（-25%）**，排名与 35B 相反：122B 的 bit 分布为 2-bit 主导
+  （MoE packed 27.05GB 中 2-bit 占 26.15GB），WxFP4 的 fp4 路径只覆盖 bit1/4
+  专家（~4% 权重），bit2 主力仍走 WxA8 kernel，故 WxFP4 ≈ WxA8 + LUT 开销
+- 四种量化模式 ppl 几乎一致（wiki 6.037~6.043），相对基线 +0.96 / +1.12
+  ——2bpw 的质量代价，与推理 kernel 无关
+- WxA16 是唯一慢于基线的模式：packed MoE 每次 forward 约 210ms 的 per-expert
+  固定开销（init 占 ~87%，实际 kernel 计算仅 ~29ms），per-expert 合并 kernel
+  是明确优化方向
+
+122B 推理配置对比（同一 2bpw checkpoint）：
+
+| 配置 | 显存峰值 | CPU RAM | bs | 适用 |
 |---|---|---|---|---|
-| wikitext2（256 samples） | 53.12 s | **45.08 s** | **-15.1%** | 7.7947（-0.0008，略好于 A16） |
-| c4（145 samples） | 76.71 s | **61.84 s** | **-19.4%** | 11.2676（+0.0045） |
-
-
-
-MoE 单独贡献 -7.0%/-6.7%，attention 路径贡献 -13.2%/-16.8%。
-WxA8 全路径数字基于 260831-u8 checkpoint（attention 均匀码本，MoE 与 260824 同型）。
-
-> WxFP8（混合部署：MoE fp8 + attention wxa8）同 checkpoint 另批实测（git 870e1f2+）：
-> c4 62.93s（vs WxA8 +0.8%，速度中性）；wiki 55.43s 疑首轮 JIT 污染（待热缓存复跑确认）；
-> ppl wiki 7.8064 / c4 11.2769（vs WxA16 +0.011/+0.014，代价远小于预期）。
-> 详见 [roadmaps/wxfp8-plan-260924.md](roadmaps/wxfp8-plan-260924.md) §七 WF-5。
-
-> **WxFP4 保守版**（bit1/4 expert fp4 + bit2/attention wxa8，t38 env，git 966e25a+）：
-> ppl wiki 7.7954 / c4 11.2711——**与 WxA8 持平（+0.0007/+0.0035）且全面优于 WxFP8**；
-> c4 59.37s（**比 WxA8 快 4.9%**）；wiki 60.1s 疑首轮 JIT 污染待复跑。
-> 详见 [roadmaps/wxfp4-plan-260924.md](roadmaps/wxfp4-plan-260924.md) WF4-4。
-
-> **WxFP4 + W 侧折叠直存 e2m1**（去 kernel 内 LUT，同批次对照 git 64c84d0 vs 64c84d0+，
-> t38 env）：ppl **逐位一致**（wiki 7.7972 / c4 11.2708）；wall 110.53 → **100.79s
->（-9.8%）**，同批次 WxA8 107.82s / WxFP8 112.24s——**WxFP4 成为最快模式**
->（vs WxA8 -6.5%、vs WxFP8 -10.2%）。gate_up kernel 2.0-2.4×（B64 40.2→16.6us；
-> B2048 bit1 185→367 TF）。详见 [roadmaps/wxfp4-fold-plan-260927.md](roadmaps/wxfp4-fold-plan-260927.md)。
-
-> 端到端时间含约 20s 的 PPL 计算开销。MoE 层与 Linear Attention 的相对加速比见各模块说明。
-> ⚠ 首次运行 WxA8 会触发 Triton JIT 编译（逐 expert 形状边跑边编译，端到端可虚增 10%+），
-> 测速前先用任意一次 wxa8 eval 捂热磁盘缓存。
+| 单卡 sequential + standby（上表口径） | ~12 GB | ~45 GB | 16 | 公平评测/单卡部署 |
+| 双卡自动切分 batch eval | ~24 GB/卡 | ~45 GB | 8 | 双卡常驻部署（免搬运，bs 受限） |
+| fp16 基线流式评测 | ~23 GB | ~15 GB | 16 | int8 原模型直接评测（算一层读一层） |
 
 ## 快速开始
 
@@ -102,6 +135,46 @@ python eval_qwen35.py --load-quantized ./quant_ckpt
 --standby-layer-cpu 可以保证小显卡也能逐层载入 GPU 完成量化。
 
 2bpw + 0.127 模型量化完成后约为 14GB 磁盘占用。
+
+2bpw 压缩后 checkpoint 磁盘占用构成（global-a8s8m2bpw、slices=1 专家级 bit 搜索，
+260930-s1 实测；MoE 为 packed 索引 + norms 的落盘大小，attention 为 8-bit packed）：
+
+| 部分 | 35B-A3B | 122B-A10B |
+|---|---|---|
+| MoE packed（1/2/4-bit 混合） | 7.52 GB（1b 0.05 / 2b 7.36 / 4b 0.11） | 27.05 GB（1b 0.30 / 2b 26.15 / 4b 0.60） |
+| Attention / shared expert（8-bit） | 1.31 GB | 4.27 GB |
+| 全精度剩余（embed、lm_head、norms 等） | 2.43 GB | 4.67 GB |
+| visual/mtp 存档（原样搬运） | — | 3.3 GB |
+| 合计 | 11.24 GB | 35.94 GB（+存档 ≈ 39.5 GB） |
+
+MoE 的 2-bit 主力专家占压缩主体的约 2/3，1/4-bit 专家为零头；attention 统一 8-bit；
+embed/lm_head 保持 BF16。
+
+### 1.1 122B 级模型（Qwen3.5-122B-A10B）
+
+122B 暂不支持切分子专家，bit 搜索在专家级进行（`--slices 1`，scheme 的 bpw 为
+全局目标值）。量化走流式路径（bf16 全量载入超出常规内存），输入为分 shard 的
+W8A8 int8 checkpoint 时逐层读盘并在 GPU 反量化：
+
+```bash
+python run_qwen35.py /path/to/Qwen3.5-122B-A10B-W8A8 wikitext2 \
+        --inference-quant-mode wxa8 --nsamples 64 --slices 1 \
+        --quant-scheme global-a8s8m2bpw --rank-mode turboquant_innerproduct \
+        --quantmode turboquant --standby-layer-meta \
+        --save-quantized models/qwen3.5-122B-2bpw/
+```
+
+量化产物逐层落盘（分 shard + index.json，约 40GB）。评测无需任何设备 flag：
+双卡自动对半切分 batch eval（bs 自动收敛），单卡自动回退 standby CPU +
+sequential eval；性能对比请用 sequential 口径（与 fp16 基线同循环结构同 bs）：
+
+```bash
+python eval_qwen35.py models/qwen3.5-122B-2bpw/ --inference-quant-mode wxa16
+
+# 性能对比口径（公平评测，见性能一节）：
+python eval_qwen35.py models/qwen3.5-122B-2bpw/ --inference-quant-mode wxa8 \
+    --sequential-eval --standby-cpu
+```
 
 ### 2. FP16 baseline 评测
 

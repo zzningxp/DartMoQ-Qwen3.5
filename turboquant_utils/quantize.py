@@ -176,8 +176,9 @@ def turboquant_quantize(
     """
     # 保存原始数据类型，用于最终输出
     orig_dtype = W.dtype
-    # 转换为float32进行量化计算
-    W = W.float()
+    # 不做整矩阵 fp32 副本：fake quant 在 quant_layer_mix_precision 里被
+    # 256 条并行 CUDA stream 同时调用（每 expert 一份），整矩阵 fp32 副本
+    # 使峰值叠加至 GB 级；改为分组内转换，逐元素等价
     out_features, in_features = W.shape
 
     # 获取Lloyd-Max码本：centroids为量化中心点，boundaries为量化区间边界
@@ -196,7 +197,7 @@ def turboquant_quantize(
     for g_start in range(0, in_features, group_size):
         g_end = min(g_start + group_size, in_features)
         g_dim = g_end - g_start
-        W_g = W[:, g_start:g_end]  # 当前分组的权重子矩阵
+        W_g = W[:, g_start:g_end].float()  # 当前分组的权重子矩阵（分组内转 fp32）
 
         # Step 1: 行归一化
         # 计算每行的L2范数，防止除零
@@ -219,8 +220,11 @@ def turboquant_quantize(
         # Step 3: Lloyd-Max标量量化
         # 使用二分查找确定每个元素对应的码本索引
         indices = torch.searchsorted(boundaries, Y_scaled.reshape(-1))
-        # 限制索引范围在有效码本范围内
-        indices = indices.clamp(0, len(centroids) - 1)
+        # 限制索引范围在有效码本范围内；立即收窄到 int32：
+        # searchsorted 返回 int64（8B/elem），256 条并行 stream 下峰值浪费
+        # GB 级；int32 是 torch indexing 支持的最小合法索引 dtype
+        # （uint8 会被当作布尔 mask、int16 不支持），gather 结果逐元素一致
+        indices = indices.clamp(0, len(centroids) - 1).to(torch.int32)
         # 通过索引查找码本中心点，得到量化后的值
         Y_quant = centroids[indices].reshape(Y_scaled.shape)
 
@@ -383,7 +387,8 @@ def turboquant_quantize_packed_full(
         group_size = N
 
     orig_dtype = W.dtype
-    W = W.float()
+    # 不做整矩阵 fp32 副本（122B gate_up 全专家为 6.4GB），改为分组内转换；
+    # 与"先整体转 fp32 再切片"逐元素等价
 
     # 获取码本
     if uniform_codebook:
@@ -410,7 +415,7 @@ def turboquant_quantize_packed_full(
     for g_start in range(0, N, group_size):
         g_end = min(g_start + group_size, N)
         g_dim = g_end - g_start
-        W_g = W[:, g_start:g_end]
+        W_g = W[:, g_start:g_end].float()
 
         # Step 1: 行归一化
         norms = W_g.norm(dim=1, keepdim=True).clamp(min=1e-8)
@@ -433,7 +438,11 @@ def turboquant_quantize_packed_full(
         # Step 3: 标量量化（Lloyd-Max 或均匀码本，共用 searchsorted 边界查找）
         indices = torch.searchsorted(boundaries, Y_scaled.reshape(-1))
         indices = indices.clamp(0, len(centroids) - 1).reshape(M, g_dim)
-        all_indices.append(indices)
+        # searchsorted 返回 int64（8B/elem），而索引值 ≤255：立即转 uint8，
+        # all_indices 累积与 torch.cat 峰值降 8 倍（122B gate_up 全专家
+        # 从 ~12.9GB+12.9GB 降到 ~1.6GB+1.6GB）；pack_nbit 内部本就按
+        # uint8 处理，打包结果 bit-exact 不变
+        all_indices.append(indices.to(torch.uint8))
 
     # 拼接所有分组的索引和范数
     full_indices = torch.cat(all_indices, dim=1)

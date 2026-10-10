@@ -339,6 +339,17 @@ def dartmoq_quant_grouped_gemm_moe(model, tokenizer, dataloader, args, test_ppl=
     # print(inps.shape)
     cache = {'i': 0, 'attention_mask': None, 'position_ids': None, 'position_embeddings': None}
 
+    # 流式 meta 模式：Catcher 需要 embed + layer0 真实驻留 GPU
+    # （embed 已在 load_model_streaming 载入到 DEV，layer0 在此反量化载入）
+    standby_meta = getattr(args, 'standby_layer_meta', False)
+    stream_reader = getattr(model, '_stream_reader', None) if standby_meta else None
+    if standby_meta:
+        assert stream_reader is not None, \
+            "--standby-layer-meta requires a model loaded via load_model_streaming (missing _stream_reader)"
+        from qwen35_stream_io import materialize_module
+        print("[stream] Dequantizing layer 0 (for Catcher)...", flush=True)
+        materialize_module(layers[0], "model.layers.0.", stream_reader, DEV)
+
     if args.standby_layer_cpu:
         model.model.embed_tokens = model.model.embed_tokens.to(DEV)
         layers[0] = layers[0].to(DEV)
@@ -450,8 +461,8 @@ def dartmoq_quant_grouped_gemm_moe(model, tokenizer, dataloader, args, test_ppl=
 
     inps = inps.squeeze(1)
 
+    layers_device = []
     if args.standby_layer_cpu:
-        layers_device = []
         for layer_idx, layer in enumerate(model.model.layers):
             params = list(layer.parameters())
             if params:
@@ -507,6 +518,29 @@ def dartmoq_quant_grouped_gemm_moe(model, tokenizer, dataloader, args, test_ppl=
             model.model_id = "qwen35_model"
         print(f"Set model.model_id to: {model.model_id}")
 
+    # 流式保存器：逐层落盘，不累积整模型 state_dict（meta 模式专用）
+    saver = None
+    if save_quantized_dir is not None and standby_meta:
+        from qwen35_stream_io import StreamingSaver
+        saver = StreamingSaver(
+            save_quantized_dir,
+            base_model_path=getattr(model, '_model_path', None),
+            # 磁盘预检：计划量化层数 + 存档/小件字节数（首层实测外推）
+            n_planned_layers=(len(quant_layers_set) if quant_layers_set is not None
+                              else len(layers)),
+            extra_bytes=(stream_reader.archive_bytes()
+                         + stream_reader.small_pieces_bytes()),
+        )
+
+    # 临时泄漏诊断开关（DARTMOQ_DEBUG_CUDA_LEAK=1；定位完毕后由本人确认删除）
+    import os
+    _dbg_leak = os.environ.get("DARTMOQ_DEBUG_CUDA_LEAK")
+    _dbg_census_prev = None
+    if _dbg_leak:
+        from qwen35_utils import cuda_tensor_census
+        _dbg_census_prev = cuda_tensor_census()
+        print("  [leak-debug] baseline CUDA census captured")
+
     for layer_idx, layer in enumerate(layers):
         # Determine if this layer should be quantized, skip layer for fast algorithm tests
         quantize_this_layer = should_quantize_layer(layer_idx, quant_layers_set)
@@ -520,7 +554,15 @@ def dartmoq_quant_grouped_gemm_moe(model, tokenizer, dataloader, args, test_ppl=
         if layer_idx % 10 == 0:
             print_memory_info("  [Memory] ")
 
-        if args.standby_layer_cpu:
+        # 流式 meta 模式：当前层从盘读入并反量化到 GPU
+        if standby_meta and any(p.is_meta for p in layers[layer_idx].parameters()):
+            from qwen35_stream_io import materialize_module
+            print(f"  [stream] Dequantizing layer {layer_idx} (int8 -> bf16)...", flush=True)
+            materialize_module(layers[layer_idx], f"model.layers.{layer_idx}.",
+                               stream_reader, DEV)
+            layer = layers[layer_idx]
+
+        if args.standby_layer_cpu or standby_meta:
             target_dev = layers_device[layer_idx] if layer_idx < len(layers_device) and layers_device[layer_idx].type == 'cuda' else DEV
             layers[layer_idx] = layers[layer_idx].to(target_dev)  # Directly modify layers list
             layer = layers[layer_idx]
@@ -551,11 +593,15 @@ def dartmoq_quant_grouped_gemm_moe(model, tokenizer, dataloader, args, test_ppl=
 
         inps = moe_out
 
-        if args.standby_layer_cpu:
+        if args.standby_layer_cpu or standby_meta:
             layers[layer_idx] = layers[layer_idx].to('cpu')  # Directly modify layers list
             del layer  # Clean up reference to help GPU memory release
             gc.collect()
             torch.cuda.empty_cache()
+
+        # 量化产物逐层落盘（流式保存，RAM 只驻留当前 shard 缓冲）
+        if saver is not None:
+            saver.add_layer(layer_idx, layers[layer_idx])
 
         # for i in range(torch.cuda.device_count()):
         #     print(f"CUDA {i} Allocated: {torch.cuda.memory_allocated(device=i) / 1024**3:.2f} GB")
@@ -565,6 +611,13 @@ def dartmoq_quant_grouped_gemm_moe(model, tokenizer, dataloader, args, test_ppl=
         mem_str = get_memory_info_str()
         print(f"Layer {layer_idx} total reconstruct and quantization time: {tick1 - tick0:.2f} s | Memory: {mem_str}", flush=True)
         print("." * 100, flush=True)
+
+        # 临时泄漏诊断：层迁移 CPU 后对比存活 CUDA 张量增量
+        if _dbg_leak:
+            from qwen35_utils import cuda_tensor_census, print_cuda_census_delta
+            _cur = cuda_tensor_census()
+            print_cuda_census_delta(_dbg_census_prev, _cur, layer_idx)
+            _dbg_census_prev = _cur
 
         # Aggressive memory cleanup after each layer
         gc.collect()
@@ -584,7 +637,6 @@ def dartmoq_quant_grouped_gemm_moe(model, tokenizer, dataloader, args, test_ppl=
         del inps
         gc.collect()
         torch.cuda.empty_cache()
-        from qwen35_quant_io import save_quantized_model
         quant_args = {
             "seed": getattr(args, 'seed', None),
             "group_size": GROUPSIZE,
@@ -594,11 +646,18 @@ def dartmoq_quant_grouped_gemm_moe(model, tokenizer, dataloader, args, test_ppl=
             "quantmode": getattr(args, 'quantmode', None),
             "git_hash": get_git_hash(),
         }
-        save_quantized_model(
-            model, save_quantized_dir,
-            base_model_path=getattr(model, '_model_path', None),
-            quant_args=quant_args,
-        )
+        if saver is not None:
+            # 流式路径：权重已逐层落盘，此处只收尾（小件/兜底层/存档/meta/index）
+            saver.finalize(model, stream_reader, quant_args=quant_args,
+                           model_id=getattr(model, 'model_id', None),
+                           base_model=getattr(model, '_model_path', None))
+        else:
+            from qwen35_quant_io import save_quantized_model
+            save_quantized_model(
+                model, save_quantized_dir,
+                base_model_path=getattr(model, '_model_path', None),
+                quant_args=quant_args,
+            )
 
     if test_ppl:
         # 量化后的内存内 eval 也尊重 --inference-quant-mode：

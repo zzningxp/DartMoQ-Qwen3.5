@@ -24,6 +24,10 @@ def main():
     parser.add_argument("--quant-scheme", type=str, default="a8s4m2233", help="Quantization scheme")
     parser.add_argument("--rank-mode", type=str, default="turboquant_innerproduct", help="Rank mode for neuron ordering")
     parser.add_argument("--standby-layer-cpu", action="store_true", default=False, help="Use CPU standby for layers")
+    parser.add_argument("--standby-layer-meta", action="store_true", default=False,
+                        help="Meta structure + per-layer streaming load (for large models, e.g. 122B W8A8 int8 "
+                             "input whose full bf16 dequant exceeds CPU RAM; quantized layers are saved to disk "
+                             "layer by layer)")
     parser.add_argument("--sequential-eval", action="store_true", default=False, help="Use sequential PPL evaluation")
     parser.add_argument("--quantmode", type=str, default="turboquant", choices=["gptq", "turboquant"], help="Quantization mode")
     parser.add_argument("--quant-layers", type=str, default=None, help="Only quantize specific layers (e.g., '0-5,8,10' for layers 0-5, 8, and 10; default: all layers)")
@@ -47,6 +51,8 @@ def main():
 
     assert not (args.save_quantized and args.load_quantized), \
         "save-quantized 与 load-quantized 不能同时使用"
+    assert not (args.standby_layer_cpu and args.standby_layer_meta), \
+        "standby-layer-cpu 与 standby-layer-meta 不能同时使用"
     if not args.load_quantized:
         if not args.model:
             parser.error("model path is required when not using --load-quantized")
@@ -70,6 +76,7 @@ def main():
           f"{'Yes' if (args.wxa16 or args.save_quantized) else 'No (fake quant)'}")
     print(f"Inference quant mode: {args.inference_quant_mode}")
     print(f"CPU standby: {'Yes' if args.standby_layer_cpu else 'No'}")
+    print(f"CPU standby (streaming meta): {'Yes' if args.standby_layer_meta else 'No'}")
     if args.save_quantized:
         print(f"Save quantized checkpoint: {args.save_quantized}")
     if args.load_quantized:
@@ -85,18 +92,32 @@ def main():
         print("\nLoading quantized checkpoint (skip calibration & quantization)...")
         print("(Note: --quant-layers/--nsamples/--slices/--quant-scheme/--rank-mode/--quantmode are ignored in load mode)")
         from qwen35_quant_io import load_quantized_model
-        from eval_qwen35 import run_ppl_evaluation
+        from eval_qwen35 import run_ppl_evaluation, clamp_two_gpu_eval_batch
         model, tokenizer = load_quantized_model(
             args.model, args.load_quantized, standby_cpu=args.standby_layer_cpu,
             inference_quant_mode=args.inference_quant_mode,
         )
+        clamp_two_gpu_eval_batch(model, args)
+        # 单卡装不下自动回退 standby CPU：eval 转 sequential
+        if getattr(model, "_standby_cpu", False) and not args.sequential_eval:
+            print("[auto] standby CPU fallback active, forcing --sequential-eval")
+            args.sequential_eval = True
         print("\nStarting PPL evaluation...")
         run_ppl_evaluation(model, tokenizer, args)
         print(f"\nFinish time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}")
         return 0
 
     print("\nLoading model...")
-    model, tokenizer = load_model(args.model, standby_cpu=args.standby_layer_cpu)
+    if args.standby_layer_meta:
+        from qwen35_utils import load_model_streaming
+        model, tokenizer = load_model_streaming(args.model)
+        # 流式 meta 模式下量化产物驻留 CPU（层量化完回 CPU），
+        # batch eval 需要全模型在 GPU，强制 sequential（与 standby 的 eval 语义一致）
+        if not args.sequential_eval:
+            print("[meta] Forcing --sequential-eval (model stays on CPU in streaming meta mode)")
+            args.sequential_eval = True
+    else:
+        model, tokenizer = load_model(args.model, standby_cpu=args.standby_layer_cpu)
 
     print("Loading calibration data...")
     dataloader, _ = get_loaders(
@@ -110,8 +131,10 @@ def main():
 
     print("\nStarting quantization...")
     with torch.no_grad():
+        import os as _os
         quant_model = dartmoq_quant_grouped_gemm_moe(
-            model, tokenizer, dataloader, args, test_ppl=True,
+            model, tokenizer, dataloader, args,
+            test_ppl=not _os.environ.get("DARTMOQ_SKIP_EVAL"),
             save_quantized_dir=args.save_quantized
         )
 

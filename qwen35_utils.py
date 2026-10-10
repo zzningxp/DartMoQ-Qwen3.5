@@ -48,6 +48,41 @@ def load_model(model_path, standby_cpu=False):
     return model, tokenizer
 
 
+def load_model_streaming(model_path):
+    """meta 空结构 + 流式逐层反量化载入（--standby-layer-meta，大模型专用）。
+
+    与 load_model 的区别：不在 CPU 上驻留整模型——层保持 meta，由量化
+    主循环逐层从盘读取（int8 → GPU 反量化 bf16）。此处只载入小件：
+    embed_tokens → GPU（Catcher 阶段需要），norm/lm_head → CPU（eval 用）。
+    reader 挂在 model._stream_reader 上供主循环使用。
+    """
+    print(f"Loading Qwen3.5 model (streaming meta mode) from: {model_path}")
+    from qwen35_stream_io import (StreamModelReader, build_meta_structure,
+                                  materialize_small_pieces)
+
+    model = build_meta_structure(model_path)
+    reader = StreamModelReader(model_path)
+    materialize_small_pieces(model, reader, embed_device=DEV)
+
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    model.seqlen = 2048
+    model.eval()
+
+    import os
+    model_id = os.path.basename(model_path.rstrip('/'))
+    if not model_id:
+        fallback = getattr(model.config, '_name_or_path', None) or model_path
+        model_id = os.path.basename(str(fallback).rstrip('/'))
+    model.model_id = model_id
+
+    print(f"{model_path}, model_id: {model.model_id}, model_type: {model.config.model_type}", flush=True)
+    model._standby_cpu = False
+    model._model_path = model_path
+    model._stream_reader = reader
+
+    return model, tokenizer
+
+
 def is_grouped_gemm_moe(model):
     """检测是否是 Grouped_GEMM_MoE mode (Qwen3.5 风格)"""
     if not hasattr(model.model, 'layers'):
@@ -106,6 +141,47 @@ def print_memory_info(prefix="  [Memory] "):
     """Print memory info (CUDA + CPU) for debugging"""
     mem_str = get_memory_info_str()
     print(f"{prefix}{mem_str}", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# 临时泄漏诊断（DARTMOQ_DEBUG_CUDA_LEAK=1 时启用，定位完毕后由本人确认删除）
+# ---------------------------------------------------------------------------
+
+import gc as _gc
+
+
+def cuda_tensor_census():
+    """统计当前所有存活 CUDA 张量：(shape, dtype) -> (count, element_size)。
+
+    只保存计数不保存张量引用，避免诊断代码本身阻止回收。
+    """
+    census = {}
+    for obj in _gc.get_objects():
+        if type(obj) is torch.Tensor and obj.device.type == "cuda":
+            key = (tuple(obj.shape), str(obj.dtype))
+            cnt, _ = census.get(key, (0, obj.element_size()))
+            census[key] = (cnt + 1, obj.element_size())
+    return census
+
+
+def print_cuda_census_delta(prev, cur, layer_idx, top_k=10, min_bytes=50 * 1024**2):
+    """打印相邻两层存活 CUDA 张量的增量（按字节排序），用于定位逐层泄漏。"""
+    import math
+    deltas = []
+    for key in set(prev) | set(cur):
+        pcnt = prev.get(key, (0, 0))
+        ccnt, csz = cur.get(key, (0, 0))
+        dc = ccnt - pcnt[0]
+        if dc > 0:
+            nbytes = dc * math.prod(key[0]) * csz
+            if nbytes >= min_bytes:
+                deltas.append((key, dc, nbytes))
+    deltas.sort(key=lambda x: -x[2])
+    total = sum(d[2] for d in deltas)
+    print(f"  [leak-debug] layer {layer_idx} CUDA tensor growth: "
+          f"{total / 1024**3:.2f}GB ({len(deltas)} groups >= {min_bytes//1024**2}MB)")
+    for key, dc, nbytes in deltas[:top_k]:
+        print(f"    {key} x{dc}: +{nbytes / 1024**2:.1f}MB")
 
 
 

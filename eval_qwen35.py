@@ -25,6 +25,11 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
     Sequential PPL evaluation for Qwen3.5 MoE: keeps layers on CPU and moves
     them to GPU one by one. Hidden states stay on GPU the entire time.
     """
+    # GPU 掉卡/不可用时明确报错（DEV 会退化成 cpu，整条评测无意义且极慢）
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "CUDA not available (GPU missing or driver broken?). "
+            "Check nvidia-smi; a hard-hung card usually needs a reboot.")
     tick0 = time.time()
     use_cache = model.config.use_cache
     model.config.use_cache = False
@@ -37,16 +42,37 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
     # Save original device for each layer
     layers = model.model.layers
 
+    # 流式模式（load_model_streaming 载入）：逐层反量化 -> 前向 -> 丢弃（to('meta')）
+    _stream_reader = getattr(model, '_stream_reader', None)
+    if _stream_reader is not None:
+        print("[stream] sequential eval: per-layer dequantize from disk, "
+              "discard after use", flush=True)
+        from qwen35_stream_io import materialize_module
+
+        def _ensure_materialized(li):
+            layer = layers[li]
+            if any(p.is_meta for p in layer.parameters()):
+                print(f"  [stream] dequantizing layer {li} (int8 -> bf16)...", flush=True)
+                materialize_module(layer, f"model.layers.{li}.", _stream_reader, DEV)
+            return layer
+    else:
+        def _ensure_materialized(li):
+            return layers[li]
+
     # P8 接线：把 chunk gated delta rule 换成仓库内 fast 版
     # （P8-2a pad 跳过 + P8-3 WY 闭式解，详见 roadmaps/wxa16-optimization-backlog-260824.md P8 节）
-    from turboquant_utils.delta_rule import patch_delta_rule
-    patch_delta_rule(model)
-
     # Norm 融合接线（2026-09-03）：RMSNorm / gated RMSNorm 换成 Triton 单 pass 版
     # （每层省 ~15ms GPU，对拍与集成验证见 test/test_norm_fusion.py，全部 PASS；
     #   A/B 对比时注释掉下一行即可，类级 patch 可用 unpatch_norms() 复原）
-    from turboquant_utils.norm_kernels import patch_norms
-    patch_norms(model)
+    # DARTMOQ_SKIP_PATCHES=1 整体跳过两个 patch；也可分别用
+    # DARTMOQ_SKIP_DELTA=1 / DARTMOQ_SKIP_NORMS=1（kernel 挂卡 bisect 用）
+    if not os.environ.get("DARTMOQ_SKIP_PATCHES"):
+        if not os.environ.get("DARTMOQ_SKIP_DELTA"):
+            from turboquant_utils.delta_rule import patch_delta_rule
+            patch_delta_rule(model)
+        if not os.environ.get("DARTMOQ_SKIP_NORMS"):
+            from turboquant_utils.norm_kernels import patch_norms
+            patch_norms(model)
 
     original_devices = []
     for layer in layers:
@@ -56,17 +82,19 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
             original_devices.append(torch.device('cpu'))
 
     # Move all layers to CPU first
-    print("Moving transformer layers to CPU for sequential evaluation...")
-    for layer in layers:
-        layer.to('cpu')
+    # （流式模式跳过：meta 层 .to('cpu') 会分配整层未初始化内存，等反量化时直接上 GPU）
+    if _stream_reader is None:
+        print("Moving transformer layers to CPU for sequential evaluation...")
+        for layer in layers:
+            layer.to('cpu')
 
-    # Keep embed_tokens, norm, lm_head, and rotary_emb on GPU permanently
-    print(f"Moving embed_tokens/norm/lm_head/rotary_emb to {DEV}...")
+    # Keep embed_tokens/rotary on GPU for embedding precompute & kwargs capture;
+    # lm_head 延迟到收尾 loss 阶段才上 GPU（层循环期省 ~1.5GB，给 delta rule
+    # 的瞬时峰值留余量）
+    print(f"Moving embed_tokens/norm/rotary_emb to {DEV} (lm_head deferred)...")
     model.model.embed_tokens = model.model.embed_tokens.to(DEV)
     if hasattr(model.model, 'norm'):
         model.model.norm = model.model.norm.to(DEV)
-    if hasattr(model, 'lm_head'):
-        model.lm_head = model.lm_head.to(DEV)
     if hasattr(model.model, 'rotary_emb'):
         model.model.rotary_emb = model.model.rotary_emb.to(DEV)
 
@@ -86,7 +114,7 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
     # First, capture correct attention_mask, position_ids, position_embeddings using Catcher
     # Temporarily move necessary components to DEV for capturing
     print("Moving temporary components to GPU for kwargs capture...")
-    layers[0] = layers[0].to(DEV)
+    layers[0] = _ensure_materialized(0).to(DEV)
     # Also move rotary embeddings if they exist
     if hasattr(model.model, 'rotary_emb'):
         model.model.rotary_emb = model.model.rotary_emb.to(DEV)
@@ -127,9 +155,14 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
     if position_embeddings is not None:
         print(f"  position_embeddings type: {type(position_embeddings)}")
 
-    # Restore layer 0 and move back to CPU
+    # Restore layer 0 and move back to CPU（流式：先 sync 再丢弃回 meta，避免
+    # 异步 kernel use-after-free；主循环会重新反量化载入）
     layers[0] = layers[0].module
-    layers[0] = layers[0].to('cpu')
+    if _stream_reader is not None:
+        torch.cuda.synchronize()
+        layers[0] = layers[0].to('meta')
+    else:
+        layers[0] = layers[0].to('cpu')
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -155,6 +188,11 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
     del all_hidden_states
     gc.collect()
 
+    # embed 仅预计算 embedding 时用到，层循环前释放（再省 ~1.5GB）
+    model.model.embed_tokens = model.model.embed_tokens.to('cpu')
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     import inspect
     # Debug: Print layer types at the beginning
     print("\n=== Layer Type Debug Info ===")
@@ -165,7 +203,15 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
     print("============================\n")
 
     # Batch sizes
-    batch_size_transformer = 32
+    # 122B 级（层>40）或流式：delta rule 的 fp32 瞬时随 bs 线性增长（~0.7GB/sample），
+    # bs=32 实测 OOM（流式 29GB / 量化 sequential 30.5GB，0930.6/0930.8），
+    # 统一收敛到 16——两条路径同 bs，对比口径一致；小模型（<=40 层）保持 32
+    if _stream_reader is not None or len(layers) > 40:
+        batch_size_transformer = 16
+        print(f"[auto] batch_size_transformer -> {batch_size_transformer} "
+              f"(delta rule fp32 transient scales with batch size)")
+    else:
+        batch_size_transformer = 32
     batch_size_lm_head = 4
 
     # 统计全局时间
@@ -182,9 +228,9 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
 
         tick_layer = time.time()
 
-        # Move layer to GPU
+        # Move layer to GPU（流式：从盘读入并反量化到 GPU）
         t_move_start = time.time()
-        layer = layer.to(DEV)
+        layer = _ensure_materialized(layer_idx).to(DEV)
         t_move_end = time.time()
         time_move = t_move_end - t_move_start
         total_time_move += time_move
@@ -226,7 +272,8 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
             print(f"  [Warmup] MoE Triton kernel 预编译完成: {_t_warmup:.2f}s", flush=True)
 
         # Process samples in batches - hidden states stay on GPU
-        new_hidden_states = torch.empty_like(hidden_states)
+        # 就地更新：层内批次间互不依赖（各读各的切片、写回同一切片），
+        # 省掉整份 new_hidden_states 双缓冲（c4 的 256 样本省 ~1.8GB）
 
         # --- CPU 侧瓶颈定位插桩（--cpu-profile 时启用）---
         _cpu_prof = getattr(args, 'cpu_profile', False)
@@ -290,8 +337,8 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
             else:
                 batch_output = layer_outputs
 
-            # Directly copy to new_hidden_states - everything on GPU
-            new_hidden_states[batch_start:batch_end].copy_(batch_output)
+            # Directly copy back into hidden_states (in-place, everything on GPU)
+            hidden_states[batch_start:batch_end].copy_(batch_output)
 
             # Cleanup batch variables aggressively
             del batch_hidden, layer_outputs, batch_output
@@ -310,10 +357,7 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
         total_time_attn += time_attn
         total_time_moe += time_moe
 
-        # Swap hidden states pointers
-        del hidden_states
-        hidden_states = new_hidden_states
-        del new_hidden_states
+        # （原 new_hidden_states 双缓冲已改为就地更新，无需交换指针）
 
         # --- CPU 侧瓶颈定位插桩：逐层打印 ---
         if _cpu_prof:
@@ -329,7 +373,13 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
                   flush=True)
 
         # Move layer back to CPU to free GPU memory (in-place, modifies layers[layer_idx])
-        layer = layer.to('cpu')
+        # （流式：先 sync 再丢弃回 meta——forward 的 kernel 是异步的，直接释放
+        # 权重存储会 use-after-free；.to('cpu') 的 D2H 拷贝自带流顺序，meta 没有）
+        if _stream_reader is not None:
+            torch.cuda.synchronize()
+            layer = layer.to('meta')
+        else:
+            layer = layer.to('cpu')
 
         # Debug: Print layer timing and memory info every 10 layers or first 10 layers
         if layer_idx < 50 or layer_idx % 10 == 0:
@@ -355,6 +405,9 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
 
     # Final norm and lm_head - process in batches of 4
     print("Processing final norm and lm_head...")
+    # lm_head 延迟至此才上 GPU（层循环期不需要，省显存）
+    if hasattr(model, 'lm_head'):
+        model.lm_head = model.lm_head.to(DEV)
     nlls = []
 
     for batch_start in range(0, nsamples, batch_size_lm_head):
@@ -389,10 +442,11 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    # Restore original devices
-    print("Restoring layers to original devices...")
-    for layer_idx, layer in enumerate(layers):
-        layer.to(original_devices[layer_idx])
+    # Restore original devices（流式跳过：层已丢弃回 meta，恢复会分配整层未初始化内存）
+    if _stream_reader is None:
+        print("Restoring layers to original devices...")
+        for layer_idx, layer in enumerate(layers):
+            layer.to(original_devices[layer_idx])
 
     # Calculate final ppl
     ppl = torch.exp(torch.stack(nlls).sum() / (nsamples * model.seqlen))
@@ -406,6 +460,11 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
 @torch.no_grad()
 def qwen35_ppl_eval(model, testloader, eval_set, args):
     """Normal PPL evaluation for Qwen3.5 MoE - no manual distribution needed."""
+    # GPU 掉卡/不可用时明确报错（与 sequential 路径同防护）
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "CUDA not available (GPU missing or driver broken?). "
+            "Check nvidia-smi; a hard-hung card usually needs a reboot.")
     # Check if we should use sequential mode
     use_sequential = getattr(args, 'sequential_eval', False)
     use_standby_cpu = getattr(args, 'standby_cpu', False)
@@ -453,7 +512,9 @@ def qwen35_ppl_eval(model, testloader, eval_set, args):
             hidden = transformer_out[0] if isinstance(transformer_out, tuple) else transformer_out.last_hidden_state
 
             # lm_head 分批算 loss，避免 logits OOM
-            shift_labels_all = batch[:, 1:].contiguous()
+            # labels 搬到 hidden 所在设备（两卡切分时 lm_head/logits 在 cuda:1，
+            # batch 在 cuda:0，nll_loss 要求同设备）
+            shift_labels_all = batch[:, 1:].contiguous().to(hidden.device)
             for lm_start in range(0, actual_bs, lm_head_batch_size):
                 lm_end = min(lm_start + lm_head_batch_size, actual_bs)
                 h = hidden[lm_start:lm_end, :-1, :].contiguous()
@@ -526,12 +587,31 @@ def run_ppl_evaluation(model, tokenizer, args):
     return ppl_results
 
 
+def clamp_two_gpu_eval_batch(model, args):
+    """两卡切分模型：把 eval batch 收敛到 8。
+
+    两卡模式全模型常驻（gf 工作集 ~15GB/卡），linear_attn 的 delta rule 会把
+    q/k/v/beta/g 等 5+ 个全量张量转 fp32，瞬时峰值随 bs 线性增长：
+    bs=32 实测 29GB OOM、bs=16 实测 30.5GB OOM（0930.5），bs=8 约 24GB 峰值。
+    """
+    if getattr(model, "_two_gpu_split", False) and args.eval_batch_size > 8:
+        print(f"[auto] eval-batch-size {args.eval_batch_size} -> 8 "
+              f"(attention fp32 transient peaks with batch size; 16/32 OOMs)")
+        args.eval_batch_size = 8
+
+
 def _is_quant_dir(path: str) -> bool:
-    """判断一个目录是否为量化 checkpoint 目录（含 meta.json + model.safetensors）。"""
+    """判断一个目录是否为量化 checkpoint 目录（含 meta.json + safetensors 权重）。
+
+    流式保存产出分 shard（model.safetensors.index.json + model-XXXXX-of-XXXXX），
+    整存路径产出单文件（model.safetensors），两种都要识别。
+    """
     if not path or not os.path.isdir(path):
         return False
-    return (os.path.isfile(os.path.join(path, "meta.json"))
-            and os.path.isfile(os.path.join(path, "model.safetensors")))
+    if not os.path.isfile(os.path.join(path, "meta.json")):
+        return False
+    return (os.path.isfile(os.path.join(path, "model.safetensors"))
+            or os.path.isfile(os.path.join(path, "model.safetensors.index.json")))
 
 
 def main():
@@ -591,12 +671,32 @@ def main():
     if args.load_quantized:
         print("\nLoading quantized checkpoint (skip fp16 model loading)...")
         from qwen35_quant_io import load_quantized_model
+        # 设备策略全自动：双卡装不下单卡 -> 自动切分；单卡装不下 -> 自动回退
+        # standby CPU；装得下 -> 常规单卡（见 load_quantized_model 内部判定）
         model, tokenizer = load_quantized_model(
             args.model, args.load_quantized, standby_cpu=args.standby_cpu,
             inference_quant_mode=args.inference_quant_mode)
+        clamp_two_gpu_eval_batch(model, args)
+        # 单卡装不下自动回退 standby CPU 时，eval 必须走 sequential
+        # （batch eval 要求全模型在 GPU，模型驻留 CPU 会设备不匹配）
+        if getattr(model, "_standby_cpu", False) and not args.sequential_eval:
+            print("[auto] standby CPU fallback active, forcing --sequential-eval")
+            args.sequential_eval = True
+            args.standby_cpu = True
     else:
         print("\nLoading model...")
-        model, tokenizer = load_model(args.model, standby_cpu=args.standby_cpu)
+        # 分 shard 的大模型 + standby：自动走流式载入（meta 空结构 + 逐层反量化载入，
+        # 122B 级 int8/fp16 全量载入超 RAM，只有这条路径能上 CPU standby；
+        # 判定条件：目录带 model.safetensors.index.json 且要求 standby）
+        if args.standby_cpu and os.path.isfile(
+                os.path.join(args.model, "model.safetensors.index.json")):
+            print("[auto] sharded checkpoint + standby CPU -> streaming load "
+                  "(per-layer dequantize from disk, ~15GB RAM)")
+            from qwen35_utils import load_model_streaming
+            model, tokenizer = load_model_streaming(args.model)
+            model._standby_cpu = True
+        else:
+            model, tokenizer = load_model(args.model, standby_cpu=args.standby_cpu)
 
     # If in CPU standby mode, make sure everything is on CPU
     if args.standby_cpu:

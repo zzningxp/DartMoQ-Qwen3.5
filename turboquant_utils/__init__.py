@@ -219,3 +219,7 @@ __all__ = [
     "turbo_fake_quant_linear",
     "turboquant_outlier_activation_aware_rates",
 ]
+
+# triton 多卡 device dispatch shim（跨卡 launch 误报 cpu tensor 的绕过，
+# 见 triton_multigpu_shim.py 顶部说明；单卡 no-op）
+from turboquant_utils.triton_multigpu_shim import *  # noqa: F401,F403
