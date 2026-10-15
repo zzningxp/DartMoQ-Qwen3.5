@@ -105,6 +105,54 @@ Triton kernel 量化推理支持三种精度模式（共用同一份 packed chec
 | 双卡自动切分 batch eval | ~24 GB/卡 | ~45 GB | 8 | 双卡常驻部署（免搬运，bs 受限） |
 | fp16 基线流式评测 | ~23 GB | ~15 GB | 16 | int8 原模型直接评测（算一层读一层） |
 
+## 下游任务评测（lm-eval 七任务，对齐 BitsMoE 口径）
+
+2026-10 起用 lm-eval-harness 对 35B 2bpw checkpoint（260930-s1，三种 kernel 模式
+共用同一份）跑 BitsMoE 同款七任务（five-shot）：HellaSwag / ARC-Easy / MathQA /
+MMLU / OpenBookQA / WinoGrande / GSM8K。评测入口 `eval_tasks.py`（自定义
+DartMoQLM 直接驱动量化模型，不经 HFLM；lm-eval 0.4.12 + transformers 5.13.0，
+量化模式整模型驻留 RTX 5090），结果 JSON 落 `results/`，日志解析用
+`task_logs_parser.py`，数据集拉取与各任务口径见 `benchmarks/roadmap.md`。
+MathQA 因 hub 旧式 script 被 datasets 4.x 禁用，走本地 parquet
+（官方 zip 转换，`benchmarks/mathqa_parquet/`，数据量与官方 metadata 一致）。
+
+主指标口径：HellaSwag / ARC-Easy / OpenBookQA / WinoGrande 取 acc_norm，
+MathQA / MMLU 取 acc，GSM8K 取 exact_match（strict-match，括号内 flexible-extract）。
+
+| 模式 | HellaSwag | ARC-Easy | MathQA | MMLU | OpenBookQA | WinoGrande | GSM8K | 七任务均值 ² |
+|---|---|---|---|---|---|---|---|---|
+| fp16 基线 ¹ | 0.8199 | 0.8998 | 0.6647 | 0.8487 | 0.4880 | 0.7648 | 0.8939 † | 0.7685 |
+| wxa8 | 0.7609 | 0.8948 | 0.5776 | 0.8094 | 0.4520 | 0.7553 | 0.8415（0.8453） | 0.7279 |
+| wxfp8 | 0.7607 | 0.8948 | 0.5762 | 0.8093 | 0.4500 | 0.7545 | 0.8362（0.8423） | 0.7268 |
+| wxfp4 | 0.7624 | 0.8969 | 0.5796 | 0.8096 | 0.4500 | 0.7435 | 0.8347（0.8431） | 0.7264 |
+
+² 七任务均值中 GSM8K 取 flexible-extract（fp16 行 † 为外部参照，仅此口径可得；
+量化行自测 flexible 见括号内）。
+
+† fp16 行的 GSM8K 非本仓库评测：Qwen3.5-35B-A3B-FP8（官方 FP8 量化）
+vLLM 评测 89.39%（flexible-extract，
+[AMD 模型卡](https://huggingface.co/amd/Qwen3.5-35B-A3B-MXFP4)）——官方
+README benchmark 表不含 GSM8K，fp16 无官方数字可引，此处取同模型官方量化档位
+的数字作外部参照（口径为 vLLM 部署 + flexible-extract）。
+
+¹ fp16 基线 70GB 无法整驻 GPU：loglikelihood 六任务走 sequential 层循环
+（层驻 CPU 逐层搬 GPU，18.8 小时，`--fp16-mode sequential`）；GSM8K 需要
+KV-cache 自回归（sequential 不支持、device_map offload 实测 268 小时不可行），
+未跑，故取外部参照（见 †）。另一 vLLM 实测约 0.78-0.81
+（[issue #37804](https://github.com/vllm-project/vllm/issues/37804)，修复精度
+bug 后）。我们 2bpw 的 flexible-extract 0.842-0.845 相对官方 FP8 数字 -4.9 分，
+与「2bpw 比 FP8 更激进」的预期方向一致。
+
+- 三种 kernel 模式七任务均值互差 ≤0.0015，与 ppl 结论一致：kernel 实现不引入质量损失
+- 2bpw 相对 fp16 基线七任务掉 4.1 分（0.7685 → 0.7279）；对照 BitsMoE 的
+  2-bit 标量量化（71.61 → 64.29，-7.3 分；Qwen3-30B 不同代模型，仅作间接对照），
+  旋转量化 2bpw 的掉分约其一半
+- 掉分最大的是 MathQA（-8.7）与 HellaSwag（-5.9），GSM8K -4.9
+  （flexible-extract，外部参照口径），OpenBookQA -3.6，其余 ≤1
+- eval 墙钟：wxa8/wxfp8/wxfp4 七任务约 8.1-8.3 小时（热跑，Triton 磁盘缓存；
+  HellaSwag + GSM8K 占 ~87%：前者 4 万次长 context 前向，后者 1319 条 batch=1
+  自回归）。此墙钟是评测耗时，不代表 decode 吞吐；速度对照另见 P0 decode 通路
+
 ## 快速开始
 
 ### 0. 环境
@@ -174,6 +222,34 @@ python eval_qwen35.py models/qwen3.5-122B-2bpw/ --inference-quant-mode wxa16
 # 性能对比口径（公平评测，见性能一节）：
 python eval_qwen35.py models/qwen3.5-122B-2bpw/ --inference-quant-mode wxa8 \
     --sequential-eval --standby-cpu
+```
+
+### 1.2 量化的 standby 模式选择
+
+量化主循环本身是逐层的，三种 standby 模式控制**权重如何在内存中流转**：
+
+| 模式 | 行为 | CPU RAM 峰值 | 适用 |
+|---|---|---|---|
+| 默认（无 standby） | `device_map="auto"` 全模型上 GPU | 低 | 模型 + 中间量装得进显存 |
+| `--standby-layer-cpu` | 整模型 CPU 常驻，逐层搬上 GPU 量化 | ≈ 全量 bf16 | RAM 装得下 bf16 全量的中型模型（35B 的经典跑法） |
+| `--standby-layer-meta` | meta 空结构，逐层从盘流式反量化载入 | ~45GB | 全量 bf16（如 122B 的 ~244GB）超出 RAM 的模型 |
+
+`--standby-layer-meta` 的特点：
+
+- 输入为分 shard 的 checkpoint（`model.safetensors.index.json`）时，每层按需读盘、
+  **int8 在 GPU 上反量化成 bf16**（不依赖 compressed-tensors 库）；BF16 权重直读
+- 量化产物**逐层落盘**（按层边界切 shard + index.json），不等全部算完；
+  量化过程中每层校验磁盘余量，不够会在第一层就报错
+- visual/mtp 部分原样搬运到 `visual_mtp.safetensors` 存档，不进加载路径
+- 与 `--standby-layer-cpu` 互斥；`--quant-layers` 部分量化时未量化层自动从
+  checkpoint 反量化兜底归档
+
+```bash
+# 122B 级（W8A8 int8 输入）：
+python run_qwen35.py $model_path wikitext2 \
+        --nsamples 64 --slices 1 --quant-scheme global-a8s8m2bpw \
+        --rank-mode turboquant_innerproduct --quantmode turboquant \
+        --standby-layer-meta --save-quantized ./quant_ckpt
 ```
 
 ### 2. FP16 baseline 评测
