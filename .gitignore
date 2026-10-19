@@ -15,5 +15,4 @@ models
 CLAUDE.md
 modeling_qwen3_5_moe.py
 
-benchmarks/lm_eval_tasks/
-benchmarks/mathqa_parquet/
+benchmarks/

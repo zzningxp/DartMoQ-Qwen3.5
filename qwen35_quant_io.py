@@ -305,6 +305,18 @@ def _split_path(root, path: str):
     return parent, parts[-1]
 
 
+def remap_prefix(key: str, old_prefix, new_prefix):
+    """把 key 的 old_prefix 前缀替换为 new_prefix（仅匹配开头一次）。
+
+    VL 结构下的公共重映射工具：CausalLM 命名的量化 checkpoint key 与
+    meta.json 模块 path 都是 model.layers.*，VL 结构是
+    model.language_model.layers.*，传 ("model.", "model.language_model.") 即可。
+    """
+    if old_prefix is None or not key.startswith(old_prefix):
+        return key
+    return new_prefix + key[len(old_prefix):]
+
+
 def _materialize_meta_buffers(model) -> list:
     """回填 assign 加载后残留的 meta 非持久 buffer。
 
@@ -333,24 +345,39 @@ def _materialize_meta_buffers(model) -> list:
     return handled
 
 
-def restore_quant_metadata(model, meta: dict, state_dict: dict = None):
+def restore_quant_metadata(model, meta: dict, state_dict: dict = None,
+                           key_prefix_map=None):
     """按元数据替换量化模块并回填张量。
 
     顺序要求：
       1. 先替换 shared_expert 内部的 WxA16Linear（此时还在原始 mlp 结构下）
       2. 再整体替换 mlp 为 WxA16BitPartitionedGroupMoE（复用替换后的 shared_expert）
       3. 最后 load_state_dict(strict=True, assign=True) 回填
+
+    key_prefix_map: 可选。VL 结构加载时传入，把 CausalLM 命名的 meta 模块
+        path 与 state_dict key 重映射到 VL 命名（纯文本路径默认 None 不变）。
+        支持两种形态：
+          - (old_prefix, new_prefix) 元组：对全部 key 做前缀替换；
+          - callable(key) -> key：逐 key 自定义（VL 路径用，只重映射语言塔
+            前缀，视觉塔 model.visual.* 原样保留）。
     """
+    def _map(p):
+        if key_prefix_map is None:
+            return p
+        if callable(key_prefix_map):
+            return key_prefix_map(p)
+        return remap_prefix(p, key_prefix_map[0], key_prefix_map[1])
+
     # 第一步：替换 WxA16Linear（attention 与 shared_expert 内部）
     for path, m in meta.get("modules", {}).items():
         if m.get("type") != "wxa16_linear":
             continue
-        parent, attr = _split_path(model, path)
+        parent, attr = _split_path(model, _map(path))
         setattr(parent, attr, WxA16Linear.from_metadata(m))
 
     # 第二步：整体替换 MoE
     for path, m in meta.get("layers", {}).items():
-        parent, attr = _split_path(model, path)
+        parent, attr = _split_path(model, _map(path))
         old_mlp = getattr(parent, attr)
         new_moe = WxA16BitPartitionedGroupMoE.from_metadata(
             m,
@@ -373,7 +400,8 @@ def restore_quant_metadata(model, meta: dict, state_dict: dict = None):
     # qmeta. 前缀的种子标量不属于模块结构，剥掉后与 meta.json 交叉核对
     if state_dict is not None:
         qmeta_tensors = {k: v for k, v in state_dict.items() if k.startswith("qmeta/")}
-        sd_weights = {k: v for k, v in state_dict.items() if not k.startswith("qmeta/")}
+        sd_weights = {_map(k): v for k, v in state_dict.items()
+                      if not k.startswith("qmeta/")}
         res = model.load_state_dict(sd_weights, strict=True, assign=True)
         if res.missing_keys:
             raise AssertionError(f"load_state_dict missing keys: {res.missing_keys[:10]}...")
@@ -581,6 +609,25 @@ def _split_model_two_gpu(model, split_idx=None, verbose=True):
     return model
 
 
+def load_quantized_state_dict(quant_dir) -> dict:
+    """读量化 checkpoint 的全部张量（分 shard 与单文件两种形态）。
+
+    公共函数：load_quantized_model（文本路径）与 qwen35_vl_io（VL 路径）共用。
+    """
+    sd_path = os.path.join(quant_dir, "model.safetensors")
+    idx_path = os.path.join(quant_dir, "model.safetensors.index.json")
+    if os.path.isfile(idx_path):
+        with open(idx_path, "r", encoding="utf-8") as f:
+            wm = json.load(f)["weight_map"]
+        shard_names = sorted(set(wm.values()))
+        sd = {}
+        for fname in shard_names:
+            sd.update(load_file(os.path.join(quant_dir, fname)))
+        print(f"Loaded {len(sd)} tensors from {len(shard_names)} shards")
+        return sd
+    return load_file(sd_path)
+
+
 def load_quantized_model(base_model_path: str = None, quant_dir: str = None,
                          standby_cpu: bool = False, seqlen: int = 2048,
                          inference_quant_mode: str = "wxa16"):
@@ -625,22 +672,10 @@ def load_quantized_model(base_model_path: str = None, quant_dir: str = None,
     with open(meta_path, "r", encoding="utf-8") as f:
         meta = json.load(f)
 
-    # 分 shard checkpoint（StreamingSaver 产出）合并读取；旧单文件路径不变
-    sd_path = os.path.join(quant_dir, "model.safetensors")
-    idx_path = os.path.join(quant_dir, "model.safetensors.index.json")
-    if os.path.isfile(idx_path):
-        with open(idx_path, "r", encoding="utf-8") as f:
-            wm = json.load(f)["weight_map"]
-        shard_names = sorted(set(wm.values()))
-        sd = {}
-        for fname in shard_names:
-            sd.update(load_file(os.path.join(quant_dir, fname)))
-        print(f"Loaded {len(sd)} tensors from {len(shard_names)} shards "
-              f"in {time.time() - tick0:.2f}s")
-    else:
-        print(f"Loading quantized tensors: {sd_path} ({os.path.getsize(sd_path) / 1024**3:.2f}GB)...")
-        sd = load_file(sd_path)
-        print(f"Loaded {len(sd)} tensors in {time.time() - tick0:.2f}s")
+    # 分 shard checkpoint（StreamingSaver 产出）与旧单文件路径统一读取
+    print(f"Loading quantized tensors from {quant_dir}...")
+    sd = load_quantized_state_dict(quant_dir)
+    print(f"Loaded {len(sd)} tensors in {time.time() - tick0:.2f}s")
 
     restore_quant_metadata(model, meta, sd)
 

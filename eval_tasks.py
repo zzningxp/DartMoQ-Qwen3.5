@@ -465,7 +465,11 @@ class DartMoQLM(TemplateLM):
 
 
 def _apply_fast_patches_and_warmup(model, batch_size, max_length):
-    """kernel patch + Triton JIT 预热（与 eval_qwen35.py 同款环境阀）。"""
+    """kernel patch + Triton JIT 预热（与 eval_qwen35.py 同款环境阀）。
+
+    结构无关（文本 CausalLM 与 VL 结构通用，eval_vl_tasks.py 复用）：
+    warmup_kernels 按 modules() 遍历，微型 forward 走顶层入口。
+    """
     import torch
 
     if not os.environ.get("DARTMOQ_SKIP_PATCHES"):
@@ -479,17 +483,17 @@ def _apply_fast_patches_and_warmup(model, batch_size, max_length):
     print("[warmup] compiling Triton kernels (first run may look stuck; "
           "unseen shapes still compile lazily)...", flush=True)
     t0 = time.time()
-    for layer in model.model.layers:
-        mlp = getattr(layer, "mlp", None)
-        if mlp is not None and hasattr(mlp, "warmup_kernels"):
-            mlp.warmup_kernels(seq_len=min(1024, max_length), batch_size=batch_size)
-            mlp.warmup_kernels(seq_len=min(2048, max_length), batch_size=batch_size)
+    for module in model.modules():
+        if hasattr(module, "warmup_kernels"):
+            module.warmup_kernels(seq_len=min(1024, max_length), batch_size=batch_size)
+            module.warmup_kernels(seq_len=min(2048, max_length), batch_size=batch_size)
     # 一次带 attention_mask 的微型真 forward：尽早暴露整模型通路问题
-    dev = next(model.model.embed_tokens.parameters()).device
+    # （纯文本输入对 CausalLM 与 VL 顶层 forward 都成立）
+    dev = next(model.parameters()).device
     ids = torch.ones((1, 16), dtype=torch.long, device=dev)
     mask = torch.ones_like(ids)
     with torch.no_grad():
-        model.model(input_ids=ids, attention_mask=mask)
+        model(input_ids=ids, attention_mask=mask)
     torch.cuda.synchronize() if torch.cuda.is_available() else None
     print(f"[warmup] done in {time.time() - t0:.1f}s", flush=True)
 

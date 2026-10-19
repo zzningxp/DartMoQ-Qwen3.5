@@ -41,11 +41,14 @@ from qwen35_utils import DEV
 # meta 结构构建
 # ---------------------------------------------------------------------------
 
-def build_meta_structure(model_path, verbose=True):
+def build_meta_structure(model_path, verbose=True, model_class=None):
     """剥掉 checkpoint 量化配置后建纯 bf16 的 meta 空结构（零权重内存）。
 
     W8A8 输入的 config.json 带 compression_config，不剥掉的话 from_config
     会走 compressed-tensors 量化模块替换，结构 key 与手动反量化路径不匹配。
+
+    model_class: 结构类。默认 AutoModelForCausalLM（纯文本结构）；
+        VL 评测传 AutoModelForImageTextToText 建 Qwen3_5MoeForConditionalGeneration。
     """
     cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     had_quant_cfg = (getattr(cfg, "compression_config", None) is not None
@@ -55,10 +58,16 @@ def build_meta_structure(model_path, verbose=True):
         cfg.quantization_config = None
         print("[stream] Stripped quantization config from checkpoint "
               "(int8 input, manual dequant)")
+    if model_class is None:
+        model_class = AutoModelForCausalLM
     with init_empty_weights():
-        model = AutoModelForCausalLM.from_config(cfg, trust_remote_code=True)
+        model = model_class.from_config(cfg, trust_remote_code=True)
     if verbose:
-        n_layers = len(model.model.layers)
+        # 层数兼容两种结构：CausalLM 的 model.layers 与 VL 的
+        # model.language_model.layers
+        base = getattr(model, "model", model)
+        lm = getattr(base, "language_model", base)
+        n_layers = len(lm.layers) if hasattr(lm, "layers") else None
         n_params = sum(p.numel() for p in model.parameters())
         print(f"[stream] meta structure: {n_layers} layers, {n_params / 1e9:.1f}B params, "
               f"dtype={next(iter(model.parameters())).dtype}")
