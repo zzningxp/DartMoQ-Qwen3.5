@@ -107,28 +107,37 @@ Triton kernel 量化推理支持三种精度模式（共用同一份 packed chec
 
 ### 吞吐（prefill / decode，RTX 5090，bench_throughput.py P0 口径）
 
-batch=1、wiki 真实文本切片；prefill 16/128/2048/4096（tok/s），decode
-256/512/1024（**ms/token**），含 cache 一致性守卫（check PASS 才入表）。
-4bpw = 全 4bit（global-a4s4m4bpw，无 bit 搜索空间）；2bpw = 1/2/4 混合。
+batch=1、wiki 真实文本切片。单位：prefill/decode 均为 **tok/s（越高越快）**，
+ttft 秒（越低越快）。prefill 只计时 transformer（不含 lm_head），decode 含
+cache 路径；每条结果都经过 cache-vs-full logits 一致性守卫（check PASS 才入表）。
 
-| 模式 | 2bpw dec（ms/tok） | 4bpw dec（ms/tok） |
-|---|---|---|
-| wxa16 | 10.91–10.97 | 10.98–11.13 |
-| **wxa8** | **9.78–9.84** | 11.26–11.39 |
-| wxfp8 | 9.92–9.93 | 11.30–11.43 |
-| wxfp4 | 9.95–9.96 | OOM（待处理） |
+| 模型 / 模式 | pf16 | pf128 | pf2048 | pf4096 | dec（256/512/1024） | ttft | check |
+|---|---|---|---|---|---|---|---|
+| 官方 FP8（双卡） | 215.6 | 1657.9 | 10009.8 | 10082.3 | 15.77 / 15.82 / 15.84 | 0.142 | PASS |
+| 官方 GPTQ-Int4（单卡） | 51.7 | 329.2 | 3298.6 | 4941.3 | 3.93 / 3.95 / 3.94 | 0.644 | PASS |
+| 4bpw wxa16（全 4bit） | 43 | 163 | 1416–1428 | 2403–2411 | 11.00–11.13 | 0.884–0.888 | PASS |
+| 4bpw wxa8 | 46.2–46.4 | 181 | 1604–1611 | 2692–2701 | 11.26–11.39 | 0.794–0.796 | PASS |
+| 4bpw wxfp8 | 46.4–46.5 | 181–184 | 1606–1609 | 2680–2686 | 11.30–11.43 | 0.791–0.797 | PASS |
+| 4bpw wxfp4 | — | — | — | — | OOM（WFF-5，见 throughput-bench §二） | — | — |
+| 2bpw wxa16（1/2/4 混合） | 43 | 160.3 | 1421.7 | 2421.6 | 10.91–10.97 | 0.890 | PASS |
+| 2bpw wxa8 | 44.6 | 177.6 | 1611.2 | 2765.6 | 9.78–9.84 | 0.824 | PASS |
+| 2bpw wxfp8 | 45.2 | 180.6 | 1628.2 | 2785.0 | 9.92–9.93 | 0.819 | PASS |
+| 2bpw wxfp4 | 44.9 | 176.8 | 1611.5 | 2760.6 | 9.95–9.96 | 0.824 | PASS |
 
-- prefill 两边基本持平（wxa8 pf2048 1603–1611 vs 1611 tok/s；pf4096 2bpw 快 ~3%）
-- **结论（2026-10-19）**：混合 1/2/4-bit 的 2bpw 比全 4bit 只快 ~13%——
-  1/2-bit kernel 的混合实现没有额外惩罚，decode 主要受每层/expert 固定开销
-  主导而非权重带宽（与 WxA8 路线「per-expert 循环开销占 MoE forward wall
-  ~80%」互证）。wxfp4 在 4bpw 上因全 4bit 池触发 WFF-1 fold 的显存账失效而
-  OOM（分块 fold 已修，驻留副本方案待拍板）。
-- 官方发布 FP8 / GPTQ-Int4 基线（用他们的 kernel：fbgemm-gpu / gptqmodel）
-  已接入同一 harness，独立环境 + 双卡注意项见
-  [roadmaps/throughput-bench-261019.md](roadmaps/throughput-bench-261019.md)
-- 明细与口径：[roadmaps/throughput-bench-261019.md](roadmaps/throughput-bench-261019.md)；
-  日志 1015.thrput.1（2bpw）/ 1018.thrput.1.w4（4bpw）
+- **4bpw vs 2bpw**：decode 4bpw 快 ~13%（11.27 vs 9.78 tok/s），短 prefill 也
+  略快，只有 pf4096 2bpw 赢回 3%——低 bit 混合路径（1/2-bit 解包 + per-bit
+  分池）的固定开销在开销主导的场景里净亏，带宽收益只在长 prefill 兑现
+- **官方 FP8 prefill 快 6.2×（单卡等价 ~3.1×）**：grouped 融合 fp8 kernel
+  （一次 launch 覆盖全部 active expert）+ BF16 attention + 双卡红利；
+  decode 差距收窄到 1.4×——小 B 场景我们的小 B 专优 kernel 撑住了
+- **官方 Int4 prefill 快 2.06×、decode 慢 2.9×**：TritonV2 是大 B GEMM
+  kernel，batch=1 崩到 254ms/step；数字是 transformers 生态口径，不代表
+  vLLM moe_wna16 上限
+- 全部差异的逐项分析（四个问题的根因拆解）见
+  [roadmaps/throughput-analysis-261020.md](roadmaps/throughput-analysis-261020.md)
+- 口径与明细：[roadmaps/throughput-bench-261019.md](roadmaps/throughput-bench-261019.md)；
+  日志 1015.thrput.1（2bpw）/ 1018.thrput.1.w4（4bpw）/
+  1018.thrput.2.official.fp8 / 1018.thrput.3.official.gptq4int
 
 ## 下游任务评测（lm-eval 七任务，对齐 BitsMoE 口径）
 
@@ -326,22 +335,37 @@ WxFP8 同理（`convert_model_to_wxfp8`，码本 e4m3 LUT + cb_scale 搜索加�
 WxFP4 同理（`convert_model_to_wxfp4`，nibble LUT + 常量 e8m0 + norms×residual 副本
 + 索引折叠直存 e2m1 加载期算），四种模式读的是同一份 checkpoint，切换只是加载标志。
 
-### 5. 吞吐基准（prefill / decode）与官方基线
+### 5. 吞吐基准（bench_throughput.py）与官方基线
+
+能测什么：同一 harness 两条线——**我们的 checkpoint**（`--quant-dir`，
+wxa16/wxa8/wxfp8/wxfp4 四种 kernel 模式共用同一份 checkpoint）与
+**外部 HF 模型**（`--model-path`：官方 FP8 / GPTQ-Int4，或任意 fp16/w4a16
+目录；ConditionalGeneration 结构自动用 ImageTextToText 加载，GPTQ 走
+gptqmodel 原生加载 + TritonV2）。测量项：prefill 16/128/2048/4096
+（tok/s，仅 transformer 不含 lm_head，每档 3 次取中位）、decode
+256/512/1024（tok/s，batch=1 greedy 含 cache）、TTFT、MoE stage 逐项拆分
+（我方模式独有，moe_ms 列）、cache-vs-full logits 一致性守卫（check 列，
+不过守卫的数字不入表）。结果 JSON 落 `results/`，`logs_parser.py` 直接解表。
 
 ```bash
-# 我们的 checkpoint（四种 kernel 模式，同一份；dart312-t38 环境）
+# 我们的 checkpoint（dart312-t38 环境）
 sh run.throughput.sh
 
-# 官方发布 FP8 / GPTQ-Int4 基线（用他们的 kernel；复用 dart312 = torch 2.9 栈，
+# 官方 FP8 / GPTQ-Int4 基线（用他们的 kernel；复用 dart312 = torch 2.9 栈，
 # 官方 kernel 包最新版按 torch 2.11 编译，版本必须钉死；⚠ 不能装进 dart312-t38）
 conda activate dart312
 pip install "gptqmodel==7.3.6" "fbgemm-gpu==1.4.0" "torchao==0.17.0" \
             optimum "kernels==0.17.2"
 sh run.throughput.official.sh   # FP8 35GB 需双卡，脚本内已设好
+
+# 单条运行（自由组合）
+python benchmarks/bench_throughput.py --quant-dir models/<ckpt>/ --mode wxa8 \
+    --prefill-lens 16,128,2048,4096 --decode-tokens 256,512,1024
 ```
 
-口径与结果见性能一节「吞吐」小节与
-[roadmaps/throughput-bench-261019.md](roadmaps/throughput-bench-261019.md)。
+口径、结果与差异分析见性能一节「吞吐」小节、
+[roadmaps/throughput-bench-261019.md](roadmaps/throughput-bench-261019.md) 与
+[roadmaps/throughput-analysis-261020.md](roadmaps/throughput-analysis-261020.md)。
 
 ## 路线图
 
@@ -392,10 +416,11 @@ sh run.throughput.official.sh   # FP8 35GB 需双卡，脚本内已设好
   - 详见 [roadmaps/wxfp4-plan-260924.md](roadmaps/wxfp4-plan-260924.md)
     与 [roadmaps/wxfp4-fold-plan-260927.md](roadmaps/wxfp4-fold-plan-260927.md)
 
-- **吞吐基准与外部基线**（2026-10-19 立项，进行中）
+- **吞吐基准与外部基线**（2026-10-19 立项；2bpw/4bpw/官方 FP8+Int4 已出全量数字）
   - bench_throughput.py P0 口径（batch=1 prefill/decode + cache 一致性守卫），
-    4bpw（全 4bit）vs 2bpw（1/2/4 混合）：decode 只差 ~13%，证明 1/2-bit
-    kernel 混合实现无额外惩罚；wxfp4 在 4bpw 上触发 fold 显存账失效（WFF-5）
-  - 官方 FP8 / GPTQ-Int4 基线接入（他们的 kernel：fbgemm-gpu / gptqmodel，
-    独立环境隔离依赖冲突）
+    我方 checkpoint 四模式 + 官方 FP8（双卡）/GPTQ-Int4（gptqmodel TritonV2）
+  - 核心发现：与官方 FP8 的差距主因是 per-expert 循环 vs grouped kernel
+    （prefill 单卡等价 3.1×）；低 bit 混合路径有固定开销惩罚（2bpw decode
+    慢 4bpw 13%）；我们小 B 场景反超 gptqmodel Int4 decode 2.9×
   - 详见 [roadmaps/throughput-bench-261019.md](roadmaps/throughput-bench-261019.md)
+    与 [roadmaps/throughput-analysis-261020.md](roadmaps/throughput-analysis-261020.md)

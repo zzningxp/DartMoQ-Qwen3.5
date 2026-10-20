@@ -5,30 +5,34 @@ bench_throughput.py 的结果记录与外部官方基线计划。P0 口径：bat
 decode 256/512/1024（**ms/token**，含 cache 路径），ttft、cache-vs-full logits
 一致性守卫。硬件 RTX 5090（31.4GB 可用）。
 
-## 一、35B：4bpw（全 4bit）vs 2bpw（1/2/4 混合）decode/prefill（2026-10-19）
+## 一、35B 吞吐结果汇总（2026-10-19/20，1015/1018/1019 日志）
 
 checkpoint：4bpw = `models/qwen3.5-35B-4bpw-261016-{gptq,turboquant}`
 （`global-a4s4m4bpw`，无 bit 搜索空间即全 4bit；两份结果取范围），
-2bpw = `qwen3.5-2bpw-260930-s1`（bit 分布见 README 性能一节）。
-bench git 99336b8+（4bpw）/ 8e0f61c+（2bpw），日志 1018.thrput.1.w4 /
-1015.thrput.1。
+2bpw = `qwen3.5-2bpw-260930-s1`。官方基线 = `~/models/` 的 FP8（双卡）与
+GPTQ-Int4（单卡，gptqmodel 原生加载 TritonV2）。单位：prefill/decode 均为
+**tok/s（越高越快）**，ttft 秒（越低越快）。
 
-| 模式 | 2bpw dec（ms/tok） | 4bpw dec（ms/tok） | 2bpw→4bpw |
-|---|---|---|---|
-| wxa16 | 10.91–10.97 | 10.98–11.13 | 持平 |
-| **wxa8** | **9.78–9.84** | 11.26–11.39 | 2bpw 快 ~13% |
-| wxfp8 | 9.92–9.93 | 11.30–11.43 | 2bpw 快 ~13% |
-| wxfp4 | 9.95–9.96 | OOM（见 §三） | — |
+| 模型 / 模式 | pf16 | pf128 | pf2048 | pf4096 | dec（256/512/1024） | ttft | check |
+|---|---|---|---|---|---|---|---|
+| 官方 FP8（双卡） | 215.6 | 1657.9 | 10009.8 | 10082.3 | 15.77 / 15.82 / 15.84 | 0.142 | PASS |
+| 官方 GPTQ-Int4（单卡） | 51.7 | 329.2 | 3298.6 | 4941.3 | 3.93 / 3.95 / 3.94 | 0.644 | PASS |
+| 4bpw wxa16 | 43–43 | 162–163 | 1416–1428 | 2403–2411 | 11.00–11.13 | 0.884–0.888 | PASS |
+| 4bpw wxa8 | 46.2–46.4 | 181–181 | 1604–1611 | 2692–2701 | 11.26–11.39 | 0.794–0.796 | PASS |
+| 4bpw wxfp8 | 46.4–46.5 | 181–184 | 1606–1609 | 2680–2686 | 11.30–11.43 | 0.791–0.797 | PASS |
+| 4bpw wxfp4 | — | — | — | — | OOM（WFF-5，见 §二） | — | — |
+| 2bpw wxa16 | 43 | 160.3 | 1421.7 | 2421.6 | 10.91–10.97 | 0.890 | PASS |
+| 2bpw wxa8 | 44.6 | 177.6 | 1611.2 | 2765.6 | 9.78–9.84 | 0.824 | PASS |
+| 2bpw wxfp8 | 45.2 | 180.6 | 1628.2 | 2785.0 | 9.92–9.93 | 0.819 | PASS |
+| 2bpw wxfp4 | 44.9 | 176.8 | 1611.5 | 2760.6 | 9.95–9.96 | 0.824 | PASS |
 
-prefill（wxa8）：pf2048 两边持平（1603–1611 vs 1611 tok/s）；pf4096 2bpw 快
-~3%（2765 vs 2691）；pf16/pf128 差异 <5%。
+差异分析（四个问题：FP8 为何快 / 4bpw 为何慢 / 2bpw 为何慢于 4bpw /
+Int4 为何 prefill 快 decode 慢）见
+[throughput-analysis-261020.md](throughput-analysis-261020.md)。
 
-结论（本人 2026-10-19）：混合 1/2/4-bit 的 2bpw 相对全 4bit 的 4bpw decode 只
-快 ~13%——MoE 权重字节减半只兑现一小部分，说明 **1/2-bit kernel 的混合实现
-没有额外惩罚**（不然 2bpw 会更慢），decode 主要受每层/expert 固定开销主导而
-非权重带宽。这与 WxA8 路线「per-expert 循环开销占 MoE forward wall ~80%」的
-结论互相印证。参照：4090 W4A16 公开 decode 103.8 tok/s ≈ 9.63 ms/tok，
-我们 wxa8 2bpw 9.78 ms/tok 同量级。
+⚠ 2026-10-20 勘误：本文件 §一 初版把 dec 列误读为 ms/tok，得出「2bpw 快
+13%」的错误结论；实际 dec 列为 tok/s，**4bpw decode 比 2bpw 快 ~13%**，
+上表与结论已按正确单位重写。
 
 ## 二、wxfp4 在 4bpw 上 OOM（已定位，处理中）
 
