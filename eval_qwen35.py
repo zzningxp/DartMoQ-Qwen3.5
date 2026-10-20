@@ -42,9 +42,22 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
     # Save original device for each layer
     layers = model.model.layers
 
-    # 流式模式（load_model_streaming 载入）：逐层反量化 -> 前向 -> 丢弃（to('meta')）
+    # 流式模式（load_model_streaming 载入）：逐层反量化 -> 前向 -> 丢弃（to('meta')）。
+    # 量化主流程直接接 eval 时（--standby-layer-meta + test_ppl），已量化层的结构
+    # key 与原始 checkpoint 不再对应（packed_indices / codebook 等只存在于量化
+    # 产物，materialize 会 KeyError），且回 meta 后权重就找不回来了——量化层驻留
+    # CPU 直接搬 GPU，只有未量化的 meta 层才从盘流式载入（部分量化 --quant-layers
+    # 场景两者混存；1016.quant.w4.1 两次全量化 eval 同点崩溃即由此）
     _stream_reader = getattr(model, '_stream_reader', None)
     if _stream_reader is not None:
+        from quantization.wxa16.linear import WxA16Linear
+        from quantization.wxa16.bit_partitioned_moe import WxA16BitPartitionedGroupMoE
+
+        def _layer_quantized(layer):
+            # WxA8/WxFP8/WxFP4 的 Linear 与 MoE 均继承 WxA16 基类，一处 isinstance 全覆盖
+            return (isinstance(getattr(layer, 'mlp', None), WxA16BitPartitionedGroupMoE)
+                    or any(isinstance(m, WxA16Linear) for m in layer.modules()))
+
         print("[stream] sequential eval: per-layer dequantize from disk, "
               "discard after use", flush=True)
         from qwen35_stream_io import materialize_module
@@ -156,9 +169,10 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
         print(f"  position_embeddings type: {type(position_embeddings)}")
 
     # Restore layer 0 and move back to CPU（流式：先 sync 再丢弃回 meta，避免
-    # 异步 kernel use-after-free；主循环会重新反量化载入）
+    # 异步 kernel use-after-free；主循环会重新反量化载入。量化层不回 meta——
+    # 权重不在原始 checkpoint 里，丢弃即丢失，回 CPU 驻留）
     layers[0] = layers[0].module
-    if _stream_reader is not None:
+    if _stream_reader is not None and not _layer_quantized(layers[0]):
         torch.cuda.synchronize()
         layers[0] = layers[0].to('meta')
     else:
@@ -374,8 +388,9 @@ def qwen35_ppl_eval_sequential(model, testloader, eval_set, args):
 
         # Move layer back to CPU to free GPU memory (in-place, modifies layers[layer_idx])
         # （流式：先 sync 再丢弃回 meta——forward 的 kernel 是异步的，直接释放
-        # 权重存储会 use-after-free；.to('cpu') 的 D2H 拷贝自带流顺序，meta 没有）
-        if _stream_reader is not None:
+        # 权重存储会 use-after-free；.to('cpu') 的 D2H 拷贝自带流顺序，meta 没有。
+        # 量化层不回 meta，权重回 CPU 驻留）
+        if _stream_reader is not None and not _layer_quantized(layer):
             torch.cuda.synchronize()
             layer = layer.to('meta')
         else:

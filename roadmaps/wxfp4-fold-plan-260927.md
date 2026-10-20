@@ -110,7 +110,7 @@
 | fold 位序约定与 kernel unpack 不一致 | 中 | 测试 [1] byte-exact 直接暴露；low-bit-first 复核 |
 | W_FOLDED 分支布局编址 bug | 中 | 测试 [2] bit-exact 对拍兜底（legacy 保留作对照） |
 | MoE wall 收益低于预期（循环占 80%） | 高（预期内） | 本路线目标定位 kernel 层消解；wall 层归 P5 系；不因 wall 无感回退 |
-| 未来 checkpoint bit1/4 池变大 → 显存账恶化 | 低 | fold 带 bit_width 参数，增量公式见 §二；超预算时改 kernel 内算术化（w1 退化 select / w2 where 链，已论证可行） |
+| 未来 checkpoint bit1/4 池变大 → 显存账恶化 | 已发生（WFF-5，2026-10-19） | 4bpw 全 4bit 池实测 OOM；分块 fold 已修瞬时分配，驻留副本方案见 WFF-5（legacy LUT 跳过 / kernel 内算术化 待拍板） |
 
 ## 变更记录
 
@@ -122,6 +122,8 @@
 - 2026-09-27 WFF-4 eval 闭环（本人手动）：**ppl 逐位一致**（wiki 7.7972 /
   c4 11.2708）；wall **-9.8%**（110.53→100.79s），**wxfp4 成为最快模式**
   （vs wxa8 -6.5%）。WFF-x 全部完成。
+- 2026-10-19 WFF-5：4bpw（全 4bit）checkpoint 上 wxfp4 首层 OOM，见执行日志
+  WFF-5（风险表「bit1/4 池变大」条目兑现）。
 
 ## 执行日志
 
@@ -192,3 +194,21 @@
     低估了 fp4 路径 kernel 阶段的 wall 占比）→ kernel 时间在 wall 中
     仍占可观比例，**§三.5 挂起的 TMA/persistent grouped（367→~490 TF
     空间）立项条件已被数据支持**，是否排期待本人定
+
+### WFF-5：4bpw 全 4bit 池下 OOM（2026-10-19 记录，处理中）
+
+- 2026-10-19（logs/1018.thrput.1.w4.log，bench git 99336b8+）：
+  4bpw checkpoint（global-a4s4m4bpw，256 expert 全部 bit4）上 wxfp4 两次
+  运行均在首层 `_get_bit_context` → `fold_indices_to_e2m1` 报
+  `CUDA out of memory. Tried to allocate 4.00 GiB`。风险表「bit1/4 池变大」
+  条目兑现——§二 的 +47MB 上限以「小池」为前提，全 4bit 池下不成立：
+  - **瞬时分配**：整矩阵一次物化 `idx.long()`（8B/元素）。已修：按 G 分块
+    （~32M 元素/块，峰值 ~数百 MB），CPU 对拍 bit 1/2/4 与整矩阵路径
+    bit-exact（test 见 throughput-bench-261019.md §二）。
+  - **驻留副本（本人已拍板：先不动，2026-10-19）**：`indices_e2m1_gf` 在全
+    4bit 池下是全量 MoE 索引副本（40 层 ctx 缓存累计 ≈ +10GB），31.4GB 卡装
+    不下。候选留档：① 池大小预算内跳过 fold，kernel 走 legacy in-kernel LUT
+    分支（`w_e2m1_gf=None`，分支仍在）——内存受限的 bit 级自适应；② 风险表
+    原方案的 kernel 内算术化（w1 select / w2 where 链，bit4 无对应算术化
+    需另行论证）。当前 4bpw 上 wxfp4 不跑，2bpw 路径不受影响。
+- 详情：[roadmaps/throughput-bench-261019.md](roadmaps/throughput-bench-261019.md) §二

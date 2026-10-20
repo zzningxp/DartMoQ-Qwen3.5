@@ -644,6 +644,13 @@ def load_quantized_model(base_model_path: str = None, quant_dir: str = None,
             （attention 默认混合部署保 wxa8，见 convert_model_to_wxfp8）。
             checkpoint 本身不变
     """
+    if not os.path.isdir(quant_dir):
+        # 目录不存在时及早报错：AutoTokenizer 会把它当 hub repo id 抛出
+        # 难以定位的 HFValidationError（1018.thrput.1.w4 实踩，路径少写了 35B-）
+        raise FileNotFoundError(
+            f"quant_dir does not exist: {quant_dir} "
+            f"(check the directory name against models/)")
+
     if base_model_path is None:
         # 优先从 meta.json 读 base_model 路径（旧 checkpoint 没拷 tokenizer 时也能用）
         meta_path_tmp = os.path.join(quant_dir, "meta.json")

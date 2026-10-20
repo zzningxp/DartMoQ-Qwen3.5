@@ -15,9 +15,17 @@ DEV = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
 
 
-def get_qwen35_model(model_path, device_map="auto"):
+def get_qwen35_model(model_path, device_map="auto", model_class=None):
+    """外部 HF 模型通用加载（bench / 基线用）。
+
+    model_class: 结构类，默认 AutoModelForCausalLM。官方 Qwen3.5 发布的
+    ConditionalGeneration 结构（含 visual/mtp，权重 key 带 language_model
+    前缀）需传 AutoModelForImageTextToText 才能对上权重名。
+    """
+    if model_class is None:
+        model_class = AutoModelForCausalLM
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
+    model = model_class.from_pretrained(
         model_path,
         torch_dtype=torch.bfloat16,
         low_cpu_mem_usage=True,

@@ -102,12 +102,24 @@ def fold_indices_to_e2m1(indices_packed_gf: torch.Tensor, nib: torch.Tensor,
     if bit_width not in {1, 2, 4}:
         raise ValueError(f"fold 支持 bit 1/2/4，got {bit_width}")
     G, N, _ = indices_packed_gf.shape
-    n_elem = G * N * group_size
-    # unpack_nbit 的 byte 内 low-bit-first 与 kernel 的 >> (pos*bit)) & mask 同约定
-    idx = unpack_nbit(indices_packed_gf.reshape(-1), bit_width, n_elem)
-    nb = nib.to(indices_packed_gf.device)[idx.long()].reshape(-1, 2)  # (n/2, 2) uint8
-    out = (nb[:, 0] | (nb[:, 1] << 4)).reshape(G, N, group_size // 2)
-    return out.contiguous()
+    out = torch.empty((G, N, group_size // 2), dtype=torch.uint8,
+                      device=indices_packed_gf.device)
+    nib_d = nib.to(indices_packed_gf.device)
+    # 分块 fold：整矩阵一次物化时 idx.long() 是 8B/元素，全 4bit 池（4bpw
+    # checkpoint 全部 256 expert 都是 bit4）下单次分配可达 4GB 直接 OOM
+    # （1018.thrput.1.w4 wxfp4 实测）；按 G 分块把瞬时峰值压到 ~数百 MB，
+    # 逐块独立计算，输出与整矩阵路径 bit-exact
+    per_g = N * (group_size // 2)
+    chunk = max(1, (1 << 25) // max(per_g, 1))  # 每块 ~32M 输出元素
+    for g0 in range(0, G, chunk):
+        sub = indices_packed_gf[g0:g0 + chunk].reshape(-1)
+        n_elem = sub.numel() * (8 // bit_width)
+        # unpack_nbit 的 byte 内 low-bit-first 与 kernel 的 >> (pos*bit)) & mask 同约定
+        idx = unpack_nbit(sub, bit_width, n_elem)
+        nb = nib_d[idx.long()].reshape(-1, 2)  # (n/2, 2) uint8
+        out[g0:g0 + chunk] = (
+            nb[:, 0] | (nb[:, 1] << 4)).reshape(-1, N, group_size // 2)
+    return out
 
 
 def quantize_act_e2m1_per32(x_rot: torch.Tensor):

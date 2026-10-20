@@ -5,6 +5,11 @@ The parser scans each log sequentially and starts a new row at every
 "Loading model: (ppl) ..." line. Metrics that are missing because a run crashed
 or skipped downstream evaluation are left empty instead of being shifted onto a
 neighboring row.
+
+另支持 bench_throughput.py 的 prefill/decode 吞吐日志（评测计划 P0）：
+以 "[model] ... | mode: ..." 行起始一条记录（bench 脚本专属标记，其他
+脚本日志无此格式），报告块内解析 prefill 各档 tok/s、decode 各档 tok/s、
+TTFT、一致性守卫结论与 MoE 每步总耗时。
 """
 
 from __future__ import annotations
@@ -19,10 +24,17 @@ from dataclasses import asdict, dataclass, field
 from typing import Iterable
 
 
-FIELDNAMES = [
-    "git_hash", "model_name", "slices", "quant_scheme", "rank_mode",
-    "moe_struct", "quantmode", "disable_0bit_prune", "standby_layer_cpu", "quant_layers", "wxa16_real_quant", "bpw", "ppl_wikitext2", "ppl_c4",
-    "status", "runtime_ppl", "runtime_quant", "runtime_ppl_eval", "runtime_ppl_wikitext2", "runtime_ppl_c4", "error",
+# 自适应列分组：测什么显示什么。
+# COMMON 恒显；量化/eval 组在批次里有数据才显（列集合与旧 DISPLAY_FIELDS
+# 一致，不含 moe_struct/disable_0bit_prune 等几乎永远空着的字段）；
+# throughput 组按 run 类型显，档位列（prefill_tokps_<len> /
+# decode_tokps_<n>）由实际测过的档位动态生成。
+COMMON_FIELDS = ["git_hash", "model_name", "quantmode", "status", "error"]
+QUANT_EVAL_FIELDS = [
+    "slices", "quant_scheme", "rank_mode", "quant_layers", "bpw",
+    "ppl_wikitext2", "ppl_c4",
+    "runtime_ppl", "runtime_quant", "runtime_ppl_eval",
+    "runtime_ppl_wikitext2", "runtime_ppl_c4",
 ]
 
 # New log format patterns
@@ -48,6 +60,23 @@ EVAL_STANDBY_CPU_RE = re.compile(r"^Standby CPU:\s+(?P<standby_cpu>\S+)")
 EVAL_LOAD_QUANTIZED_RE = re.compile(r"^Load quantized checkpoint:\s+(?P<path>\S+)")
 # WxA8 推理模式（eval_qwen35.py 打印，位于 Quantized checkpoint 之后）
 EVAL_INFERENCE_QUANT_MODE_RE = re.compile(r"^Inference quant mode:\s+(?P<mode>\S+)")
+
+# Throughput 日志（benchmarks/bench_throughput.py）
+THROUGHPUT_START_RE = re.compile(
+    r"^\[model\]\s+(?P<model>\S+)\s+on\s+\S+\s+\|\s*mode:\s*(?P<mode>\S+)")
+THROUGHPUT_MODEL_RE = re.compile(
+    r"^model:\s+(?P<model>\S+)\s*\|\s*mode:\s*(?P<mode>\S+)"
+    r".*dataset:\s*(?P<dataset>\S+)")
+THROUGHPUT_GIT_RE = re.compile(r"\bgit:\s*(?P<git_hash>\S+)")
+THROUGHPUT_PREFILL_RE = re.compile(
+    r"^\s*len=(?P<len>\d+)\s+latency=[-+0-9.eE]+s\s+tok/s=(?P<tokps>[-+0-9.eE]+)")
+THROUGHPUT_DECODE_RE = re.compile(
+    r"^\s*tokens=(?P<n>\d+)\s+wall tok/s = (?P<tokps>[-+0-9.eE]+)")
+THROUGHPUT_TTFT_RE = re.compile(r"^\s*TTFT = (?P<ttft>[-+0-9.eE]+)s")
+THROUGHPUT_CHECK_RE = re.compile(r"^Consistency check:\s*(?P<verdict>PASS|FAIL)")
+# 报告里以 total 开头的行只有 MoE stage 块的 total 行（_clean_line 会 strip
+# 行首空格，不能靠缩进判断块边界，直接匹配即可）
+THROUGHPUT_MOE_TOTAL_RE = re.compile(r"^\s*total\s+(?P<value>[-+0-9.eE]+)")
 
 # Old log format patterns (for backward compatibility)
 LOADING_RE = re.compile(r"Loading model:\s*\(ppl\)\s*(?P<path>\S+)")
@@ -102,6 +131,14 @@ class RunRecord:
     runtime_quant: str = ""
     runtime_ppl_eval: str = ""
     error: str = ""
+    # Throughput（bench_throughput.py）字段
+    is_throughput: bool = False
+    dataset: str = ""
+    prefill_tokps: dict[int, str] = field(default_factory=dict, repr=False)
+    decode_tokps: dict[int, str] = field(default_factory=dict, repr=False)
+    ttft_s: str = ""
+    check: str = ""
+    moe_total_ms: str = ""
     _fatal: bool = field(default=False, repr=False)
     # Temporary fields for accumulating time from old logs
     _layer_times: list[float] = field(default_factory=list, repr=False)
@@ -141,6 +178,12 @@ class RunRecord:
                 self.runtime_ppl = f"{t_quant + t_ppl:.2f}"
         if self._fatal:
             self.status = "failed"
+        elif self.decode_tokps:
+            # Throughput 记录：decode 数字齐全即 ok
+            self.status = "ok"
+        elif self.prefill_tokps:
+            # 只有 prefill（decode 前崩了）——OOM 等 fatal 已在上面判 failed
+            self.status = "partial"
         elif self.ppl_wikitext2 and self.ppl_c4:
             # Have both ppl results
             self.status = "ok"
@@ -204,6 +247,7 @@ def parse_log(path: str) -> list[RunRecord]:
     # Track which format we're using
     using_new_format = False
     using_eval_format = False
+    using_throughput_format = False
 
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         for line_no, raw_line in enumerate(f, 1):
@@ -247,8 +291,30 @@ def parse_log(path: str) -> list[RunRecord]:
                 using_eval_format = False
                 continue
 
+            # Check for throughput format start (bench_throughput.py 的
+            # "[model] ... | mode: ..." 行，其他脚本日志无此格式)
+            throughput_start_match = THROUGHPUT_START_RE.search(line)
+            if throughput_start_match:
+                if current is not None:
+                    current.finalize(line_no - 1)
+                    records.append(current)
+                current = RunRecord(
+                    source=source,
+                    run_idx=len(records) + 1,
+                    start_line=line_no,
+                    start_time="",
+                    model_path="",
+                )
+                current.model_name = throughput_start_match.group("model")
+                current.quantmode = throughput_start_match.group("mode")
+                current.is_throughput = True
+                using_throughput_format = True
+                using_new_format = False
+                using_eval_format = False
+                continue
+
             # If not using new format yet, check for old format patterns
-            if not using_new_format and not using_eval_format:
+            if not using_new_format and not using_eval_format and not using_throughput_format:
                 start_time_match = START_TIME_RE.search(line)
                 if start_time_match:
                     pending_start_time = start_time_match.group("value").strip()
@@ -282,6 +348,45 @@ def parse_log(path: str) -> list[RunRecord]:
                 except ValueError:
                     pass
                 # Don't continue, fall through to other matches
+
+            # Throughput format parsing (bench_throughput.py 报告块)
+            if using_throughput_format:
+                tput_model_match = THROUGHPUT_MODEL_RE.search(line)
+                if tput_model_match:
+                    current.model_name = tput_model_match.group("model")
+                    current.quantmode = tput_model_match.group("mode")
+                    current.dataset = tput_model_match.group("dataset")
+                    continue
+                tput_git_match = THROUGHPUT_GIT_RE.search(line)
+                if tput_git_match:
+                    current.git_hash = tput_git_match.group("git_hash")
+                    continue
+                tput_prefill_match = THROUGHPUT_PREFILL_RE.search(line)
+                if tput_prefill_match:
+                    current.prefill_tokps[int(tput_prefill_match.group("len"))] = \
+                        tput_prefill_match.group("tokps")
+                    continue
+                tput_decode_match = THROUGHPUT_DECODE_RE.search(line)
+                if tput_decode_match:
+                    current.decode_tokps[int(tput_decode_match.group("n"))] = \
+                        tput_decode_match.group("tokps")
+                    continue
+                tput_ttft_match = THROUGHPUT_TTFT_RE.search(line)
+                if tput_ttft_match:
+                    current.ttft_s = tput_ttft_match.group("ttft")
+                    continue
+                tput_check_match = THROUGHPUT_CHECK_RE.search(line)
+                if tput_check_match:
+                    current.check = tput_check_match.group("verdict")
+                    continue
+                tput_moe_total = THROUGHPUT_MOE_TOTAL_RE.search(line)
+                if tput_moe_total:
+                    current.moe_total_ms = tput_moe_total.group("value")
+                    continue
+                if FATAL_RE.search(line):
+                    current._fatal = True
+                    _append_error(current, line)
+                continue
 
             # Both new formats use model line
             model_match = NEW_MODEL_RE.search(line)
@@ -491,13 +596,13 @@ def parse_logs(paths: Iterable[str]) -> list[RunRecord]:
 
 
 def _format_row(record: RunRecord, fields: list[str]) -> dict[str, str]:
-    row = record.public_dict()
-    return {field: _format_value(field, row.get(field, "")) for field in fields}
+    return {field: _format_value(field, _field_value(record, field))
+            for field in fields}
 
 
-def _format_export_row(record: RunRecord) -> dict[str, str]:
-    row = record.public_dict()
-    return {EXPORT_HEADERS[field]: _format_value(field, row.get(field, "")) for field in FIELDNAMES}
+def _format_export_row(record: RunRecord, fields: list[str]) -> dict[str, str]:
+    return {_export_header(field): _format_value(field, _field_value(record, field))
+            for field in fields}
 
 
 def _csv_escape(value: str) -> str:
@@ -507,19 +612,53 @@ def _csv_escape(value: str) -> str:
 
 
 def write_csv(records: list[RunRecord], out) -> None:
-    headers = [EXPORT_HEADERS[field] for field in FIELDNAMES]
+    fields = _select_fields(records)
+    headers = [_export_header(f) for f in fields]
     out.write(",".join([_csv_escape(h) for h in headers]) + "\n")
     for record in records:
-        row = _format_row(record, FIELDNAMES)
-        out.write(",".join([_csv_escape(row.get(field, "")) for field in FIELDNAMES]) + "\n")
+        row = _format_row(record, fields)
+        out.write(",".join([_csv_escape(row.get(field, "")) for field in fields]) + "\n")
 
 
-DISPLAY_FIELDS = [
-    "git_hash", "model_name", "slices", "quant_scheme", "rank_mode", "quantmode", "quant_layers", "bpw",
-    "ppl_wikitext2", "ppl_c4",
-    "status",
-    "runtime_ppl", "runtime_quant", "runtime_ppl_eval", "runtime_ppl_wikitext2", "runtime_ppl_c4", "error",
-]
+def _field_value(record: RunRecord, field: str) -> str:
+    """按字段名取值；档位字段从 dict 动态解析（prefill_tokps_<len> 等）。"""
+    if field.startswith("prefill_tokps_"):
+        return record.prefill_tokps.get(int(field[len("prefill_tokps_"):]), "")
+    if field.startswith("decode_tokps_"):
+        return record.decode_tokps.get(int(field[len("decode_tokps_"):]), "")
+    return str(getattr(record, field, "") or "")
+
+
+def _select_fields(records: list[RunRecord]) -> list[str]:
+    """自适应选择展示列：按批次内容决定列集合。"""
+    fields = list(COMMON_FIELDS)
+    if any(any(getattr(r, f) for r in records) for f in QUANT_EVAL_FIELDS):
+        fields += QUANT_EVAL_FIELDS
+    if any(r.is_throughput for r in records):
+        if any(r.dataset for r in records):
+            fields.append("dataset")
+        prefill_lens = sorted({L for r in records for L in r.prefill_tokps})
+        decode_tiers = sorted({n for r in records for n in r.decode_tokps})
+        fields += [f"prefill_tokps_{L}" for L in prefill_lens]
+        fields += [f"decode_tokps_{n}" for n in decode_tiers]
+        for f in ("ttft_s", "check", "moe_total_ms"):
+            if any(getattr(r, f) for r in records):
+                fields.append(f)
+    return fields
+
+
+def _plain_header(field: str) -> str:
+    """plain 输出的短表头；档位字段生成 pf<len>/dec<n> 形式。"""
+    if field.startswith("prefill_tokps_"):
+        return "pf" + field.rsplit("_", 1)[1]
+    if field.startswith("decode_tokps_"):
+        return "dec" + field.rsplit("_", 1)[1]
+    return PLAIN_HEADERS.get(field, field)
+
+
+def _export_header(field: str) -> str:
+    """csv/md/json 输出表头；档位字段直接用完整字段名。"""
+    return EXPORT_HEADERS.get(field, field)
 
 PLAIN_HEADERS = {
     "model_name": "model",
@@ -542,6 +681,10 @@ PLAIN_HEADERS = {
     "runtime_ppl_wikitext2": "t_wiki",
     "runtime_ppl_c4": "t_c4",
     "error": "err",
+    "dataset": "ds",
+    "ttft_s": "ttft",
+    "check": "check",
+    "moe_total_ms": "moe_ms",
 }
 
 EXPORT_HEADERS = {
@@ -565,6 +708,10 @@ EXPORT_HEADERS = {
     "runtime_ppl_eval": "ppl_eval_time",
     "runtime_ppl_wikitext2": "t_wiki",
     "runtime_ppl_c4": "t_c4",
+    "dataset": "dataset",
+    "ttft_s": "ttft_s",
+    "check": "check",
+    "moe_total_ms": "moe_total_ms",
 }
 
 
@@ -593,13 +740,14 @@ def _format_plain_value(record: RunRecord, field: str, value) -> str:
 
 
 def write_plain(records: list[RunRecord], out) -> None:
+    fields = _select_fields(records)
     rows: list[list[str]] = []
-    rows.append([PLAIN_HEADERS[field] for field in DISPLAY_FIELDS])
+    rows.append([_plain_header(f) for f in fields])
     for record in records:
-        row = record.public_dict()
-        rows.append([_format_plain_value(record, col, row.get(col, "")) for col in DISPLAY_FIELDS])
+        rows.append([_format_plain_value(record, f, _field_value(record, f))
+                     for f in fields])
 
-    widths = [max(len(row[i]) for row in rows) for i in range(len(DISPLAY_FIELDS))]
+    widths = [max(len(row[i]) for row in rows) for i in range(len(fields))]
     for row in rows:
         pieces = []
         for i, value in enumerate(row):
@@ -611,19 +759,19 @@ def write_plain(records: list[RunRecord], out) -> None:
 
 
 def write_markdown(records: list[RunRecord], out) -> None:
+    fields = _select_fields(records)
     print("<table>", file=out)
     print("  <thead>", file=out)
     print("    <tr>", file=out)
-    for field in FIELDNAMES:
-        print(f"      <th>{html.escape(EXPORT_HEADERS[field])}</th>", file=out)
+    for field in fields:
+        print(f"      <th>{html.escape(_export_header(field))}</th>", file=out)
     print("    </tr>", file=out)
     print("  </thead>", file=out)
     print("  <tbody>", file=out)
     for record in records:
-        row = record.public_dict()
         print("    <tr>", file=out)
-        for field in FIELDNAMES:
-            value = _format_plain_value(record, field, row.get(field, ""))
+        for field in fields:
+            value = _format_plain_value(record, field, _field_value(record, field))
             print(f"      <td>{html.escape(value)}</td>", file=out)
         print("    </tr>", file=out)
     print("  </tbody>", file=out)
@@ -662,7 +810,10 @@ def main(argv: list[str] | None = None) -> int:
         output_path = f"{log_path}.{args.format}"
         with open(output_path, "w", newline="", encoding="utf-8") as out:
             if args.format == "json":
-                json.dump([_format_export_row(record) for record in records], out, indent=2, ensure_ascii=False)
+                fields = _select_fields(records)
+                json.dump([_format_export_row(record, fields)
+                           for record in records], out, indent=2,
+                          ensure_ascii=False)
                 print(file=out)
             elif args.format == "md":
                 write_markdown(records, out)

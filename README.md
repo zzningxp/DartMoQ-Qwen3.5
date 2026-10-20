@@ -105,6 +105,31 @@ Triton kernel 量化推理支持三种精度模式（共用同一份 packed chec
 | 双卡自动切分 batch eval | ~24 GB/卡 | ~45 GB | 8 | 双卡常驻部署（免搬运，bs 受限） |
 | fp16 基线流式评测 | ~23 GB | ~15 GB | 16 | int8 原模型直接评测（算一层读一层） |
 
+### 吞吐（prefill / decode，RTX 5090，bench_throughput.py P0 口径）
+
+batch=1、wiki 真实文本切片；prefill 16/128/2048/4096（tok/s），decode
+256/512/1024（**ms/token**），含 cache 一致性守卫（check PASS 才入表）。
+4bpw = 全 4bit（global-a4s4m4bpw，无 bit 搜索空间）；2bpw = 1/2/4 混合。
+
+| 模式 | 2bpw dec（ms/tok） | 4bpw dec（ms/tok） |
+|---|---|---|
+| wxa16 | 10.91–10.97 | 10.98–11.13 |
+| **wxa8** | **9.78–9.84** | 11.26–11.39 |
+| wxfp8 | 9.92–9.93 | 11.30–11.43 |
+| wxfp4 | 9.95–9.96 | OOM（待处理） |
+
+- prefill 两边基本持平（wxa8 pf2048 1603–1611 vs 1611 tok/s；pf4096 2bpw 快 ~3%）
+- **结论（2026-10-19）**：混合 1/2/4-bit 的 2bpw 比全 4bit 只快 ~13%——
+  1/2-bit kernel 的混合实现没有额外惩罚，decode 主要受每层/expert 固定开销
+  主导而非权重带宽（与 WxA8 路线「per-expert 循环开销占 MoE forward wall
+  ~80%」互证）。wxfp4 在 4bpw 上因全 4bit 池触发 WFF-1 fold 的显存账失效而
+  OOM（分块 fold 已修，驻留副本方案待拍板）。
+- 官方发布 FP8 / GPTQ-Int4 基线（用他们的 kernel：fbgemm-gpu / gptqmodel）
+  已接入同一 harness，独立环境 + 双卡注意项见
+  [roadmaps/throughput-bench-261019.md](roadmaps/throughput-bench-261019.md)
+- 明细与口径：[roadmaps/throughput-bench-261019.md](roadmaps/throughput-bench-261019.md)；
+  日志 1015.thrput.1（2bpw）/ 1018.thrput.1.w4（4bpw）
+
 ## 下游任务评测（lm-eval 七任务，对齐 BitsMoE 口径）
 
 2026-10 起用 lm-eval-harness 对 35B 2bpw checkpoint（260930-s1，三种 kernel 模式
@@ -301,6 +326,23 @@ WxFP8 同理（`convert_model_to_wxfp8`，码本 e4m3 LUT + cb_scale 搜索加�
 WxFP4 同理（`convert_model_to_wxfp4`，nibble LUT + 常量 e8m0 + norms×residual 副本
 + 索引折叠直存 e2m1 加载期算），四种模式读的是同一份 checkpoint，切换只是加载标志。
 
+### 5. 吞吐基准（prefill / decode）与官方基线
+
+```bash
+# 我们的 checkpoint（四种 kernel 模式，同一份；dart312-t38 环境）
+sh run.throughput.sh
+
+# 官方发布 FP8 / GPTQ-Int4 基线（用他们的 kernel；复用 dart312 = torch 2.9 栈，
+# 官方 kernel 包最新版按 torch 2.11 编译，版本必须钉死；⚠ 不能装进 dart312-t38）
+conda activate dart312
+pip install "gptqmodel==7.3.6" "fbgemm-gpu==1.4.0" "torchao==0.17.0" \
+            optimum "kernels==0.17.2"
+sh run.throughput.official.sh   # FP8 35GB 需双卡，脚本内已设好
+```
+
+口径与结果见性能一节「吞吐」小节与
+[roadmaps/throughput-bench-261019.md](roadmaps/throughput-bench-261019.md)。
+
 ## 路线图
 
 - **WxA16** ✅ 已完成（FP16 激活 + FP16 Tensor Core + 混合 bit 权重量化）
@@ -349,3 +391,11 @@ WxFP4 同理（`convert_model_to_wxfp4`，nibble LUT + 常量 e8m0 + norms×resi
     普通结构 MoE 大 B 部署可基本绕开全部条件
   - 详见 [roadmaps/wxfp4-plan-260924.md](roadmaps/wxfp4-plan-260924.md)
     与 [roadmaps/wxfp4-fold-plan-260927.md](roadmaps/wxfp4-fold-plan-260927.md)
+
+- **吞吐基准与外部基线**（2026-10-19 立项，进行中）
+  - bench_throughput.py P0 口径（batch=1 prefill/decode + cache 一致性守卫），
+    4bpw（全 4bit）vs 2bpw（1/2/4 混合）：decode 只差 ~13%，证明 1/2-bit
+    kernel 混合实现无额外惩罚；wxfp4 在 4bpw 上触发 fold 显存账失效（WFF-5）
+  - 官方 FP8 / GPTQ-Int4 基线接入（他们的 kernel：fbgemm-gpu / gptqmodel，
+    独立环境隔离依赖冲突）
+  - 详见 [roadmaps/throughput-bench-261019.md](roadmaps/throughput-bench-261019.md)
