@@ -195,7 +195,15 @@
     仍占可观比例，**§三.5 挂起的 TMA/persistent grouped（367→~490 TF
     空间）立项条件已被数据支持**，是否排期待本人定
 
-### WFF-5：4bpw 全 4bit 池下 OOM（2026-10-19 记录，处理中）
+### WFF-5：4bpw 全 4bit 池下 OOM（2026-10-20 已修复落地）
+
+- ~~驻留副本（本人已拍板：先不动，2026-10-19）~~ **2026-10-20 修复落地**：
+  `quantization/wxfp4/bit_partitioned_moe.py::_FOLD_BYTES_BUDGET`（64MB/层/
+  方向）——小池折叠（2bpw 的 bit1/4 长尾池，全模型 +47MB 不变）、大池跳过
+  fold 走 kernel 内 LUT 分支（`W_FOLDED=False`，同一 LUT 同一映射，bit-exact
+  A/B 验证 maxdiff 0）。4bpw wxfp4 首次可跑通（1018.thrput.6：pf2048 1567.3
+  / dec 11.12 / check PASS，为「逐 expert + 未折叠 LUT」双重旧路径叠加数字，
+  待 fp4 合并 kernel 接线后重测——合并版天然不需要 fold 副本）。
 
 - 2026-10-19（logs/1018.thrput.1.w4.log，bench git 99336b8+）：
   4bpw checkpoint（global-a4s4m4bpw，256 expert 全部 bit4）上 wxfp4 两次

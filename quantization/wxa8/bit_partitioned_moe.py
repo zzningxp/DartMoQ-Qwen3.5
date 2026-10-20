@@ -248,22 +248,6 @@ class WxA8BitPartitionedGroupMoE(WxA16BitPartitionedGroupMoE):
             x, bit_ctx, x_rot_by_bit, sorted_tokens, sorted_weights,
             tokens_per_expert, final_hidden_states, prof)
 
-    def _merged_pools_ok(self):
-        """合并路径前置：每个 bit 池内 expert 的 inter 切片一致。
-
-        合并 kernel 要求池内行切片（gate_up）与 group 切片（down）统一——
-        本模型 256 expert 同构（inter=512），仅防御性检查；未来若出现
-        池内变长 inter，回退逐 expert 并在此处记录。
-        """
-        sizes = {}
-        for expert_idx in range(self.num_experts):
-            for bit_str, _bit, start, end in self._active_bits_by_expert[expert_idx]:
-                s = end - start
-                if bit_str in sizes and sizes[bit_str] != s:
-                    return False
-                sizes[bit_str] = s
-        return True
-
     def _expert_compute_merged(self, x, bit_ctx, x_rot_by_bit, sorted_tokens,
                                sorted_weights, tokens_per_expert,
                                final_hidden_states, prof):
@@ -275,23 +259,10 @@ class WxA8BitPartitionedGroupMoE(WxA16BitPartitionedGroupMoE):
         顺序（对拍见 test/test_moe_merged_kernel.py，bit-exact）。
         """
         time_triton_total = 0.0
-        active_experts_count = 0
-        active_bits_count = 0
 
-        # 池 → 成员列表 [(expert_idx, bit, start, end, token_start, token_count)]
-        pools = {}
-        for expert_idx in range(self.num_experts):
-            token_start = (0 if expert_idx == 0
-                           else int(tokens_per_expert[expert_idx - 1]))
-            token_end = int(tokens_per_expert[expert_idx])
-            count = token_end - token_start
-            if count <= 0:
-                continue
-            active_experts_count += 1
-            for bit_str, bit, start, end in self._active_bits_by_expert[expert_idx]:
-                pools.setdefault(bit_str, []).append(
-                    (expert_idx, bit, start, end, token_start, count))
-                active_bits_count += 1
+        # 池/expert_info 构建走基类共享工具（wxfp8/wxa16/wxfp4 合并路径同型复用）
+        pools, active_experts_count, active_bits_count = self._merged_pools(
+            tokens_per_expert)
 
         for bit_str, members in pools.items():
             ctx = bit_ctx[bit_str]
@@ -325,11 +296,7 @@ class WxA8BitPartitionedGroupMoE(WxA16BitPartitionedGroupMoE):
                     extra_scale=ctx["gate_up_cb_step"])
 
             # 合并 gate_up（列切片 2*start / 2*inter，池内统一）
-            expert_info_gu = []
-            cursor = 0
-            for _e, _b, start, _e2, _ts, n in members:
-                expert_info_gu.append((cursor, n, 2 * start, 2 * inter))
-                cursor += n
+            expert_info_gu = self._merged_expert_info_rows(members)
 
             with prof.stage("merged_gate_up"):
                 t_k = time.time()
@@ -351,7 +318,7 @@ class WxA8BitPartitionedGroupMoE(WxA16BitPartitionedGroupMoE):
                 del gate, up
 
             # down：逐 expert 旋转量化（seed + start；v1 每 expert 一次 launch）
-            act_parts, xs_parts, expert_info_dn = [], [], []
+            act_parts, xs_parts = [], []
             cursor = 0
             for _e, _b, start, _e2, _ts, n in members:
                 act_e = act[cursor:cursor + n]
@@ -363,10 +330,9 @@ class WxA8BitPartitionedGroupMoE(WxA16BitPartitionedGroupMoE):
                     extra_scale=ctx["down_cb_step"])
                 act_parts.append(a_i8)
                 xs_parts.append(a_s)
-                expert_info_dn.append(
-                    (cursor, n, start // gs_dn, inter // gs_dn))
                 cursor += n
             del act
+            expert_info_dn = self._merged_expert_info_groups(members, gs_dn)
 
             with prof.stage("merged_down"):
                 t_k = time.time()

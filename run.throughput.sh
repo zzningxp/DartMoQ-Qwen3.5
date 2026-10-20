@@ -23,10 +23,10 @@ modelname="$PWD/models/qwen3.5-35B-4bpw-261016-gptq/"
 
 # python benchmarks/bench_throughput.py --quant-dir $modelname \
 #     --prefill-lens 16,128,2048,4096 --decode-tokens 256,512,1024
-python benchmarks/bench_throughput.py --quant-dir $modelname --mode wxa8 \
-    --prefill-lens 16,128,2048,4096 --decode-tokens 256,512,1024
-# python benchmarks/bench_throughput.py --quant-dir $modelname --mode wxfp8 \
+# python benchmarks/bench_throughput.py --quant-dir $modelname --mode wxa8 \
 #     --prefill-lens 16,128,2048,4096 --decode-tokens 256,512,1024
+python benchmarks/bench_throughput.py --quant-dir $modelname --mode wxfp8 \
+    --prefill-lens 16,128,2048,4096 --decode-tokens 256,512,1024
 # python benchmarks/bench_throughput.py --quant-dir $modelname --mode wxfp4 \
 #     --prefill-lens 16,128,2048,4096 --decode-tokens 256,512,1024
 
@@ -36,10 +36,10 @@ modelname="$PWD/models/qwen3.5-35B-4bpw-261016-turboquant/"
 
 # python benchmarks/bench_throughput.py --quant-dir $modelname \
 #     --prefill-lens 16,128,2048,4096 --decode-tokens 256,512,1024
-python benchmarks/bench_throughput.py --quant-dir $modelname --mode wxa8 \
-    --prefill-lens 16,128,2048,4096 --decode-tokens 256,512,1024
-# python benchmarks/bench_throughput.py --quant-dir $modelname --mode wxfp8 \
+# python benchmarks/bench_throughput.py --quant-dir $modelname --mode wxa8 \
 #     --prefill-lens 16,128,2048,4096 --decode-tokens 256,512,1024
+python benchmarks/bench_throughput.py --quant-dir $modelname --mode wxfp8 \
+    --prefill-lens 16,128,2048,4096 --decode-tokens 256,512,1024
 # python benchmarks/bench_throughput.py --quant-dir $modelname --mode wxfp4 \
 #     --prefill-lens 16,128,2048,4096 --decode-tokens 256,512,1024
 
@@ -49,9 +49,9 @@ modelname="$PWD/models/qwen3.5-2bpw-260930-s1/"
 
 # python benchmarks/bench_throughput.py --quant-dir $modelname \
 #     --prefill-lens 16,128,2048,4096 --decode-tokens 256,512,1024
-python benchmarks/bench_throughput.py --quant-dir $modelname --mode wxa8 \
-    --prefill-lens 16,128,2048,4096 --decode-tokens 256,512,1024
-# python benchmarks/bench_throughput.py --quant-dir $modelname --mode wxfp8 \
+# python benchmarks/bench_throughput.py --quant-dir $modelname --mode wxa8 \
 #     --prefill-lens 16,128,2048,4096 --decode-tokens 256,512,1024
+python benchmarks/bench_throughput.py --quant-dir $modelname --mode wxfp8 \
+    --prefill-lens 16,128,2048,4096 --decode-tokens 256,512,1024
 # python benchmarks/bench_throughput.py --quant-dir $modelname --mode wxfp4 \
 #     --prefill-lens 16,128,2048,4096 --decode-tokens 256,512,1024

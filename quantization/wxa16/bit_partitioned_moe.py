@@ -852,6 +852,69 @@ class WxA16BitPartitionedGroupMoE(nn.Module):
             t_compute_end=time.time(),
         )
 
+    # ------------------------------------- P5-2 合并路径共享工具（模式无关）
+
+    def _merged_pools_ok(self):
+        """合并路径前置：每个 bit 池内 expert 的 inter 切片一致。
+
+        合并 kernel 要求池内行切片（gate_up）与 group 切片（down）统一——
+        本模型 256 expert 同构（inter=512），仅防御性检查；未来若出现
+        池内变长 inter，回退逐 expert 并在此处记录。
+        """
+        sizes = {}
+        for expert_idx in range(self.num_experts):
+            for bit_str, _bit, start, end in self._active_bits_by_expert[expert_idx]:
+                s = end - start
+                if bit_str in sizes and sizes[bit_str] != s:
+                    return False
+                sizes[bit_str] = s
+        return True
+
+    def _merged_pools(self, tokens_per_expert):
+        """把 active (expert, bit) 组成按 bit 的池，供合并路径整池一次处理。
+
+        Returns:
+            (pools, active_experts_count, active_bits_count)，其中
+            pools: {bit_str: [(expert_idx, bit, start, end, token_start, count)]}
+            （成员按 expert 序排列，token 行段即各成员在 sorted_tokens 里的位置）
+        """
+        pools = {}
+        active_experts_count = 0
+        active_bits_count = 0
+        for expert_idx in range(self.num_experts):
+            token_start = (0 if expert_idx == 0
+                           else int(tokens_per_expert[expert_idx - 1]))
+            token_end = int(tokens_per_expert[expert_idx])
+            count = token_end - token_start
+            if count <= 0:
+                continue
+            active_experts_count += 1
+            for bit_str, bit, start, end in self._active_bits_by_expert[expert_idx]:
+                pools.setdefault(bit_str, []).append(
+                    (expert_idx, bit, start, end, token_start, count))
+                active_bits_count += 1
+        return pools, active_experts_count, active_bits_count
+
+    @staticmethod
+    def _merged_expert_info_rows(members):
+        """gate_up 的 expert_info（行切片语义）：slice = [2*start, +2*inter)。"""
+        inter = members[0][3] - members[0][2]
+        info, cursor = [], 0
+        for _e, _b, start, _e2, _ts, n in members:
+            info.append((cursor, n, 2 * start, 2 * inter))
+            cursor += n
+        return info
+
+    @staticmethod
+    def _merged_expert_info_groups(members, group_size):
+        """down 的 expert_info（in_features 切片语义）：slice = [start/gs, +inter/gs)。"""
+        inter = members[0][3] - members[0][2]
+        info, cursor = [], 0
+        for _e, _b, start, _e2, _ts, n in members:
+            info.append((cursor, n, start // group_size, inter // group_size))
+            cursor += n
+        return info
+
     def forward(self, hidden_states):
         """
         前向推理：按 expert 处理，对每个 bit 分别反量化 + GEMM。

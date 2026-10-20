@@ -45,3 +45,32 @@
 - 2026-10-20 深夜：**t38 正式数字（1018.thrput.4/5，均为 dart312-t38，check 全 PASS）**——4bpw wxa8 合并路径：pf2048 1603→3619.4（2.26×）、pf4096 2692→4898.8（1.82×）、decode 11.27→13.34（+18%）、ttft 0.794→0.322、MoE 段 57.3→41.3ms/step；prefill 已反超官方 GPTQ-Int4（3298）。2bpw wxa8 合并路径：pf2048 1611→3648.8（2.26×）、pf4096 2766→5186.8（1.88×）、decode 9.78→11.69（+19.5%）、MoE 段 63.2→46.6ms。同环境确认：4bpw decode 快 2bpw 14%、2bpw 长 prefill 快 5.9%（合并后带宽收益可见度从 +3% 提高到 +5.9%）。wxa16/wxfp8 未接线（「随后同型」）。
 - 2026-10-20 深夜：**WFF-5 修复落地**——`_FOLD_BYTES_BUDGET`（64MB/层/方向）小池折叠、大池跳过走 in-kernel LUT 分支（bit-exact A/B 验证，maxdiff 0）；2bpw wxfp4 全绿（小池折叠不变），4bpw wxfp4 重跑验证中。
 - 2026-10-20 深夜：**4bpw wxfp4 首个成功数字**（1018.thrput.6，check PASS）——pf2048 1567.3 / dec 11.12 / ttft 0.806 / MoE 58.8ms。为「逐 expert 路径 + 预算跳过 fold 的 in-kernel LUT」双重旧路径叠加，显著慢于合并版 wxa8（3619/13.34）；待 wxfp4 合并 kernel 同型接线后重测。注意 wxfp4 合并版的自然设计就是 in-kernel LUT + 合并 grid（不需要 fold 副本，4bpw 无 +10GB 代价）。
+- 2026-10-20 深夜（续）：**wxfp8 合并同型落地（待本人主流程验证）**——
+  `triton_kernels_fp8.py` 增 `_wxfp8_merged_kernel_gf` + 两个 merged wrapper
+  （block_info/expert_info 骨架复用 a8 的 `_build_merged_block_info`，import
+  不重复实现；fp8 语义三处差异：激活 tile e4m3 且 masked load 不给 other、
+  码本 e4m3 LUT、group 内 fp32 dot 直接累加）；wxa16 基类抽出模式无关共享
+  工具（`_merged_pools_ok` / `_merged_pools` / `_merged_expert_info_rows` /
+  `_merged_expert_info_groups`），wxa8 编排改调共享工具（行为零变化，模块
+  A/B 与 test_quant_io wxa8 段回归 bit-exact / relerr 0.01336 与记录一致），
+  WxFP8 加 `_expert_compute` 合并覆盖（精确类门控 + `DARTMOQ_MERGED_MOE`
+  开关，编排与 wxa8 逐点对应）。对拍（test_moe_merged_kernel.py，t38 自测）：
+  kernel 级 f8 decode/prefill × bit1/2/4 全 **bit-exact**；模块级 fp8 A/B
+  bit-exact（⚠ 形状必须 gs=128——fp8 kernel 的 masked load 不能给 other，
+  K 尾部未定义 lane 会污染有效输出，真实模型 gs=128 恒满足）；test_quant_io
+  WxFP8 段全绿（relerr 0.05042，合并路径默认开）。perf 预览（64 expert 真实
+  形状）：decode 3.16× / prefill 2.60×（wxa8 同批 3.16×/2.72×）。待本人
+  bench_throughput.py 全档（check PASS）+ ppl eval（与逐 expert 逐位一致）。
+- 2026-10-20（续）：**wxfp8 合并路径正式数字**（1018.thrput.7，git 11e7d11+，
+  check 全 PASS，t38）——4bpw：pf16 46.4→84.7–85.1、pf128 181–184→445–446.2、
+  pf2048 1606–1609→**3605.4–3620（2.25×）**、pf4096 2680–2686→**4932.2–4959.9
+  （1.84×）**、decode 11.30–11.43→**13.93–14.03（+23%）**、ttft 0.791–0.797→
+  0.36–0.361、MoE 段 39.9ms；2bpw：pf2048 1628.2→3590.9（2.20×）、pf4096
+  2785→5188.2（1.86×）、decode 9.92–9.93→11.62–11.64（+17%）、ttft 0.819→
+  0.404、MoE 段 46.8ms。判读：**4bpw wxfp8 decode 反超 wxa8 合并版**
+  （13.98 vs 13.34，+5%）——逐 expert 时代两模式 decode 持平（11.3 vs 11.3），
+  调度链消失后 FP8 Tensor Core 算力优势才兑现（MoE 段 39.9 vs 41.3ms）；
+  prefill 持平（3620 vs 3619.4），小 prefill（pf16 84.7 vs 111.5、pf128 445
+  vs 492.7）wxa8 仍更快；2bpw 两模式全档持平（bit2 主导、kernel 形态相同）；
+  与官方 FP8 decode 差距收窄至 **1.12×**（15.77/14.03）。ppl eval 待本人跑
+  （bit-exact 预期：合并 kernel 同 tile 分解同累加顺序，模块 A/B 已零差）。
