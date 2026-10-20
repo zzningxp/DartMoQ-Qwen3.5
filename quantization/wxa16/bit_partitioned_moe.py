@@ -752,6 +752,106 @@ class WxA16BitPartitionedGroupMoE(nn.Module):
             )
 
     @torch.no_grad()
+    def _expert_compute(self, x, bit_ctx, x_rot_by_bit, sorted_tokens,
+                        sorted_weights, tokens_per_expert, final_hidden_states, prof):
+        """expert 循环计算 + scatter 回写（默认实现：逐 expert）。
+
+        P5-2 重做：从 forward 原样抽出，允许子类整体覆盖为合并路径
+        （WxA8 的按 bit 池 grouped kernel）。返回计时计数与结束时刻，
+        字段与 forward 的 last_timings 对齐。
+        """
+        time_dequant_total = 0.0
+        time_gemm_total = 0.0
+        time_triton_total = 0.0
+        active_experts_count = 0
+        active_bits_count = 0
+
+        for expert_idx in range(self.num_experts):
+            # print(f"  [DEBUG] expert_idx: {expert_idx}", flush=True)
+            # t0 = time.time()
+            end_idx = tokens_per_expert[expert_idx]
+            start_idx = 0 if expert_idx == 0 else tokens_per_expert[expert_idx - 1]
+
+            if start_idx == end_idx:
+                continue
+
+            active_experts_count += 1
+
+            # 取当前 expert 的所有 token
+            exp_token_idx = sorted_tokens[start_idx:end_idx]
+            expert_weights = sorted_weights[start_idx:end_idx].unsqueeze(1)
+
+            # P6-2: expert_tokens 改为懒 gather —— 只有存在"未预旋转"的 bit 时才需要原始 x 切片。
+            # 全部 bit 都走预旋转时（本模型的主力场景），这次 gather 完全省掉。
+            expert_tokens = None
+            # P6-2: 去掉 torch.zeros_like(expert_tokens)（每层 256 次 8MB 分配）。
+            # 每个 expert 实际只有一个活跃 bit，首个 bit 的结果直接接管，后续 bit 才累加。
+            expert_out = None
+
+            # P6-2: 只遍历该 expert 真正活跃的 bit（预计算），
+            # 原先每层空转约 512 次 `actual_inter_size == 0` 的 continue。
+            for bit_str, bit, start, end in self._active_bits_by_expert[expert_idx]:
+                t_triton_start = time.time()
+                active_bits_count += 1
+
+                actual_inter_size = end - start
+                ctx = bit_ctx[bit_str]
+
+                # ========== 量化 matmul：gate_up → silu*up → down ==========
+                # 两个 matmul 抽成方法，WxA8 子类只覆盖这两处
+                gate_up_out, expert_tokens = self._gate_up_matmul(
+                    ctx, bit, bit_str, x, x_rot_by_bit,
+                    exp_token_idx, expert_tokens, start, end, prof,
+                )
+
+                with prof.stage("silu_mul"):
+                    gate_out = gate_up_out[:, :actual_inter_size]
+                    up_out = gate_up_out[:, actual_inter_size:]
+                    del gate_up_out
+
+                    act_out = F.silu(gate_out) * up_out
+                    del gate_out, up_out
+
+                down_out = self._down_matmul(ctx, bit, act_out, start, end, prof)
+                del act_out
+
+                # P6-2: 首个活跃 bit 直接接管输出，避免 zeros_like 预分配
+                if expert_out is None:
+                    expert_out = down_out
+                else:
+                    expert_out += down_out
+                    del down_out
+                t_triton_end = time.time()
+                time_triton_total += t_triton_end - t_triton_start
+                # print(f"    [DEBUG] bit: {bit}, time: {t_triton_end - t_triton_start:.4f}s", flush=True)
+                # ==========================================
+
+            # 该 expert 无任何活跃 bit（理论上不会发生，防御性跳过）
+            if expert_out is None:
+                del expert_weights, exp_token_idx
+                continue
+
+            # 累加回最终结果
+            # 用 index_add_ 替代 scatter_reduce_(sum)：
+            #   - 无需把 index 从 (M,) expand/repeat 到 (M, H)，省一次大张量分配+拷贝
+            #   - 语义完全等价（按行累加，dim=0）
+            with prof.stage("scatter"):
+                expert_out.mul_(expert_weights)
+                final_hidden_states.index_add_(0, exp_token_idx, expert_out)
+
+            del expert_out, expert_tokens, expert_weights, exp_token_idx
+            # t1 = time.time()
+            # print(f"    [DEBUG] expert_idx: {expert_idx}, time: {t1 - t0:.4f}s", flush=True)
+
+        return dict(
+            time_triton_total=time_triton_total,
+            time_dequant_total=time_dequant_total,
+            time_gemm_total=time_gemm_total,
+            active_experts_count=active_experts_count,
+            active_bits_count=active_bits_count,
+            t_compute_end=time.time(),
+        )
+
     def forward(self, hidden_states):
         """
         前向推理：按 expert 处理，对每个 bit 分别反量化 + GEMM。
@@ -859,82 +959,17 @@ class WxA16BitPartitionedGroupMoE(nn.Module):
                     x, bit_ctx, tokens_per_expert,
                 )
 
-        for expert_idx in range(self.num_experts):
-            # print(f"  [DEBUG] expert_idx: {expert_idx}", flush=True)
-            # t0 = time.time()
-            end_idx = tokens_per_expert[expert_idx]
-            start_idx = 0 if expert_idx == 0 else tokens_per_expert[expert_idx - 1]
-
-            if start_idx == end_idx:
-                continue
-
-            active_experts_count += 1
-
-            # 取当前 expert 的所有 token
-            exp_token_idx = sorted_tokens[start_idx:end_idx]
-            expert_weights = sorted_weights[start_idx:end_idx].unsqueeze(1)
-
-            # P6-2: expert_tokens 改为懒 gather —— 只有存在"未预旋转"的 bit 时才需要原始 x 切片。
-            # 全部 bit 都走预旋转时（本模型的主力场景），这次 gather 完全省掉。
-            expert_tokens = None
-            # P6-2: 去掉 torch.zeros_like(expert_tokens)（每层 256 次 8MB 分配）。
-            # 每个 expert 实际只有一个活跃 bit，首个 bit 的结果直接接管，后续 bit 才累加。
-            expert_out = None
-
-            # P6-2: 只遍历该 expert 真正活跃的 bit（预计算），
-            # 原先每层空转约 512 次 `actual_inter_size == 0` 的 continue。
-            for bit_str, bit, start, end in self._active_bits_by_expert[expert_idx]:
-                t_triton_start = time.time()
-                active_bits_count += 1
-
-                actual_inter_size = end - start
-                ctx = bit_ctx[bit_str]
-
-                # ========== 量化 matmul：gate_up → silu*up → down ==========
-                # 两个 matmul 抽成方法，WxA8 子类只覆盖这两处
-                gate_up_out, expert_tokens = self._gate_up_matmul(
-                    ctx, bit, bit_str, x, x_rot_by_bit,
-                    exp_token_idx, expert_tokens, start, end, prof,
-                )
-
-                with prof.stage("silu_mul"):
-                    gate_out = gate_up_out[:, :actual_inter_size]
-                    up_out = gate_up_out[:, actual_inter_size:]
-                    del gate_up_out
-
-                    act_out = F.silu(gate_out) * up_out
-                    del gate_out, up_out
-
-                down_out = self._down_matmul(ctx, bit, act_out, start, end, prof)
-                del act_out
-
-                # P6-2: 首个活跃 bit 直接接管输出，避免 zeros_like 预分配
-                if expert_out is None:
-                    expert_out = down_out
-                else:
-                    expert_out += down_out
-                    del down_out
-                t_triton_end = time.time()
-                time_triton_total += t_triton_end - t_triton_start
-                # print(f"    [DEBUG] bit: {bit}, time: {t_triton_end - t_triton_start:.4f}s", flush=True)
-                # ==========================================
-
-            # 该 expert 无任何活跃 bit（理论上不会发生，防御性跳过）
-            if expert_out is None:
-                del expert_weights, exp_token_idx
-                continue
-
-            # 累加回最终结果
-            # 用 index_add_ 替代 scatter_reduce_(sum)：
-            #   - 无需把 index 从 (M,) expand/repeat 到 (M, H)，省一次大张量分配+拷贝
-            #   - 语义完全等价（按行累加，dim=0）
-            with prof.stage("scatter"):
-                expert_out.mul_(expert_weights)
-                final_hidden_states.index_add_(0, exp_token_idx, expert_out)
-
-            del expert_out, expert_tokens, expert_weights, exp_token_idx
-            # t1 = time.time()
-            # print(f"    [DEBUG] expert_idx: {expert_idx}, time: {t1 - t0:.4f}s", flush=True)
+        # P5-2 重做：expert 循环抽成可整体覆盖的方法（WxA8 子类换成
+        # 按 bit 池合并的 grouped kernel 路径；本类默认实现 = 逐 expert 循环）
+        stats = self._expert_compute(
+            x, bit_ctx, x_rot_by_bit, sorted_tokens, sorted_weights,
+            tokens_per_expert, final_hidden_states, prof,
+        )
+        time_triton_total = stats["time_triton_total"]
+        time_dequant_total = stats["time_dequant_total"]
+        time_gemm_total = stats["time_gemm_total"]
+        active_experts_count = stats["active_experts_count"]
+        active_bits_count = stats["active_bits_count"]
 
         # Cleanup
         del flat_expert_indices, flat_expert_weights, flat_token_indices
@@ -943,7 +978,7 @@ class WxA16BitPartitionedGroupMoE(nn.Module):
         x_rot_by_bit.clear()
         del x_rot_by_bit
 
-        t_compute_end = time.time()
+        t_compute_end = stats["t_compute_end"]
         t4 = t_compute_end
 
         result = final_hidden_states.reshape(batch_size, seq_len, hidden_dim)

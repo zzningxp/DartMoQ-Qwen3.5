@@ -74,6 +74,11 @@ THROUGHPUT_DECODE_RE = re.compile(
     r"^\s*tokens=(?P<n>\d+)\s+wall tok/s = (?P<tokps>[-+0-9.eE]+)")
 THROUGHPUT_TTFT_RE = re.compile(r"^\s*TTFT = (?P<ttft>[-+0-9.eE]+)s")
 THROUGHPUT_CHECK_RE = re.compile(r"^Consistency check:\s*(?P<verdict>PASS|FAIL)")
+# checkpoint 标识：bench summary 的 checkpoint: 行。⚠ 只认 summary 行——
+# "Loading quantized checkpoint from:" 打印在**下一次**运行的 [model] 行
+# 之前，会泄漏进上一条（failed 无 summary 的）记录
+THROUGHPUT_CKPT_RE = re.compile(r"^checkpoint:\s+(?P<path>\S+)")
+CHECKPOINT_BPW_RE = re.compile(r"(\d+(?:\.\d+)?)\s*bpw", re.IGNORECASE)
 # 报告里以 total 开头的行只有 MoE stage 块的 total 行（_clean_line 会 strip
 # 行首空格，不能靠缩进判断块边界，直接匹配即可）
 THROUGHPUT_MOE_TOTAL_RE = re.compile(r"^\s*total\s+(?P<value>[-+0-9.eE]+)")
@@ -139,6 +144,8 @@ class RunRecord:
     ttft_s: str = ""
     check: str = ""
     moe_total_ms: str = ""
+    ckpt_path: str = ""
+    checkpoint_path: str = ""
     _fatal: bool = field(default=False, repr=False)
     # Temporary fields for accumulating time from old logs
     _layer_times: list[float] = field(default_factory=list, repr=False)
@@ -357,6 +364,13 @@ def parse_log(path: str) -> list[RunRecord]:
                     current.quantmode = tput_model_match.group("mode")
                     current.dataset = tput_model_match.group("dataset")
                     continue
+                tput_ckpt_match = THROUGHPUT_CKPT_RE.search(line)
+                if tput_ckpt_match:
+                    current.checkpoint_path = tput_ckpt_match.group("path")
+                    m = CHECKPOINT_BPW_RE.search(current.checkpoint_path)
+                    if m and not current.bpw:
+                        current.bpw = m.group(1)
+                    continue
                 tput_git_match = THROUGHPUT_GIT_RE.search(line)
                 if tput_git_match:
                     current.git_hash = tput_git_match.group("git_hash")
@@ -382,6 +396,14 @@ def parse_log(path: str) -> list[RunRecord]:
                 tput_moe_total = THROUGHPUT_MOE_TOTAL_RE.search(line)
                 if tput_moe_total:
                     current.moe_total_ms = tput_moe_total.group("value")
+                    continue
+                tput_ckpt_match = THROUGHPUT_CKPT_RE.search(line)
+                if tput_ckpt_match:
+                    current.ckpt_path = tput_ckpt_match.group("path")
+                    if not current.bpw:
+                        m = CHECKPOINT_BPW_RE.search(current.ckpt_path)
+                        if m:
+                            current.bpw = m.group(1)
                     continue
                 if FATAL_RE.search(line):
                     current._fatal = True
@@ -632,11 +654,19 @@ def _field_value(record: RunRecord, field: str) -> str:
 def _select_fields(records: list[RunRecord]) -> list[str]:
     """自适应选择展示列：按批次内容决定列集合。"""
     fields = list(COMMON_FIELDS)
-    if any(any(getattr(r, f) for r in records) for f in QUANT_EVAL_FIELDS):
+    # bpw 不触发 eval 列集：吞吐记录的 bpw 来自 checkpoint: 行（summary），
+    # 不是量化元数据，不应把 sli/qsch/rank 等 eval 列带出来
+    if any(any(getattr(r, f) for r in records)
+           for f in QUANT_EVAL_FIELDS if f != "bpw"):
         fields += QUANT_EVAL_FIELDS
     if any(r.is_throughput for r in records):
+        if any(r.bpw for r in records) and "bpw" not in fields:
+            fields.insert(fields.index("quantmode"), "bpw")
         if any(r.dataset for r in records):
             fields.append("dataset")
+        # 模型 bpw（checkpoint 路径提取，吞吐批次混合多 checkpoint 时也有意义）
+        if any(r.bpw for r in records) and "bpw" not in fields:
+            fields.insert(fields.index("quantmode"), "bpw")
         prefill_lens = sorted({L for r in records for L in r.prefill_tokps})
         decode_tiers = sorted({n for r in records for n in r.decode_tokps})
         fields += [f"prefill_tokps_{L}" for L in prefill_lens]

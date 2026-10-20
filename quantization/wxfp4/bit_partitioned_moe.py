@@ -53,6 +53,14 @@ class WxFP4BitPartitionedGroupMoE(WxA8BitPartitionedGroupMoE):
         moe._fp4_ctx_ready = None
         return moe
 
+    # WFF-5 修复（2026-10-20）：fold 预算。e2m1 折叠副本只在**小池**时值得
+    # 持有（2bpw 的 bit1/4 长尾池全模型仅 +47MB）；全 4bit 池（4bpw
+    # checkpoint）的副本 ≈ 全量 MoE 索引，40 层 ctx 缓存累计 ~+10GB 把
+    # 31.4GB 卡吃满（1018.thrput.4/5 两次 OOM 实测）。大池跳过 fold，
+    # kernel 走 in-kernel LUT 分支（W_FOLDED=False，同一 LUT 同一映射，
+    # 与折叠路径 bit-exact）——内存受限的 bit 级自适应。
+    _FOLD_BYTES_BUDGET = 64 * 1024 * 1024
+
     # ---------------------------------------------------------------- context
 
     def _get_bit_context(self, device):
@@ -87,8 +95,12 @@ class WxFP4BitPartitionedGroupMoE(WxA8BitPartitionedGroupMoE):
             # WFF-1：索引 → e2m1 load 期折叠（kernel 直读 W_FOLDED 分支，bit-exact；
             # bit4 零膨胀 / bit1 ×4 小池，全模型 +47MB 上限，见 fold plan §二）。
             # 新增 key 不替换 indices_packed_gf——共享 buffer 原样保留
-            gu["indices_e2m1_gf"] = fold_indices_to_e2m1(
-                gu["indices_packed_gf"], c["gate_up_nib"], bit, gs_gu)
+            # WFF-5：超预算的池不折叠（indices_e2m1_gf 缺席 → kernel 走
+            # in-kernel LUT 分支），见类级 _FOLD_BYTES_BUDGET 注释
+            gu_fold_bytes = gu["indices_packed_gf"].numel() * (4 // bit)
+            if gu_fold_bytes <= self._FOLD_BYTES_BUDGET:
+                gu["indices_e2m1_gf"] = fold_indices_to_e2m1(
+                    gu["indices_packed_gf"], c["gate_up_nib"], bit, gs_gu)
 
             gs_dn = c["down_group_size"]
             dn = c["down"]
@@ -99,8 +111,21 @@ class WxFP4BitPartitionedGroupMoE(WxA8BitPartitionedGroupMoE):
             c["down_ws"] = torch.full(
                 (n_dn, k_dn // 32), 127 + e0_d, dtype=torch.uint8, device=device)
             dn["norms_gf"] = (dn["norms_gf"].float() * resid_d).half().contiguous()
-            dn["indices_e2m1_gf"] = fold_indices_to_e2m1(
-                dn["indices_packed_gf"], c["down_nib"], bit, gs_dn)
+            dn_fold_bytes = dn["indices_packed_gf"].numel() * (4 // bit)
+            if dn_fold_bytes <= self._FOLD_BYTES_BUDGET:
+                dn["indices_e2m1_gf"] = fold_indices_to_e2m1(
+                    dn["indices_packed_gf"], c["down_nib"], bit, gs_dn)
+
+        if not getattr(self, "_fold_skip_logged", False):
+            self._fold_skip_logged = True
+            skipped = [
+                bit_str for bit_str, c in ctx.items()
+                if (int(bit_str) in self.FP4_BITS
+                    and "indices_e2m1_gf" not in c["gate_up"])
+            ]
+            if skipped:
+                print(f"  [wxfp4] WFF-5 budget: fold skipped for bit pools "
+                      f"{skipped} (in-kernel LUT path)", flush=True)
 
         self._fp4_ctx_ready = ctx
         return ctx

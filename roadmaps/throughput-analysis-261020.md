@@ -18,6 +18,16 @@ tok/s（越高越快）。硬件 RTX 5090 ×2（带宽 ~1.79TB/s/卡，显存 31
 实际只需激活的 ~4GB（~2-3ms）；FP8 35GB 双卡激活 ~5GB——**所有路径的
 decode 都远高于带宽下限（>20×），全部是开销主导而非带宽主导**。
 
+**decode 开销的构成（B=1，2026-10-20 修正口径）**：每 token 每层激活 8 个
+专家、40 层 = **320 次专家迭代**。纯 kernel launch 约 5µs × ~2000 次 ≈
+10ms，占比不大；真正贵的是每次专家迭代外面裹的 **Python/torch 调度小算子
+链**（切片、gather、silu、乘、scatter），每个算子 dispatch 10-30µs 且
+B=1 时工作量趋近零、开销一分不少——320 次 × ~10 个算子 ≈ **40-90ms**，
+与实测 MoE 段 57.3ms 对上。即：decode 贵在 launch 外面的调度链，不只是
+launch 本身。（B=32 的 eval profile 结论「warm 循环 GPU-bound」与 B=1 的
+调度链主导并存——小 B 时算子工作量→0 但 dispatch 不变，开销占比反超；
+大 B 时 GPU 时间重新盖过调度链。）
+
 ## 1）官方 FP8 为什么这么快（pf2048 10009 vs 我们 1603，6.2×）
 
 - **kernel 形态是根因**：transformers 5.20 的 finegrained-fp8 kernel 提供
@@ -39,11 +49,20 @@ decode 都远高于带宽下限（>20×），全部是开销主导而非带宽�
 prefill 6.2×（单卡等价 3.1×）、decode 1.4×。拆 88.7ms/step（MoE 57.3ms
 占 65%）与 pf2048 的 32ms/层：
 
-1. **MoE per-expert 固定开销（主因）**：WxA8 路线 profile 结论「per-expert
-   循环开销占 MoE forward wall ~80%」——256 expert 的 init/router/sort/
-   scatter/逐 expert launch 是结构性开销。fp8 引擎 grouped kernel 把这些
-   全部摊薄成一次（或少数几次）launch。权重压到 4bit 省的是带宽，而
-   decode/prefill 都不缺带宽（见基础量表），省不到开销上。
+1. **MoE kernel 形态（主因）**：main 上逐 expert 循环是唯一路径，代价随 B
+   两头爆：**小 B（decode）**：320 次专家迭代 × 每次 ~10 个 Python/torch
+   调度小算子（切片/gather/silu/乘/scatter，每个 10-30µs、工作量→0）≈
+   40-90ms，对上实测 57.3ms——launch 本身（~10ms）不是大头；**大 B
+   （eval/prefill）**：小 kernel SM 填不满（gate_up 256 programs /
+   170 SM = 1.51 波，尾波利用率 50.6%，backlog §4.3 实测）+ 串行链 ×256。
+   fp8 引擎 grouped kernel 一次覆盖全部 active expert，launch 与调度链
+   同时消失、SM 填满。
+   **P5-2 注脚**：按 bit 合并多 expert 的 v2 kernel 已做过但在 `opt-p5-2`
+   分支，真实 eval 变慢（269.4→288.6s）被否、未并入 main；否决发生在
+   P5-3 tile 调优之前（当时还是 B=32 旧配置），SM 填充度证据说明合并动机
+   仍成立，「新配置下重测 P5-2」挂在 backlog §4.3——官方 grouped kernel
+   正是该方向的正确完成态，本次对比是其外部佐证；且合并 kernel 同时
+   消灭 decode 的调度链与 prefill 的填充度问题，双场景受益。
 2. **4bpw 的 attention 更重**：`global-a4s4m4bpw` 的 qscheme attn=[4]，
    attention 是 4-bit Lloyd-Max 码本（非均匀）→ 不能转 WxA8（量化日志
    "Converted to WxA8: 40 MoE layers, 0 attention/shared linears"），
@@ -51,12 +70,14 @@ prefill 6.2×（单卡等价 3.1×）、decode 1.4×。拆 88.7ms/step（MoE 57.
    attention 是 8-bit 均匀码本（identity，免查表），反而轻。
 3. **激活量化链**：我们 wxa8 每层 per-token-per-group 旋转+量化（已 hoist
    优化）；官方 dynamic fp8 是 per-tensor 缩放直进 tensor core。
-4. **decode 差距小（1.4×）而 prefill 差距大（3.1×/卡）**：说明我们的小 B
-   kernel（P5-3 autotune、B 自适应）在 decode 场景撑住了相当一部分，输的
-   主要是 prefill 的 kernel 形态。
+4. **decode 差距小（1.4×）而 prefill 差距大（3.1×/卡）的机制**：decode
+   单 token 只激活 6-8 个专家——sort/scatter 数据量与循环长度小一个量级，
+   且我们小 B tile 配置是 P5-3 专门调过的；fp8 侧 decode 每步还付跨卡
+   同步。prefill 是 256 expert 全激活、逐 expert 串行被放大的场景。
 
-方向：差距的杠杆在「多 expert 合并/grouped kernel」（P5 系长期方向），以及
-attention 均匀码本（4bit attention 无法转 wxa8 是 4bpw 配置特有的坑）。
+方向：杠杆在 grouped/合并 kernel 的**正确形态**（P5-2 重测挂在 backlog
+§4.3，需带 P5-3 新配置），以及 4bpw 配置的 attention 均匀码本（4bit
+Lloyd-Max 无法转 wxa8 是该配置特有的坑）。
 
 ## 3）我们的 2bpw 为什么比 4bpw 慢（decode -13%，仅 pf4096 +3%）
 

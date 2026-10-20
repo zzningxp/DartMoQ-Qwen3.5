@@ -796,3 +796,273 @@ def wxa8_matmul_grouped_gf(
         group_size, num_groups, bit_width, "attn",
         identity_cb=identity_cb, cfg=cfg,
     )
+
+
+# ===========================================================================
+# P5-2 重做：按 bit 池合并多 expert 的 grouped kernel（2026-10-20）
+#
+# 动机（throughput-analysis-261020.md）：decode 每步 MoE 段 57.3ms 由
+# 「320 次专家迭代 × ~10 个 Python/torch 调度小算子」主导（launch 本身
+# ~10ms 不是大头）；prefill 由小 kernel SM 填充不足（单 expert 1.51 波）
+# 主导。官方 FP8 的 grouped kernel 一次覆盖全部 active expert。
+#
+# 方案：同一 bit 池的所有 expert 合并进一次 kernel launch。
+#   - token 已按 expert 排序（sorted_tokens），x 被 gather 成扁平
+#     (B_total, K) 连续布局（每 bit 池一次 gather）
+#   - expert_info (E, 4) int32: [token_start, token_count, row_start, row_count]
+#     row_start/row_count 是 expert 在共享 indices/norms 上的列（行）切片
+#   - block_info (num_blocks, 3) int32: [expert_idx, block_b, block_n]，
+#     host 端预计算；1D grid，每 block 先读自己的 (expert, tile) 映射
+#   - 输出扁平 (B_total, N_slice) 连续布局（本模型同 bit 池内 expert
+#     inter_size 一致，行与列切片都连续），silu/scatter 整块一次做完
+#
+# 数学与逐 expert 路径完全一致：同一 tile 分解（BLOCK_B/BLOCK_N/BLOCK_K
+# 同表）、同一累加顺序 → 期望 bit-exact。
+# ===========================================================================
+
+
+@triton.jit
+def _wxa8_merged_kernel_gf(
+    # Input
+    x_ptr,            # (B_total, K_total) int8 —— gather 后扁平连续
+    xs_ptr,           # (B_total, NUM_GROUPS) fp32 —— 行与 x 对齐
+    # Quantized weight (group-first 布局，本 bit 池共享)
+    indices_ptr,      # (NUM_GROUPS_TOTAL, N_total, PACKED_PER_GROUP) uint8
+    codebook_ptr,     # (n_levels,) int8
+    norms_ptr,        # (NUM_GROUPS_TOTAL, N_total) fp16（1/sqrt(gs) 已预乘）
+    # Expert / block 布局
+    expert_info_ptr,  # (E, 4) int32: [token_start, token_count, slice_start, slice_count]
+    block_info_ptr,   # (num_blocks, 3) int32: [expert_idx, block_b, block_n]
+    # Output
+    output_ptr,       # (B_total, N_slice) fp16 扁平连续，行 stride = OUT_ROW_STRIDE
+    # Shape / strides
+    B_total, K_total, N_LIMIT,
+    INDICES_G0_STRIDE, NORMS_G0_STRIDE, XS_ROW_STRIDE, OUT_ROW_STRIDE,
+    # Constexpr config
+    GROUP_SIZE: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,     # 本 expert 的有效 group 数
+    BIT_WIDTH: tl.constexpr,
+    N_LEVELS: tl.constexpr,
+    SLICE_IS_GROUPS: tl.constexpr = False,
+    BLOCK_B: tl.constexpr = 64,
+    BLOCK_N: tl.constexpr = 32,
+    BLOCK_K: tl.constexpr = 128,
+):
+    """按 bit 池合并多 expert 的 WxA8 grouped GEMM（双模式）。
+
+    SLICE_IS_GROUPS=False（gate_up / 行切片）：slice_start/slice_count 是
+    expert 在共享 indices/norms 上的**列**切片（rn 从 slice_start 起，输出
+    列回到 [0, slice_count)），K 维是完整的 in_features（每 expert 相同）。
+    SLICE_IS_GROUPS=True（down / in_features 切片）：slice_start/slice_count
+    是 **group** 切片（indices/norms 从全局 group slice_start 起），K 维
+    已是切片后的 inter（x 的列与 xs 都按切片后的 group 排布），N 维完整。
+    行维两模式一致：从 token_start 起（B 维是 gather 后的扁平 token 序）。
+
+    与 _wxa8_fused_matmul_kernel_grouped_gf 的 tile 数学完全一致（同一
+    tile 分解、同一累加顺序）→ 期望与逐 expert 路径 bit-exact。
+    """
+    pid = tl.program_id(0)
+    bi = block_info_ptr + pid * 3
+    eid = tl.load(bi + 0).to(tl.int32)
+    blk_b = tl.load(bi + 1).to(tl.int32)
+    blk_n = tl.load(bi + 2).to(tl.int32)
+
+    ei = expert_info_ptr + eid * 4
+    token_start = tl.load(ei + 0).to(tl.int32)
+    token_count = tl.load(ei + 1).to(tl.int32)
+    slice_start = tl.load(ei + 2).to(tl.int32)
+    slice_count = tl.load(ei + 3).to(tl.int32)
+
+    rb = token_start + blk_b * BLOCK_B + tl.arange(0, BLOCK_B)
+    mask_b = rb < token_start + token_count
+
+    if SLICE_IS_GROUPS:
+        # down：N 维完整（从 0 起），group 维按 slice_start 偏移
+        rn = blk_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    else:
+        # gate_up：N 维是共享权重的列切片，从 slice_start 起
+        rn = slice_start + blk_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = rn < N_LIMIT
+
+    total_acc = tl.zeros((BLOCK_B, BLOCK_N), dtype=tl.float32)
+
+    ELEMENTS_PER_BYTE = 8 // BIT_WIDTH
+    PACKED_PER_GROUP = GROUP_SIZE // ELEMENTS_PER_BYTE
+    row_base = rn * PACKED_PER_GROUP
+
+    for g in range(NUM_GROUPS):
+        g_global = (slice_start + g) if SLICE_IS_GROUPS else g
+        g_start = g * GROUP_SIZE
+        g_base = g_global * INDICES_G0_STRIDE
+
+        norm_g = tl.load(norms_ptr + g_global * NORMS_G0_STRIDE + rn,
+                         mask=mask_n, other=0.0)
+        xs_g = tl.load(xs_ptr + rb * XS_ROW_STRIDE + g, mask=mask_b, other=0.0)
+
+        acc_i = tl.zeros((BLOCK_B, BLOCK_N), dtype=tl.int32)
+
+        for k_start in range(0, GROUP_SIZE, BLOCK_K):
+            rk = k_start + tl.arange(0, BLOCK_K)
+            mask_k = rk < GROUP_SIZE
+
+            inp_off = rb[:, None] * K_total + (g_start + rk)[None, :]
+            x_tile = tl.load(x_ptr + inp_off,
+                             mask=mask_b[:, None] & mask_k[None, :], other=0)
+
+            w_mask = mask_n[:, None] & mask_k[None, :]
+            if BIT_WIDTH == 8:
+                byte_off = g_base + row_base[:, None] + rk[None, :]
+                idx = tl.load(indices_ptr + byte_off, mask=w_mask, other=0).to(tl.int32)
+            else:
+                BIT_MASK = (1 << BIT_WIDTH) - 1
+                byte_col = rk // ELEMENTS_PER_BYTE
+                pos_in_byte = rk % ELEMENTS_PER_BYTE
+                byte_off = g_base + row_base[:, None] + byte_col[None, :]
+                packed = tl.load(indices_ptr + byte_off, mask=w_mask, other=0).to(tl.uint8)
+                shift = pos_in_byte * BIT_WIDTH
+                idx = ((packed >> shift[None, :]) & BIT_MASK).to(tl.int32)
+
+            w_i8 = tl.load(codebook_ptr + idx, mask=w_mask, other=0)
+
+            acc_i += tl.dot(x_tile, tl.trans(w_i8), out_dtype=tl.int32)
+
+        total_acc += acc_i.to(tl.float32) * xs_g[:, None] * norm_g[None, :]
+
+    # 输出列坐标回到扁平缓冲（down 模式 rn 已从 0 起，rows 模式回退 slice_start）
+    out_col = (rn - slice_start) if not SLICE_IS_GROUPS else rn
+    out_off = rb[:, None] * OUT_ROW_STRIDE + out_col[None, :]
+    tl.store(output_ptr + out_off, total_acc.to(output_ptr.dtype.element_ty),
+             mask=mask_b[:, None] & mask_n[None, :])
+
+
+def _build_merged_block_info(expert_info, BLOCK_B, BLOCK_N, n_extent, device):
+    """host 端预计算 block_info：(num_blocks, 3) int32 [expert_idx, block_b, block_n]。
+
+    n_extent 是 N 方向（列）的 tile 覆盖范围：rows 模式 = 每 expert 的列切片
+    宽（2*inter）；in_features 模式 = 完整输出列数 N（hidden）。token 方向
+    按各 expert 的 token_count 切。合并后总 grid = num_blocks（1D）。
+    """
+    blocks = []
+    for e, (token_start, token_count, slice_start, slice_count) in enumerate(expert_info):
+        if token_count <= 0 or slice_count <= 0:
+            continue
+        n_b = (token_count + BLOCK_B - 1) // BLOCK_B
+        n_n = (n_extent + BLOCK_N - 1) // BLOCK_N
+        for b in range(n_b):
+            for n in range(n_n):
+                blocks.append((e, b, n))
+    if not blocks:
+        raise ValueError("merged kernel: empty block list (no active experts)")
+    return torch.tensor(blocks, dtype=torch.int32, device=device).contiguous()
+
+
+def wxa8_matmul_merged_rows_gf(
+    x_i8, x_scale, indices_packed_gf, codebook_i8, norms_gf,
+    expert_info, group_size, in_features, bit_width: int = 2,
+    norms_prescaled: bool = True, cfg=None,
+):
+    """gate_up 合并版：同一 bit 池所有 expert 一次 launch（行切片语义）。
+
+    与逐 expert 的 wxa8_matmul_grouped_slice_rows_gf 逐段等价（数学
+    bit-exact 期望）。x_i8 已按 sorted_tokens gather 成 (B_total, K) 扁平
+    布局，x_scale 行对齐；expert_info 里 row_start/row_count 是该 expert
+    在共享 indices/norms 上的列切片（主流程为 e*2*inter / 2*inter）。
+
+    Returns:
+        output: (B_total, 2*inter) fp16 扁平连续（按 expert 顺序行拼接）
+    """
+    if bit_width not in {1, 2, 4, 8}:
+        raise ValueError(f"bit_width must be 1/2/4/8, got {bit_width}")
+    if in_features % group_size != 0:
+        raise ValueError(
+            f"WxA8 要求 in_features ({in_features}) 对齐 group_size ({group_size})")
+
+    expert_info = [tuple(int(v) for v in row) for row in expert_info]
+    B_total = x_i8.shape[0]
+    num_groups = in_features // group_size
+    # 同 bit 池内 inter_size 一致 → N_slice = row_count 统一
+    n_slice = expert_info[0][3] if expert_info else 0
+    if any(row[3] != n_slice for row in expert_info):
+        raise ValueError(
+            f"merged rows kernel 要求池内列切片一致（inter_size 相同），"
+            f"得到 row_count 集合 {sorted({row[3] for row in expert_info})}")
+
+    norms_full = norms_gf if norms_prescaled else (
+        norms_gf.float() / math.sqrt(group_size))
+
+    BLOCK_B, BLOCK_N, BLOCK_K, num_warps, num_stages = (
+        cfg if cfg is not None
+        else get_wxa8_config(bit_width, direction="gate_up", B=B_total))
+
+    block_info = _build_merged_block_info(expert_info, BLOCK_B, BLOCK_N,
+                                          n_slice, x_i8.device)
+    out = torch.empty(B_total, n_slice, dtype=torch.float16, device=x_i8.device)
+    n_limit = max(row[2] for row in expert_info) + n_slice
+
+    _wxa8_merged_kernel_gf[(block_info.shape[0],)](
+        x_i8, x_scale, indices_packed_gf, codebook_i8, norms_full,
+        torch.tensor(expert_info, dtype=torch.int32, device=x_i8.device),
+        block_info, out,
+        B_total, x_i8.shape[1], n_limit,
+        indices_packed_gf.stride(0), norms_full.stride(0), x_scale.stride(0),
+        out.stride(0),
+        GROUP_SIZE=group_size, NUM_GROUPS=num_groups,
+        BIT_WIDTH=bit_width, N_LEVELS=codebook_i8.shape[0],
+        BLOCK_B=BLOCK_B, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        num_warps=num_warps, num_stages=num_stages,
+    )
+    return out
+
+
+def wxa8_matmul_merged_in_features_gf(
+    x_i8, x_scale, indices_packed_gf, codebook_i8, norms_gf,
+    expert_info, group_size, bit_width: int = 2,
+    norms_prescaled: bool = True, cfg=None,
+):
+    """down 合并版：同一 bit 池所有 expert 一次 launch（in_features 切片语义）。
+
+    x_i8 已按 expert 顺序拼接成 (B_total, inter) 扁平布局（每 expert 的
+    激活已用 seed+original_start 旋转并量化，v1 由调用方逐 expert 调
+    rotate_quantize_fused）；expert_info 里 row_start/row_count 是 group
+    维切片（主流程为 e*inter/gs / inter/gs），列 N 是共享的完整 hidden。
+
+    Returns:
+        output: (B_total, N) fp16 扁平连续（按 expert 顺序行拼接）
+    """
+    if bit_width not in {1, 2, 4, 8}:
+        raise ValueError(f"bit_width must be 1/2/4/8, got {bit_width}")
+
+    expert_info = [tuple(int(v) for v in row) for row in expert_info]
+    B_total = x_i8.shape[0]
+    g_count = expert_info[0][3] if expert_info else 0
+    if any(row[3] != g_count for row in expert_info):
+        raise ValueError(
+            f"merged in_features kernel 要求池内 group 切片一致（inter_size "
+            f"相同），得到集合 {sorted({row[3] for row in expert_info})}")
+
+    norms_slice = norms_gf if norms_prescaled else (
+        norms_gf.float() / math.sqrt(group_size))
+    N = norms_slice.shape[1]
+
+    BLOCK_B, BLOCK_N, BLOCK_K, num_warps, num_stages = (
+        cfg if cfg is not None
+        else get_wxa8_config(bit_width, direction="down", B=B_total))
+
+    block_info = _build_merged_block_info(expert_info, BLOCK_B, BLOCK_N,
+                                          N, x_i8.device)
+    out = torch.empty(B_total, N, dtype=torch.float16, device=x_i8.device)
+
+    _wxa8_merged_kernel_gf[(block_info.shape[0],)](
+        x_i8, x_scale, indices_packed_gf, codebook_i8, norms_slice,
+        torch.tensor(expert_info, dtype=torch.int32, device=x_i8.device),
+        block_info, out,
+        B_total, x_i8.shape[1], N,
+        indices_packed_gf.stride(0), norms_slice.stride(0), x_scale.stride(0),
+        out.stride(0),
+        GROUP_SIZE=group_size, NUM_GROUPS=g_count,
+        BIT_WIDTH=bit_width, N_LEVELS=codebook_i8.shape[0],
+        SLICE_IS_GROUPS=True,
+        BLOCK_B=BLOCK_B, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        num_warps=num_warps, num_stages=num_stages,
+    )
+    return out

@@ -116,23 +116,28 @@ cache 路径；每条结果都经过 cache-vs-full logits 一致性守卫（chec
 | 官方 FP8（双卡） | 215.6 | 1657.9 | 10009.8 | 10082.3 | 15.77 / 15.82 / 15.84 | 0.142 | PASS |
 | 官方 GPTQ-Int4（单卡） | 51.7 | 329.2 | 3298.6 | 4941.3 | 3.93 / 3.95 / 3.94 | 0.644 | PASS |
 | 4bpw wxa16（全 4bit） | 43 | 163 | 1416–1428 | 2403–2411 | 11.00–11.13 | 0.884–0.888 | PASS |
-| 4bpw wxa8 | 46.2–46.4 | 181 | 1604–1611 | 2692–2701 | 11.26–11.39 | 0.794–0.796 | PASS |
+| 4bpw wxa8 | 111.5 | 492.7 | **3619.4** | **4898.8** | **13.33–13.36** | **0.322** | PASS |
+| 4bpw wxa8（逐 expert，旧基线） | 46.2–46.4 | 181 | 1604–1611 | 2692–2701 | 11.26–11.39 | 0.794–0.796 | PASS |
 | 4bpw wxfp8 | 46.4–46.5 | 181–184 | 1606–1609 | 2680–2686 | 11.30–11.43 | 0.791–0.797 | PASS |
-| 4bpw wxfp4 | — | — | — | — | OOM（WFF-5，见 throughput-bench §二） | — | — |
+| 4bpw wxfp4（逐 expert + LUT） | 45.4 | 178.6 | 1567.3 | 2641.0 | 11.12–11.14 | 0.806 | PASS |
 | 2bpw wxa16（1/2/4 混合） | 43 | 160.3 | 1421.7 | 2421.6 | 10.91–10.97 | 0.890 | PASS |
-| 2bpw wxa8 | 44.6 | 177.6 | 1611.2 | 2765.6 | 9.78–9.84 | 0.824 | PASS |
+| 2bpw wxa8 | 77.9 | 407.2 | **3648.8** | **5186.8** | **11.69** | **0.406** | PASS |
+| 2bpw wxa8（逐 expert，旧基线） | 44.6 | 177.6 | 1611.2 | 2765.6 | 9.78–9.84 | 0.824 | PASS |
 | 2bpw wxfp8 | 45.2 | 180.6 | 1628.2 | 2785.0 | 9.92–9.93 | 0.819 | PASS |
 | 2bpw wxfp4 | 44.9 | 176.8 | 1611.5 | 2760.6 | 9.95–9.96 | 0.824 | PASS |
 
-- **4bpw vs 2bpw**：decode 4bpw 快 ~13%（11.27 vs 9.78 tok/s），短 prefill 也
-  略快，只有 pf4096 2bpw 赢回 3%——低 bit 混合路径（1/2-bit 解包 + per-bit
-  分池）的固定开销在开销主导的场景里净亏，带宽收益只在长 prefill 兑现
-- **官方 FP8 prefill 快 6.2×（单卡等价 ~3.1×）**：grouped 融合 fp8 kernel
-  （一次 launch 覆盖全部 active expert）+ BF16 attention + 双卡红利；
-  decode 差距收窄到 1.4×——小 B 场景我们的小 B 专优 kernel 撑住了
-- **官方 Int4 prefill 快 2.06×、decode 慢 2.9×**：TritonV2 是大 B GEMM
-  kernel，batch=1 崩到 254ms/step；数字是 transformers 生态口径，不代表
-  vLLM moe_wna16 上限
+- **P5-2 合并路径（2026-10-20 落地，仅 wxa8）**：按 bit 池合并多 expert 为单次
+  grouped kernel launch，消灭逐 expert 的 Python/torch 调度链——4bpw 与 2bpw
+  的 prefill 均 **2.26×**、decode **+18~19.5%**、MoE 段 57.3→41.3ms（4bpw）；
+  prefill 反超官方 GPTQ-Int4，与官方 FP8 的差距收窄到 decode 1.18× / prefill
+  单卡等价 ~1.4×。`DARTMOQ_MERGED_MOE=0` 可回退逐 expert 对照；
+  wxfp8/wxa16/wxfp4 的合并同型为下一步
+- **4bpw vs 2bpw**（同合并路径）：decode 4bpw 快 ~14%（13.34 vs 11.69），
+  2bpw 仅 pf4096 赢回 5.9%——低 bit 混合路径（1/2-bit 解包 + per-bit 分池）
+  的固定开销在开销主导的场景里净亏，带宽收益只在长 prefill 兑现（合并后
+  带宽收益可见度从 +3% 提高到 +5.9%）
+- 4bpw wxfp4 为「逐 expert + WFF-5 预算跳过 fold 的 in-kernel LUT」双重旧路径
+  叠加的数字（首个可跑通的 4bpw wxfp4，此前 OOM），待 fp4 合并接线后重测
 - 全部差异的逐项分析（四个问题的根因拆解）见
   [roadmaps/throughput-analysis-261020.md](roadmaps/throughput-analysis-261020.md)
 - 口径与明细：[roadmaps/throughput-bench-261019.md](roadmaps/throughput-bench-261019.md)；
