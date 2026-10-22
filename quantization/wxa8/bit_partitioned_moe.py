@@ -264,98 +264,12 @@ class WxA8BitPartitionedGroupMoE(WxA16BitPartitionedGroupMoE):
         pools, active_experts_count, active_bits_count = self._merged_pools(
             tokens_per_expert)
 
+        # 逐池分派（_merged_pool_compute 默认 = 本类 int8 语义；WxFP4 覆盖
+        # 为 fp4 池走 e2m1 合并 kernel、其余 bit 继承本实现）
         for bit_str, members in pools.items():
-            ctx = bit_ctx[bit_str]
-            bit = members[0][1]
-            inter = members[0][3] - members[0][2]
-            gs_gu = ctx["gate_up_group_size"]
-            in_f = ctx["gate_up_in_features"]
-            gs_dn = ctx["down_group_size"]
-
-            # 池内 token/权重（各成员行段按序拼接，一次 gather）
-            pool_tokens = torch.cat(
-                [sorted_tokens[ts:ts + n] for _e, _b, _s, _e2, ts, n in members])
-            pool_weights = torch.cat(
-                [sorted_weights[ts:ts + n] for _e, _b, _s, _e2, ts, n in members])
-
-            # gate_up 输入：hoisted 则整池切片；否则整池一次旋转+量化
-            hoisted = x_rot_by_bit.get(bit_str)
-            if hoisted is not None:
-                x_i8_all, x_scale_all = hoisted
-                x_pool_i8 = x_i8_all[pool_tokens]
-                x_pool_scale = x_scale_all[pool_tokens]
-            else:
-                src = x[pool_tokens]
-                if src.dtype != torch.float16:
-                    src = src.half()
-                rot = generate_batch_rotation_matrices(
-                    gs_gu, ctx["gate_up_seed"], in_f // gs_gu, stride=gs_gu,
-                    device=src.device, dtype=torch.float16)
-                x_pool_i8, x_pool_scale = rotate_quantize_fused(
-                    src, rot, gs_gu, in_f // gs_gu,
-                    extra_scale=ctx["gate_up_cb_step"])
-
-            # 合并 gate_up（列切片 2*start / 2*inter，池内统一）
-            expert_info_gu = self._merged_expert_info_rows(members)
-
-            with prof.stage("merged_gate_up"):
-                t_k = time.time()
-                gu = wxa8_matmul_merged_rows_gf(
-                    x_pool_i8, x_pool_scale,
-                    ctx["gate_up"]["indices_packed_gf"], ctx["gate_up_cb_i8"],
-                    ctx["gate_up"]["norms_gf"],
-                    expert_info_gu, gs_gu, in_f,
-                    bit_width=bit,
-                    norms_prescaled=ctx["gate_up_norms_prescaled"])
-                time_triton_total += time.time() - t_k
-
-            # silu×up 一次（整池扁平输出，gate 前 inter 列 up 后 inter 列）
-            with prof.stage("silu_mul"):
-                gate = gu[:, :inter]
-                up = gu[:, inter:]
-                del gu
-                act = F.silu(gate) * up
-                del gate, up
-
-            # down：逐 expert 旋转量化（seed + start；v1 每 expert 一次 launch）
-            act_parts, xs_parts = [], []
-            cursor = 0
-            for _e, _b, start, _e2, _ts, n in members:
-                act_e = act[cursor:cursor + n]
-                rot = generate_batch_rotation_matrices(
-                    gs_dn, ctx["down_seed"] + start, inter // gs_dn,
-                    stride=gs_dn, device=act.device, dtype=torch.float16)
-                a_i8, a_s = rotate_quantize_fused(
-                    act_e.half(), rot, gs_dn, inter // gs_dn,
-                    extra_scale=ctx["down_cb_step"])
-                act_parts.append(a_i8)
-                xs_parts.append(a_s)
-                cursor += n
-            del act
-            expert_info_dn = self._merged_expert_info_groups(members, gs_dn)
-
-            with prof.stage("merged_down"):
-                t_k = time.time()
-                dn = wxa8_matmul_merged_in_features_gf(
-                    torch.cat(act_parts), torch.cat(xs_parts),
-                    ctx["down"]["indices_packed_gf"], ctx["down_cb_i8"],
-                    ctx["down"]["norms_gf"],
-                    expert_info_dn, gs_dn,
-                    bit_width=bit,
-                    norms_prescaled=ctx["down_norms_prescaled"])
-                time_triton_total += time.time() - t_k
-            del act_parts, xs_parts
-
-            # 对齐逐 expert 路径：输出 cast 回激活 dtype（真实模型 bf16）
-            if dn.dtype != ctx["act_dtype"]:
-                dn = dn.to(ctx["act_dtype"])
-
-            # 整池 scatter 一次（同 token 跨池出现时由 index_add_ 累加，
-            # 与逐 expert 的多 bit 累加语义一致）
-            with prof.stage("scatter"):
-                dn.mul_(pool_weights.unsqueeze(1))
-                final_hidden_states.index_add_(0, pool_tokens, dn)
-            del dn, pool_tokens, pool_weights
+            time_triton_total += self._merged_pool_compute(
+                bit_str, members, x, bit_ctx, x_rot_by_bit,
+                sorted_tokens, sorted_weights, final_hidden_states, prof)
 
         return dict(
             time_triton_total=time_triton_total,
@@ -365,3 +279,107 @@ class WxA8BitPartitionedGroupMoE(WxA16BitPartitionedGroupMoE):
             active_bits_count=active_bits_count,
             t_compute_end=time.time(),
         )
+
+    def _merged_pool_compute(self, bit_str, members, x, bit_ctx, x_rot_by_bit,
+                             sorted_tokens, sorted_weights,
+                             final_hidden_states, prof):
+        """单个 bit 池的合并计算（int8 语义，WxA8 默认实现）。
+
+        从 _expert_compute_merged 原样抽出（行为零变化），供子类按 bit
+        覆盖分派（WxFP4 的 FP4_BITS 池走 e2m1 合并 kernel）。返回本池
+        两个合并 kernel 的耗时（累进 time_triton_total 口径）。
+        """
+        t_pool = 0.0
+        ctx = bit_ctx[bit_str]
+        bit = members[0][1]
+        inter = members[0][3] - members[0][2]
+        gs_gu = ctx["gate_up_group_size"]
+        in_f = ctx["gate_up_in_features"]
+        gs_dn = ctx["down_group_size"]
+
+        # 池内 token/权重（各成员行段按序拼接，一次 gather）
+        pool_tokens = torch.cat(
+            [sorted_tokens[ts:ts + n] for _e, _b, _s, _e2, ts, n in members])
+        pool_weights = torch.cat(
+            [sorted_weights[ts:ts + n] for _e, _b, _s, _e2, ts, n in members])
+
+        # gate_up 输入：hoisted 则整池切片；否则整池一次旋转+量化
+        hoisted = x_rot_by_bit.get(bit_str)
+        if hoisted is not None:
+            x_i8_all, x_scale_all = hoisted
+            x_pool_i8 = x_i8_all[pool_tokens]
+            x_pool_scale = x_scale_all[pool_tokens]
+        else:
+            src = x[pool_tokens]
+            if src.dtype != torch.float16:
+                src = src.half()
+            rot = generate_batch_rotation_matrices(
+                gs_gu, ctx["gate_up_seed"], in_f // gs_gu, stride=gs_gu,
+                device=src.device, dtype=torch.float16)
+            x_pool_i8, x_pool_scale = rotate_quantize_fused(
+                src, rot, gs_gu, in_f // gs_gu,
+                extra_scale=ctx["gate_up_cb_step"])
+
+        # 合并 gate_up（列切片 2*start / 2*inter，池内统一）
+        expert_info_gu = self._merged_expert_info_rows(members)
+
+        with prof.stage("merged_gate_up"):
+            t_k = time.time()
+            gu = wxa8_matmul_merged_rows_gf(
+                x_pool_i8, x_pool_scale,
+                ctx["gate_up"]["indices_packed_gf"], ctx["gate_up_cb_i8"],
+                ctx["gate_up"]["norms_gf"],
+                expert_info_gu, gs_gu, in_f,
+                bit_width=bit,
+                norms_prescaled=ctx["gate_up_norms_prescaled"])
+            t_pool += time.time() - t_k
+
+            # silu×up 一次（整池扁平输出，gate 前 inter 列 up 后 inter 列）
+        with prof.stage("silu_mul"):
+            gate = gu[:, :inter]
+            up = gu[:, inter:]
+            del gu
+            act = F.silu(gate) * up
+            del gate, up
+
+        # down：逐 expert 旋转量化（seed + start；v1 每 expert 一次 launch）
+        act_parts, xs_parts = [], []
+        cursor = 0
+        for _e, _b, start, _e2, _ts, n in members:
+            act_e = act[cursor:cursor + n]
+            rot = generate_batch_rotation_matrices(
+                gs_dn, ctx["down_seed"] + start, inter // gs_dn,
+                stride=gs_dn, device=act.device, dtype=torch.float16)
+            a_i8, a_s = rotate_quantize_fused(
+                act_e.half(), rot, gs_dn, inter // gs_dn,
+                extra_scale=ctx["down_cb_step"])
+            act_parts.append(a_i8)
+            xs_parts.append(a_s)
+            cursor += n
+        del act
+        expert_info_dn = self._merged_expert_info_groups(members, gs_dn)
+
+        with prof.stage("merged_down"):
+            t_k = time.time()
+            dn = wxa8_matmul_merged_in_features_gf(
+                torch.cat(act_parts), torch.cat(xs_parts),
+                ctx["down"]["indices_packed_gf"], ctx["down_cb_i8"],
+                ctx["down"]["norms_gf"],
+                expert_info_dn, gs_dn,
+                bit_width=bit,
+                norms_prescaled=ctx["down_norms_prescaled"])
+            t_pool += time.time() - t_k
+        del act_parts, xs_parts
+
+        # 对齐逐 expert 路径：输出 cast 回激活 dtype（真实模型 bf16）
+        if dn.dtype != ctx["act_dtype"]:
+            dn = dn.to(ctx["act_dtype"])
+
+        # 整池 scatter 一次（同 token 跨池出现时由 index_add_ 累加，
+        # 与逐 expert 的多 bit 累加语义一致）
+        with prof.stage("scatter"):
+            dn.mul_(pool_weights.unsqueeze(1))
+            final_hidden_states.index_add_(0, pool_tokens, dn)
+        del dn, pool_tokens, pool_weights
+
+        return t_pool

@@ -469,6 +469,13 @@ def _launch_swapped(x_f4_t, x_s, indices_slice, nib, w_s, norms_slice,
     w_folded=True 时 indices_slice 应传 fold_indices_to_e2m1 产物（切片后同布局），
     nib 传任意 uint8 占位张量（W_FOLDED constexpr 分支不读）。
     """
+    # A 侧 kernel 按形状推导行距（(k/2+j)*B、rb*(K_total//32)），非连续
+    # view（如整池预转置产物的列切片）会读错行——兜底拷贝成连续（真实
+    # 路径 gather 产物本就连续，不触发拷贝）
+    if not x_f4_t.is_contiguous():
+        x_f4_t = x_f4_t.contiguous()
+    if not x_s.is_contiguous():
+        x_s = x_s.contiguous()
     B = x_f4_t.shape[1]
     N = indices_slice.shape[1]
     K_total = x_f4_t.shape[0] * 2
@@ -560,6 +567,311 @@ def wxfp4_matmul_grouped_slice_in_features_gf_swapped(
         w_s, norms_slice,
         group_size, g_end - g_start, bit_width,
         w_s.stride(0), original_start // 32, w_folded=w_e2m1_gf is not None)
+
+
+# ===========================================================================
+# P5-2 重做：按 bit 池合并多 expert 的 grouped kernel（wxfp4 版）
+# ===========================================================================
+# 与 _wxa8_merged_kernel_gf 同骨架（block_info 1D grid + expert_info 双模式），
+# fp4 语义三处差异：A 侧 e2m1 预转置 + per-32 e8m0 双操作数 dot_scaled、
+# W 侧 nibble LUT / WFF-1 folded 直读（W_FOLDED，大池免副本）、acc fp32。
+# 天然 in-kernel LUT：4bpw 大池不需要 fold 副本（WFF-5 的 +10GB 问题消失），
+# 有 folded 副本的小池直读（与逐 expert 折叠路径 bit-exact）。
+
+from turboquant_utils.triton_kernels_a8 import (  # noqa: E402
+    _build_merged_block_info,
+)
+
+
+@triton.jit
+def _wxfp4_merged_kernel_gf(
+    # A 侧（MX 原生格式，池内按 expert 顺序拼接）
+    a_ptr,        # (K_a//2, B_total) uint8 —— e2m1 打包、预转置（行=k 对，列=b）
+    a_s_ptr,      # (B_total, K_a//32) uint8 —— per-32 e8m0（scale 尾维=K）
+    # W 侧（group-first 布局，本 bit 池共享，全局寻址免切片）
+    indices_ptr,  # (G_total, N_total, PACKED_PER_GROUP | GS//2) uint8
+                  # W_FOLDED 时传 fold_indices_to_e2m1 产物（stride(0) 随之）
+    nib_ptr,      # (2^bit,) uint8（W_FOLDED 分支不读，传占位）
+    w_s_ptr,      # (N_total, K_w_total//32) uint8 —— W 块缩放（全局布局）
+    norms_ptr,    # (G_total, N_total) fp16
+    # Expert / block 布局（与 _wxa8_merged_kernel_gf 一致）
+    expert_info_ptr,  # (E, 4) int32: [token_start, token_count, slice_start, slice_count]
+    block_info_ptr,   # (num_blocks, 3) int32: [expert_idx, block_b, block_n]
+    # Output
+    output_ptr,   # (B_total, N_out) fp16 扁平连续，行 stride = OUT_ROW_STRIDE
+    # Shape / strides
+    B_total, N_LIMIT,
+    INDICES_G0_STRIDE, NORMS_G0_STRIDE, AS_ROW_STRIDE,
+    WS_STRIDE, OUT_ROW_STRIDE,
+    # Constexpr config
+    GROUP_SIZE: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,     # 本 expert 的有效 group 数
+    BIT_WIDTH: tl.constexpr,
+    W_FOLDED: tl.constexpr = False,
+    SLICE_IS_GROUPS: tl.constexpr = False,
+    BLOCK_B: tl.constexpr = 32,
+    BLOCK_N: tl.constexpr = 128,
+    BLOCK_K: tl.constexpr = 128,
+):
+    """按 bit 池合并多 expert 的 wxfp4 grouped GEMM（双模式，swapped 操作数）。
+
+    SLICE_IS_GROUPS=False（gate_up / 行切片）：slice_start 是共享权重上的
+    **列**切片（rn 全局，输出列回 [0, slice_count)），A 的 K 是完整
+    in_features（k 局部 = 全局）。SLICE_IS_GROUPS=True（down / group 切片）：
+    slice_start 是 **group** 切片（indices/norms 从全局 group 起），A 的 K
+    是切片后 inter（k 局部），W 的 e8m0 k 偏移由 slice_start 在 kernel 内
+    折算（ws_koff = slice_start*GROUP_SIZE//32）。
+
+    与 _wxfp4_fused_matmul_kernel_swapped_gf 的 tile 数学完全一致（同一
+    tile 分解、同一 dot_scaled 累加顺序；两档 tile 表 BLOCK_K 同为 128，
+    fp32 acc 跨档仍位级一致）→ 与逐 expert 路径 bit-exact。
+    """
+    pid = tl.program_id(0)
+    bi = block_info_ptr + pid * 3
+    eid = tl.load(bi + 0).to(tl.int32)
+    blk_b = tl.load(bi + 1).to(tl.int32)
+    blk_n = tl.load(bi + 2).to(tl.int32)
+
+    ei = expert_info_ptr + eid * 4
+    token_start = tl.load(ei + 0).to(tl.int32)
+    token_count = tl.load(ei + 1).to(tl.int32)
+    slice_start = tl.load(ei + 2).to(tl.int32)
+
+    rb = token_start + blk_b * BLOCK_B + tl.arange(0, BLOCK_B)
+    mask_b = rb < token_start + token_count
+
+    if SLICE_IS_GROUPS:
+        # down：N 维完整（从 0 起），group 维按 slice_start 偏移
+        rn = blk_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    else:
+        # gate_up：N 维是共享权重的列切片，从 slice_start 起
+        rn = slice_start + blk_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = rn < N_LIMIT
+
+    # W 的 e8m0 k 偏移：rows 模式 0；groups 模式 = 切片起始的全局 k 块
+    if SLICE_IS_GROUPS:
+        ws_koff = (slice_start * GROUP_SIZE) // 32
+    else:
+        ws_koff = 0
+
+    total_acc = tl.zeros((BLOCK_N, BLOCK_B), dtype=tl.float32)
+
+    ELEMENTS_PER_BYTE = 8 // BIT_WIDTH
+    PACKED_PER_GROUP = GROUP_SIZE // ELEMENTS_PER_BYTE
+    row_base = rn * PACKED_PER_GROUP
+    # 拼包权重 [1, 16]
+    pk_w = tl.arange(0, 2) * 15 + 1
+
+    for g in range(NUM_GROUPS):
+        g_global = (slice_start + g) if SLICE_IS_GROUPS else g
+        k_local = g * GROUP_SIZE      # A 侧始终局部 k（rows=全局 / groups=切片内）
+        g_base = g_global * INDICES_G0_STRIDE
+
+        norm_g = tl.load(norms_ptr + g_global * NORMS_G0_STRIDE + rn,
+                         mask=mask_n, other=0.0)
+
+        acc_g = tl.zeros((BLOCK_N, BLOCK_B), dtype=tl.float32)
+
+        rk_pk = tl.arange(0, BLOCK_K // 2)
+        rk_sc = tl.arange(0, BLOCK_K // 32)
+
+        for k_start in range(0, GROUP_SIZE, BLOCK_K):
+            # --- rhs = A：预转置 (BK/2, BM)，行连续；group 偏移是行偏移×B_total
+            a_off = ((k_local + k_start) // 2 + rk_pk[:, None]) * B_total + rb[None, :]
+            a_tile = tl.load(a_ptr + a_off,
+                             mask=((k_start // 2 + rk_pk) < (GROUP_SIZE // 2))[:, None]
+                             & mask_b[None, :], other=0)
+            # rhs scale (BM, BK/32)（尾维 = K）
+            as_off = rb[:, None] * AS_ROW_STRIDE + (k_local + k_start) // 32 + rk_sc[None, :]
+            as_tile = tl.load(a_s_ptr + as_off,
+                              mask=mask_b[:, None]
+                              & ((k_start // 32 + rk_sc) < (GROUP_SIZE // 32))[None, :],
+                              other=0)
+
+            # --- lhs = W：W_FOLDED 直读（WFF-1）或 unpack → nibble LUT → 拼包
+            if W_FOLDED:
+                row_f = rn * (GROUP_SIZE // 2)
+                wf_off = g_base + row_f[:, None] + (k_start // 2 + rk_pk)[None, :]
+                w_byte = tl.load(indices_ptr + wf_off,
+                                 mask=mask_n[:, None]
+                                 & ((k_start // 2 + rk_pk) < (GROUP_SIZE // 2))[None, :],
+                                 other=0)
+            else:
+                rk = k_start + tl.arange(0, BLOCK_K)
+                w_mask = mask_n[:, None] & (rk < GROUP_SIZE)[None, :]
+                BIT_MASK = (1 << BIT_WIDTH) - 1
+                byte_col = rk // ELEMENTS_PER_BYTE
+                pos_in_byte = rk % ELEMENTS_PER_BYTE
+                byte_off = g_base + row_base[:, None] + byte_col[None, :]
+                packed_w = tl.load(indices_ptr + byte_off, mask=w_mask, other=0).to(tl.uint8)
+                shift = pos_in_byte * BIT_WIDTH
+                idx = ((packed_w >> shift[None, :]) & BIT_MASK).to(tl.int32)
+                nib = tl.load(nib_ptr + idx, mask=w_mask, other=0)      # (BN, BK) uint8
+
+                nib3 = tl.reshape(nib, (BLOCK_N, BLOCK_K // 2, 2))
+                w_byte = tl.sum(nib3.to(tl.int32) * pk_w[None, None, :], axis=2).to(tl.uint8)
+
+            # lhs scale (BN, BK/32)——按全局 w_s 布局寻址（WS_STRIDE/ws_koff）
+            ws_off = rn[:, None] * WS_STRIDE + ws_koff \
+                + (k_local + k_start) // 32 + rk_sc[None, :]
+            ws_tile = tl.load(w_s_ptr + ws_off,
+                              mask=mask_n[:, None]
+                              & ((k_start // 32 + rk_sc) < (GROUP_SIZE // 32))[None, :],
+                              other=0)
+
+            acc_g = tl.dot_scaled(w_byte, ws_tile, "e2m1",
+                                  a_tile, as_tile, "e2m1", acc_g)
+
+        total_acc += acc_g * norm_g[:, None]
+
+    # (BN, BM) -> output (B_total, N_out)：一次转置写（列回 [0, slice_count)）
+    out_col = (rn - slice_start) if not SLICE_IS_GROUPS else rn
+    tl.store(output_ptr + rb[None, :] * OUT_ROW_STRIDE + out_col[:, None],
+             total_acc.to(output_ptr.dtype.element_ty),
+             mask=mask_b[None, :] & mask_n[:, None])
+
+
+def _merged_fp4_default_cfg(B_total):
+    """合并 fp4 的默认 tile（与 _launch_swapped 两档一致：BLOCK_K 恒 128）。"""
+    BLOCK_B = 32 if B_total <= 256 else 128
+    return BLOCK_B, 128, 128, (4 if B_total <= 256 else 8), 2
+
+
+def wxfp4_matmul_merged_rows_gf(
+    x_f4_t, x_s, indices_packed_gf, nib, w_s, norms_gf,
+    expert_info, group_size, in_features, bit_width: int,
+    norms_prescaled: bool = False, w_e2m1_gf=None, cfg=None,
+):
+    """gate_up 合并版（wxfp4）：同一 bit 池所有 expert 一次 launch（行切片语义）。
+
+    与逐 expert 的 wxfp4_matmul_grouped_slice_rows_gf_swapped 逐段等价。
+    x_f4_t 是 (in_features//2, B_total) 预转置 e2m1（hoisted 列 gather 或
+    整池一次 rotate_quantize_fused_fp4），池内按 expert 顺序列拼接；
+    expert_info 里 slice_start/slice_count 是该 expert 在共享 indices/norms
+    上的列切片（主流程为 e*2*inter / 2*inter）。W 侧全局寻址（rn 全局），
+    免逐 expert 切片。
+
+    W_FOLDED：w_e2m1_gf 非 None（WFF-5 小池折叠副本）时直读 folded buffer
+    （nib 占位不读），与逐 expert 折叠路径 bit-exact；None 走 in-kernel
+    LUT（大池免副本，wxfp4 合并版的自然设计）。
+
+    Returns:
+        output: (B_total, 2*inter) fp16 扁平连续（按 expert 顺序行拼接）
+    """
+    if bit_width not in {1, 2, 4}:
+        raise ValueError(f"WxFP4 支持 bit 1/2/4，got {bit_width}")
+    if in_features % group_size != 0:
+        raise ValueError(
+            f"in_features ({in_features}) 必须对齐 group_size ({group_size})")
+
+    expert_info = [tuple(int(v) for v in row) for row in expert_info]
+    B_total = x_f4_t.shape[1]
+    num_groups = in_features // group_size
+    # A 侧 kernel 按形状推导行距（(k/2+j)*B_total），兜底非连续 view
+    # （真实路径 hoisted 列 gather / 整池融合量化产物均连续，不触发拷贝）
+    if not x_f4_t.is_contiguous():
+        x_f4_t = x_f4_t.contiguous()
+    n_slice = expert_info[0][3] if expert_info else 0
+    if any(row[3] != n_slice for row in expert_info):
+        raise ValueError(
+            f"merged rows kernel 要求池内列切片一致（inter_size 相同），"
+            f"得到 slice_count 集合 {sorted({row[3] for row in expert_info})}")
+
+    norms_used = norms_gf if norms_prescaled else (
+        norms_gf.float() / math.sqrt(group_size))
+
+    if cfg is not None:
+        BLOCK_B, BLOCK_N, BLOCK_K, nw, ns = cfg
+    else:
+        BLOCK_B, BLOCK_N, BLOCK_K, nw, ns = _merged_fp4_default_cfg(B_total)
+
+    block_info = _build_merged_block_info(expert_info, BLOCK_B, BLOCK_N,
+                                          n_slice, x_f4_t.device)
+    out = torch.empty(B_total, n_slice, dtype=torch.float16, device=x_f4_t.device)
+    n_limit = max(row[2] for row in expert_info) + n_slice
+
+    w_src = w_e2m1_gf if w_e2m1_gf is not None else indices_packed_gf
+    nib_arg = w_src if w_e2m1_gf is not None else nib
+
+    _wxfp4_merged_kernel_gf[(block_info.shape[0],)](
+        x_f4_t, x_s, w_src, nib_arg, w_s, norms_used,
+        torch.tensor(expert_info, dtype=torch.int32, device=x_f4_t.device),
+        block_info, out,
+        B_total, n_limit,
+        w_src.stride(0), norms_used.stride(0), x_s.stride(0),
+        w_s.stride(0), out.stride(0),
+        GROUP_SIZE=group_size, NUM_GROUPS=num_groups,
+        BIT_WIDTH=bit_width, W_FOLDED=w_e2m1_gf is not None,
+        BLOCK_B=BLOCK_B, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        num_warps=nw, num_stages=ns,
+    )
+    return out
+
+
+def wxfp4_matmul_merged_in_features_gf(
+    x_f4_t, x_s, indices_packed_gf, nib, w_s, norms_gf,
+    expert_info, group_size, bit_width: int,
+    norms_prescaled: bool = False, w_e2m1_gf=None, cfg=None,
+):
+    """down 合并版（wxfp4）：同一 bit 池所有 expert 一次 launch（in_features 切片）。
+
+    x_f4_t 是 (inter//2, B_total) 预转置 e2m1——每 expert 段已用
+    seed + original_start 旋转并量化（v1 由调用方逐 expert 调
+    rotate_quantize_fused_fp4），列拼接；expert_info 里 slice_start/slice_count
+    是 group 维切片（主流程为 e*inter/gs / inter/gs），N 维完整 hidden。
+    W 的 e8m0 k 偏移由 slice_start 在 kernel 内折算。
+
+    Returns:
+        output: (B_total, N) fp16 扁平连续（按 expert 顺序行拼接）
+    """
+    if bit_width not in {1, 2, 4}:
+        raise ValueError(f"WxFP4 支持 bit 1/2/4，got {bit_width}")
+
+    expert_info = [tuple(int(v) for v in row) for row in expert_info]
+    B_total = x_f4_t.shape[1]
+    # A 侧 kernel 按形状推导行距（(k/2+j)*B_total），兜底非连续 view
+    if not x_f4_t.is_contiguous():
+        x_f4_t = x_f4_t.contiguous()
+    g_count = expert_info[0][3] if expert_info else 0
+    if any(row[3] != g_count for row in expert_info):
+        raise ValueError(
+            f"merged in_features kernel 要求池内 group 切片一致（inter_size "
+            f"相同），得到集合 {sorted({row[3] for row in expert_info})}")
+    if x_f4_t.shape[0] * 2 != g_count * group_size:
+        raise ValueError(
+            f"x_f4_t K ({x_f4_t.shape[0] * 2}) != g_count*group_size "
+            f"({g_count * group_size})")
+
+    norms_used = norms_gf if norms_prescaled else (
+        norms_gf.float() / math.sqrt(group_size))
+    N = norms_used.shape[1]
+
+    if cfg is not None:
+        BLOCK_B, BLOCK_N, BLOCK_K, nw, ns = cfg
+    else:
+        BLOCK_B, BLOCK_N, BLOCK_K, nw, ns = _merged_fp4_default_cfg(B_total)
+
+    block_info = _build_merged_block_info(expert_info, BLOCK_B, BLOCK_N,
+                                          N, x_f4_t.device)
+    out = torch.empty(B_total, N, dtype=torch.float16, device=x_f4_t.device)
+
+    w_src = w_e2m1_gf if w_e2m1_gf is not None else indices_packed_gf
+    nib_arg = w_src if w_e2m1_gf is not None else nib
+
+    _wxfp4_merged_kernel_gf[(block_info.shape[0],)](
+        x_f4_t, x_s, w_src, nib_arg, w_s, norms_used,
+        torch.tensor(expert_info, dtype=torch.int32, device=x_f4_t.device),
+        block_info, out,
+        B_total, N,
+        w_src.stride(0), norms_used.stride(0), x_s.stride(0),
+        w_s.stride(0), out.stride(0),
+        GROUP_SIZE=group_size, NUM_GROUPS=g_count,
+        BIT_WIDTH=bit_width, W_FOLDED=w_e2m1_gf is not None,
+        SLICE_IS_GROUPS=True,
+        BLOCK_B=BLOCK_B, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        num_warps=nw, num_stages=ns,
+    )
+    return out
 
 
 # ===========================================================================
