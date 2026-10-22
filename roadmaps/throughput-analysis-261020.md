@@ -149,13 +149,33 @@ Lloyd-Max 无法转 wxa8 是该配置特有的坑）。
      attention（fla 等价物）内置。MoE 段 38.4ms vs 单卡读权重 ~10ms →
      kernel 效率还有 3–4× 空间（对应边际 1.3× 那条线，P5 系继续走）。
   - 中值 2×3×1.7≈10×，因子取区间上端可达 ~18×+，对齐实测。
-- **推论**：L0（fla）只拿回 attention 计算那一份，launch 开销与单卡串行
-  碰不到——单卡 eager 现实天花板 20–23 tok/s；其余全在引擎层。空档由
-  P9-5（CUDA Graph，仍在 transformers 内、不破坏同框架可比性）承接，
-  L2（我方 MoE kernel 进 vLLM）仍是长期解。
+- **推论（2026-10-22 晚间按 L0 实测修正，10-23 全批复核口径见变更记录）**：
+  L0（fla）decode 侧收益实测**微负**（全模式一致 −0.5~−4.6%，见变更记录）——
+  decode 走 recurrent 单步路径、torch
+  参考本来就便宜，原「fla 后 20–23 tok/s」是把 prefill chunk 画像误推到
+  decode，作废。decode 76ms/step 构成：MoE 38.4 + 投影/norm/launch ~32 +
+  GDN core 小头，~90% 是开销非计算；graph（P9-5，仍在 transformers 内、
+  不破坏同框架可比性）打的就是前两块的 launch 部分，L2（我方 MoE kernel
+  进 vLLM）仍是长期解。
 
 ## 变更记录
 
+- 2026-10-23（凌晨）：**官方 FP8 重跑（fla 后）+ 双侧新口径差距定档**。
+  官方（1019.thrput.3.mla.off.log，8e60d1a+，双卡 device_map）：pf2048
+  **19544.6（+95%）**、pf4096 **20496.3（+103%）**、pf128 1723.9（+4%）、
+  pf16 214.4 / ttft 0.141 持平；**decode 16.43–16.65 反而 −4%**——fla
+  recurrent 在 T=1 微慢是栈级现象，与我方 −0.5~−4.6% 同款（非我方特有）。
+  官方近乎翻倍证明其 prefill 近半耗在 attention 段，而我方只 +25~40%
+  （大头在 MoE/固定开销）。双侧均 fla 后差距（wxfp4 4bpw）：pf2048
+  3.39–3.45× / pf4096 2.46× / pf128 2.77–2.81× / pf16 1.69–1.82× /
+  decode 1.17× / ttft 1.88–1.97×（长档表面拉大，其中含双卡串行不可折算，
+  §1 勘误仍成立）。外推拆解更新：**边际 66.1 vs 46.4 μs/tok（1.42×，fla
+  前 1.3×）+ 固定 ~220ms vs ~10ms（fla 只帮我们省 ~24ms；pf2048 一档固定
+  占我方总时 62%）**。结论：attention 双方同顶后剩余差距聚焦 MoE 边际 +
+  固定 launch 链两点；**P9-5 适用范围扩展到 prefill**（P0 四档长度静态
+  固定，逐档 capture CUDA graph 可打 220ms 固定开销）。待办：官方
+  GPTQ-Int4 重跑（旧 3298/3.93 为 fla 前口径不可再比）；turboquant 4bpw
+  wxfp4 check FAIL 待查。
 - 2026-10-20：立项；四问分析成文（基于 1015/1018 系列日志与 WxA8 路线
   既有 profile 结论）；勘误 dec 单位误读。
 - 2026-10-20 深夜：**P5-2 合并路径落地（wxa8）后差距更新**——4bpw wxa8：
@@ -182,6 +202,25 @@ Lloyd-Max 无法转 wxa8 是该配置特有的坑）。
   per-GPU 3.1×→1.4×」的推导作废；per-GPU prefill 差距按全量口径：
   合并前 6.2×、合并后 2.77×。注意这同时意味着 vLLM TP=2（真正层内切分）
   的官方 FP8 prefill 上限比本基线更高，对比时须标注。
+- 2026-10-22（晚间）：**L0（fla + causal-conv1d）双 env 落地 + §5 推论修正**。
+  环境级安装（dart312 官方基线 / dart312-t38 主流程；causal-conv1d 无 PyPI
+  wheel、GitHub 官方 wheel 187MB 单连接被限速，最终本机 nvcc 12.8 源码自编，
+  含 sm_120；fla-core 0.5.2 拆包结构 base 只依赖 einops，不碰 triton）。
+  验证：`test/test_fla_smoke.py`（新增）双机制状态判定（transformers 5.13
+  模块级 import + is_fast_path_available 全量判定 / 5.16+ 逐函数
+  use_kernel_func_from_hub_with_fallback）+ torch 参考子进程数值对拍全过
+  （prefill max_abs ~1.2e-3）；t38 三道门（triton 3.8+ptxas 软链未动 /
+  test_moe_merged_kernel / test_quant_io）全绿。首测（1019.2.mla.all.log，
+  wxa16 4bpw）：**pf128 533（旧 163，3.3×）/ pf2048 4442（旧 ~3447，+29%）/
+  pf4096 6784.8，decode 13.15–13.23 持平**。机制：prefill 走 chunk 路径
+  （torch 参考极慢→fla 大赚）；decode T=1 走 recurrent 参考、循环只跑一步
+  本来便宜——GDN core 在 decode 非 MoE ~32ms 里只占小头（大头=62 层投影/
+  norm/launch，fla 不碰）。⚠ **两侧基线重跑前，旧数字（含本文档全部
+  pf/dec）不与新口径混表**；四模式需同批重跑（wxa16 4442 暂超 wxfp4 的
+  fla 前数字 4090–4134 不构成排名）。测量工具同步交付：
+  profile_prefill.py 新增 `--decode-steps`（带 cache 真 decode 单步三层
+  分解：干净计时 / MoE stage / kernel 归类 + 每步 launch 数 + idle gap，
+  bench decode_loop 同口径含 lm_head）。
 - 2026-10-22：**新增 §5——社区 vLLM 2×5090 参照校准**：单流 decode
   252–274 tok/s（4bit、MTP off），对 14 tok/s 的 ~18–20× 差距分解为
   TP=2（~2×）× CUDA Graph（~2–4×）× 全融合（~1.5–2×）三因子，全部属

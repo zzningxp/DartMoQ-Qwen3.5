@@ -159,12 +159,54 @@ batch=1、wiki 真实文本切片。单位：prefill/decode 均为 **tok/s（越
 ttft 秒（越低越快）。prefill 只计时 transformer（不含 lm_head），decode 含
 cache 路径；每条结果都经过 cache-vs-full logits 一致性守卫（check PASS 才入表）。
 
+fla fast path 后同批四模式（2026-10-22，git 8e60d1a+，logs/1019.2.mla.all.log；
+4bpw 仍 gptq/turboquant 两份 checkpoint 连跑，区间即两值；本表起 GDN/conv 走
+fla + causal-conv1d 库 kernel，环境级安装零代码改动，官方基线同享）：
+
+| 模式 | pf16 | pf128 | pf2048 | pf4096 | dec（256/512/1024） | ttft | check |
+|---|---|---|---|---|---|---|---|
+| 4bpw wxa16 | 90.2–92.1 | 533.4–550.2 | 4442–4585 | 6784.8–6821.8 | 13.15–13.44 | 0.306–0.308 | PASS |
+| 4bpw wxa8 | 111.6–113.1 | 517.1–527.5 | 4796.1–4820.9 | 7155.6–7187.6 | 13.48–13.71 | 0.45–0.453 | PASS |
+| 4bpw wxfp8 | 112.3–115.2 | 522.2–529 | 4748.3–4754.5 | 7096.7–7133 | 13.54–13.83 | 0.449–0.456 | PASS |
+| **4bpw wxfp4** | **117.8–126.5** | **612.5–621.7** | **5657.1–5767.9** | **8269.9–8347.8** | **13.96–14.03** | **0.265–0.278** | PASS / **FAIL**(tq) |
+| 2bpw wxa16（1/2/4 混合） | 88.3 | 505 | 4456.1 | 6760.5 | 12.9–13.01 | 0.327 | PASS |
+| 2bpw wxa8 | 98.5 | 472.2 | 4712.3 | 7792.8 | 11.39–11.45 | 0.497 | PASS |
+| 2bpw wxfp8 | 99.3 | 478.3 | 4747.2 | 7815.3 | 11.44–11.48 | 0.49 | PASS |
+| 2bpw wxfp4 | 98.2 | 476.4 | 4727.8 | **7937.7** | 11.25–11.32 | 0.497 | PASS |
+
+- **fla fast path（2026-10-22 起）**：两 env 补装 flash-linear-attention 0.5.2
+  （fla-core 拆包，base 仅依赖 einops 不碰 triton）+ causal-conv1d 1.7.0
+  （PyPI 无 wheel、GitHub 官方 wheel 限速，本机 nvcc 12.8 源码自编含 sm_120）。
+  GDN delta rule 与 causal conv 从 torch 参考实现切到库 kernel；生效验证
+  `test/test_fla_smoke.py`（fast vs torch 参考子进程 A/B，max_abs ~1.2e-3），
+  warmup 日志第一行 "The fast path is not available" 消失
+- **prefill 大涨、decode 微降（对 fla 前 1019.thrput.1 同批）**：chunk 路径
+  （prefill）的 torch 参考实现极慢被换掉 → pf2048 +25~+40%（wxfp4 最大）、
+  pf4096 +41~+53%、pf128 +16~18%；decode 走 recurrent 单步路径、参考实现本来
+  便宜 → 四模式一致微降 −0.5~−4.6%（fla recurrent 在 T=1 不占优）。decode
+  优化主线由此转向 P9-5 CUDA Graph（backlog），测量工具
+  `profile_prefill.py --decode-steps` 已就绪
+- ⚠ **turboquant 4bpw wxfp4 check FAIL**（同模式 gptq PASS，速度正常 5657/13.96）：
+  该模式本就是 ppl 贴边档（e2m1 激活 +0.19），疑 fla attention 舍入差叠加把
+  cache-vs-full 一致性容差推出界——待复跑排查，暂不收录该行速度为结论
+- 与官方 FP8/Int4 对比待两侧重跑（下表官方行为 fla 前口径，不可与本表混用）；
+  vLLM 引擎档基线由本人另行测试，收录时以独立口径标注
+
+官方基线（FP8 已重跑 fla 后口径，2026-10-22，logs/1019.thrput.3.mla.off.log；
+GPTQ-Int4 重跑待跑，下行仍为 fla 前口径）：
+
 | 模型 / 模式 | pf16 | pf128 | pf2048 | pf4096 | dec（256/512/1024） | ttft | check |
 |---|---|---|---|---|---|---|---|
-| 官方 FP8（双卡） | 215.6 | 1657.9 | 10009.8 | 10082.3 | 15.77 / 15.82 / 15.84 | 0.142 | PASS |
-| 官方 GPTQ-Int4（单卡） | 51.7 | 329.2 | 3298.6 | 4941.3 | 3.93 / 3.95 / 3.94 | 0.644 | PASS |
+| 官方 FP8（双卡，fla 后） | 214.4 | 1723.9 | 19544.6 | 20496.3 | 16.43 / 16.59 / 16.65 | 0.141 | PASS |
+| 官方 FP8（双卡，fla 前） | 215.6 | 1657.9 | 10009.8 | 10082.3 | 15.77 / 15.82 / 15.84 | 0.142 | PASS |
+| 官方 GPTQ-Int4（单卡，fla 前） | 51.7 | 329.2 | 3298.6 | 4941.3 | 3.93 / 3.95 / 3.94 | 0.644 | PASS |
 
-同批次四模式（git 3349151，P5-2 合并路径全模式落地后，1018.thrput.10；
+官方 FP8 对 fla 前：pf2048 +95%、pf4096 +103%（官方 attention 段占其 prefill
+近半，fla 红利吃得比我们多——我们大头在 MoE/固定开销故只 +25~40%）、pf128 +4%、
+pf16/ttft 持平；decode 15.77→16.43 反而 −4%，fla recurrent 在 T=1 微慢是栈级
+现象（与我们 −0.5~−4.6% 同款），decode 差距维持 ~1.17×。
+
+fla 前口径——同批次四模式（git 3349151，P5-2 合并路径全模式落地后，1019.thrput.1；
 4bpw 先跑 gptq、后跑 turboquant（261016 两份 checkpoint），区间即两值——
 除 wxa16 pf4096（gptq 4796 vs turboquant 4678，2.5%）外互差 ≤0.9%）：
 
@@ -207,12 +249,16 @@ cache 路径；每条结果都经过 cache-vs-full logits 一致性守卫（chec
   2bpw：量化激活三模式 decode 11.5–11.8 而 wxa16 13.2（低 bit 混合池下
   bit2-int8 + bit1/4-e2m1 双格式激活链的每步固定成本），prefill 则三模式
   反超 wxa16（~3600 vs 3384）
-- **与官方 FP8 的差距（仍是主要差距）**：pf2048 2.42× / pf4096 1.85× /
-  pf128 3.18× / decode 1.12× / ttft 2.24×。拆分诊断（由官方 json latency
-  逐档外推）：长档边际速率 125–131 vs 官方 98.6 μs/tok（1.3×，kernel 效率）
-  + 每次 prefill 调用 ~180–240ms 固定开销（官方 ~2–15ms）两个独立问题，
-  差距随 prefill 变长收窄。下一步：pf2048 单步分层 profile（attention/
-  dense/MoE/搬运拆分，P8-1 同法）+ wxfp4 合并 kernel tile cfg 扫描
+- **与官方 FP8 的差距（双侧均 fla 后口径，wxfp4 4bpw）**：pf2048 3.39–3.45× /
+  pf4096 2.46× / pf128 2.77–2.81× / pf16 1.69–1.82× / decode 1.17× / ttft
+  1.88–1.97×。表面比 fla 前（2.42×/1.85×/3.18×）在长档拉大，但其中 ~2× 是
+  双卡 TP 本身；单卡真实差距看外推拆解：**边际速率 66.1 vs 46.4 μs/tok
+  （1.42×，fla 前 125–131 vs 98.6 = 1.3×，MoE kernel 效率）+ 每次 prefill
+  固定开销 ~220ms vs 官方 ~10ms（launch 链；fla 只省掉其中 ~24ms，pf2048
+  一档它占我们总时的 62%）**。fla 把双方 attention 段同时打到顶后，剩余差距
+  完全聚焦在 MoE 边际 + 固定开销两点。下一步：P9-5 CUDA graph 扩展到 prefill
+  静态档（P0 四档长度固定，逐档 capture 可打 220ms 固定开销）+ wxfp4 合并
+  kernel tile cfg 扫描（边际 1.42×）
   （LUT 档锚点 TF 仅 folded 直读的一半，有 1.6× cfg 空间）进行中
 - 全部差异的逐项分析（四个问题的根因拆解）见
   [roadmaps/throughput-analysis-261020.md](roadmaps/throughput-analysis-261020.md)

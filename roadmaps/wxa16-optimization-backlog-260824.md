@@ -661,6 +661,26 @@ ppl 11.268 / 7.7944 无损失。收益小于预期（delta rule 只是全模型�
 - **方法论**：P8-1 profile 先行同样适用——先用 profile_prefill 的 launch
   数那层把 70ms/step 里 launch 开销 vs 计算占比测出，再决定投入。
 
+> **状态补充（2026-10-22 晚间，L0 fla 落地后）**：
+> 1. **前置核实点 1 已核实 ✅**：合并 kernel 的 grid = `block_info.shape[0]`，
+>    由 expert_info（每 expert 切片数，真实模型恒定）+ B_total（=B×topk，
+>    decode 恒定）决定，**每步 grid 不变**；路由全部动态性在
+>    indices_packed_gf 的张量值里（kernel 内读，非 host 分支）；逐步 Python
+>    逻辑（cfg 按 B 查表 / dtype cast / expert_info 校验）在固定 B/dtype 下
+>    走同一条路；capture 期内的临时分配进 graph 私有内存池。router→gather→
+>    合并 kernel→scatter 整段可作一个单元 capture。核实点 2（fla recurrent
+>    在 capture 下表现）仍开放。
+> 2. **背景修正**：L0 已落地，decode 侧收益实测 ≈0（13.2 持平；decode 走
+>    recurrent 单步路径本来就便宜，GDN core 在非 MoE ~32ms 里只占小头）——
+>    本项打的对象就是 MoE 38.4ms 调度链 + 62 层投影/norm/launch ~32ms 的
+>    全部 launch 开销（76ms/step 里 ~90% 是开销非计算），不再是「L0 之外的
+>    空档」。
+> 3. **测量工具已交付**：`benchmarks/profile_prefill.py --decode-steps N`
+>    （带 cache 真 decode 单步三层分解 + 每步 launch 数 + idle gap，bench
+>    decode_loop 同口径含 lm_head）。**判据**：launch 千级 + idle gap >20ms
+>    → graph 优先；moe_gemm 类 kernel 时间 >15ms → kernel 效率（P5 系：
+>    tile 扫描续跑 / rotate_quantize 折进 kernel / scatter 融合）同步动。
+
 ---
 
 ## 二、已评估 / 已否决 / 已降级（明确不做，避免重复踩坑）

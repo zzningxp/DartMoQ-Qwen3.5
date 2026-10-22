@@ -668,12 +668,10 @@ def _select_fields(records: list[RunRecord]) -> list[str]:
     """自适应选择展示列：按批次内容决定列集合。"""
     fields = list(COMMON_FIELDS)
     # checkpoint 目录名列：混合批次（gptq/turboquant 等）必须能区分每行来源；
-    # ckpt 名内已含模型名（qwen3.5-35B-...），全部记录有 ckpt 时用 ckpt
-    # 替换 model 列，避免包含关系冗余（部分记录缺 ckpt 时才两列都留）
-    if all(r.ckpt for r in records):
+    # ckpt 名内已含模型名（qwen3.5-35B-...），任一记录有 ckpt 即用 ckpt 替换
+    # model 列，避免包含关系冗余；未完成/无 ckpt 的行该列显示 ----
+    if any(r.ckpt for r in records):
         fields[fields.index("model_name")] = "ckpt"
-    elif any(r.ckpt for r in records):
-        fields.insert(fields.index("model_name") + 1, "ckpt")
     # bpw 不触发 eval 列集：吞吐记录的 bpw 来自 checkpoint: 行（summary），
     # 不是量化元数据，不应把 sli/qsch/rank 等 eval 列带出来
     if any(any(getattr(r, f) for r in records)
