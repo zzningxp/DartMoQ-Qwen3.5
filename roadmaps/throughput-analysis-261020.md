@@ -125,6 +125,34 @@ Lloyd-Max 无法转 wxa8 是该配置特有的坑）。
 | 我们 4bpw vs 2bpw（decode） | 4bpw 快 13% | 低 bit 混合路径固定开销惩罚 |
 | Int4 vs 我们 4bpw（prefill） | Int4 快 2.06× | TritonV2 大 B GEMM |
 | Int4 vs 我们 4bpw（decode） | 我们快 2.9× | TritonV2 小 B 崩 + 我们小 B 专优 |
+| vLLM 2×5090（社区实测，引擎完整形态） vs 我们 4bpw decode | ~18–20× | TP=2 × CUDA Graph × 全融合 三因子相乘（§5） |
+
+## 5）社区 vLLM 参照：decode ~18× 差距的三因子分解（引擎层缺口）
+
+- **数字校准（2026-10-22）**：社区 2×5090 vLLM 单流 decode 实测 **252–274
+  tok/s**（4bit、MTP off——MTP 对该 MoE 反而 -45%~-51%），不是「100+」。
+  我方 wxfp4 4bpw 合并路径 14 tok/s → 差距 **~18–20×**（252/14=18.0、
+  274/14=19.6）。这是引擎层完整形态（TP+Graph+融合）的参照，非单一
+  kernel 差距；论文对照须与 FreeToken 77–83（研究原型口径）分开标注。
+- **三因子（相乘）**：
+  1. **TP=2 张量并行 ~2×**：vLLM 双卡每层同算，decode 带宽瓶颈下每步权重
+     分两卡读、带宽聚合 3.58TB/s；我方 device_map 是串行层切分（与
+     2026-10-21 勘误同源）——每步仍读全模型 ~18GB、只用单卡 1.79TB/s，
+     另一卡闲置。
+  2. **CUDA Graph ~2–4×**：vLLM decode 整步 capture 成一张 graph 单次
+     replay；我方 eager 框架每步数千次 Python 级 launch，bs=1 微秒级
+     kernel 被 CPU/launch 开销主导。roofline 验证：我方 70ms/step，单卡
+     读一遍 4bit 权重仅需 ~10ms——离带宽上限 7×，是开销瓶颈不是带宽
+     瓶颈；vLLM 3.6ms/step 对双卡 ~5ms 理论下限效率 ~73%，已贴 roofline。
+  3. **全融合 kernel ~1.5–2×**：我方 MoE 段 38.4ms 含调度链；vLLM fused
+     MoE（marlin/machete 类 bs=1 kernel + moe_align）每层一两发 launch，
+     attention（fla 等价物）内置。MoE 段 38.4ms vs 单卡读权重 ~10ms →
+     kernel 效率还有 3–4× 空间（对应边际 1.3× 那条线，P5 系继续走）。
+  - 中值 2×3×1.7≈10×，因子取区间上端可达 ~18×+，对齐实测。
+- **推论**：L0（fla）只拿回 attention 计算那一份，launch 开销与单卡串行
+  碰不到——单卡 eager 现实天花板 20–23 tok/s；其余全在引擎层。空档由
+  P9-5（CUDA Graph，仍在 transformers 内、不破坏同框架可比性）承接，
+  L2（我方 MoE kernel 进 vLLM）仍是长期解。
 
 ## 变更记录
 
@@ -154,3 +182,8 @@ Lloyd-Max 无法转 wxa8 是该配置特有的坑）。
   per-GPU 3.1×→1.4×」的推导作废；per-GPU prefill 差距按全量口径：
   合并前 6.2×、合并后 2.77×。注意这同时意味着 vLLM TP=2（真正层内切分）
   的官方 FP8 prefill 上限比本基线更高，对比时须标注。
+- 2026-10-22：**新增 §5——社区 vLLM 2×5090 参照校准**：单流 decode
+  252–274 tok/s（4bit、MTP off），对 14 tok/s 的 ~18–20× 差距分解为
+  TP=2（~2×）× CUDA Graph（~2–4×）× 全融合（~1.5–2×）三因子，全部属
+  引擎层；CUDA Graph 方向立为 P9-5（见 wxa16-optimization-backlog），
+  P8-1 的 profile 先行原则同样适用（先测 70ms/step 里 launch 开销占比）。

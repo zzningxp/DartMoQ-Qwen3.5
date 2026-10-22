@@ -637,6 +637,30 @@ ppl 11.268 / 7.7944 无损失。收益小于预期（delta rule 只是全模型�
 - **现状**：纯讨论备选，未实现。
 - **来源**：ROADMAP_ALTERNATIVE_QWENMULTILINEAR.md。
 
+#### P9-5：CUDA Graph / decode 引擎层（transformers 内 mini decode engine）🆕 讨论立项（2026-10-22）
+- **背景**：社区 2×5090 vLLM 单流 decode 252–274 tok/s vs 我方 14（~18–20×），
+  三因子分解见 `throughput-analysis-261020.md` §5——TP=2（~2×，归 L2/双卡线）、
+  CUDA Graph（~2–4×，**本项**）、全融合 kernel（~1.5–2×，P5 系既有主线）。
+  本项不破坏同框架可比性（仍在 transformers），补 L0（fla，只拿 attention
+  计算）与 L2（我方 MoE kernel 进 vLLM）之间的空档。
+- **三条路（成本递增）**：
+  1. `torch.compile(mode="reduce-overhead")`：一行改动先试（~1 天）——但
+     dynamo 遇自定义 triton 模块与 P6 hoist 的跨 step 缓存张量会 graph
+     break，decode 整步 capture 不完整，不指望拿满；
+  2. **手动 capture decode 整步**（静态 input/cache buffer +
+     `torch.cuda.CUDAGraph` replay，采样留图外）：收益最大（bs=1 估 2–3×）。
+     架构巧合：P5-2 合并 kernel 是固定形状设计——池总行数只由
+     B×topk×groups 决定，路由结果是 kernel 内读的 tensor 数据而非 host
+     分支，天然 graph 友好。前提：GDN conv_states/recurrent_states 每步
+     原地更新（不重分配）、全步无 .item()/host 同步、需静态 cache 变体。
+     周级工作量 ≈ 在 transformers 里造 mini decode 引擎；
+  3. 分段 graph（只 capture MoE 段或逐层）：折中，先吃 MoE 段 launch 开销。
+- **前置核实两点**：合并 kernel 的 grid 是否纯由静态形状决定（若依赖逐步
+  变化的打包长度则不可 graph）；fla recurrent kernel（T=1 decode 路径）在
+  graph capture 下的表现（mamba2 在 vLLM 里被 graph 化过，先例是好的）。
+- **方法论**：P8-1 profile 先行同样适用——先用 profile_prefill 的 launch
+  数那层把 70ms/step 里 launch 开销 vs 计算占比测出，再决定投入。
+
 ---
 
 ## 二、已评估 / 已否决 / 已降级（明确不做，避免重复踩坑）
@@ -739,7 +763,7 @@ ppl 11.268 / 7.7944 无损失。收益小于预期（delta rule 只是全模型�
    测量模式才 sync）。**待本人跑一轮 `--cpu-profile` 后按数据定位。**
 7. **P9-1（WxA8 / WxA4）** — 战略优先级已上调。A16 的天花板是 fp16 tensor core 吞吐，
    而 W2A16 现在已经比 FP16 快 18%，P6 之后的增量空间有限；输入侧也量化后走整数乘法才是下一个数量级。
-8. **P9-2（Machete/Marlin） / P9-3（cuTile） / P9-4（QwenMultiLinear）** — 独立技术路线，长期备选。
+8. **P9-2（Machete/Marlin） / P9-3（cuTile） / P9-4（QwenMultiLinear） / P9-5（CUDA Graph decode 引擎层）** — 独立技术路线，长期备选（P9-5 为 2026-10-22 新立项讨论，承接 vLLM ~18–20× decode 差距里 CUDA Graph 那一份，分解见 throughput-analysis §5）。
 
 ### 4.3 待定 / 需本人决策
 
