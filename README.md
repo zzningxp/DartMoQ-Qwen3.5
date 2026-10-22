@@ -47,33 +47,80 @@ Triton kernel 量化推理支持三种精度模式（共用同一份 packed chec
 
 ## 性能
 
-### Qwen3.5-35B-A3B（bpw2，RTX 5090，sequential eval，各模式分属不同 git 批次）
+### Qwen3.5-35B-A3B（bpw2，RTX 5090，sequential eval，git c87966f 同批四模式）
 
-| 数据集 | fp16 基线 | WxA16 | **WxA8** | WxFP4 | WxFP8 |
+2026-10-22 重跑（logs/1020.1.evalppl.all.log，checkpoint 260930-s1，四模式同批
+连跑，wiki 145 / c4 256 samples）；fp16 基线列沿用旧批次数（跨批锚点）。
+
+| 数据集 | fp16 基线* | WxA16 | **WxA8** | WxFP4 | WxFP8 |
 |---|---|---|---|---|---|
-| wikitext2（256 samples） | 87.19 s | 53.12 s | **45.08 s** | 60.10 s † | 55.43 s † |
-| c4（145 samples） | 90.52 s | 76.71 s | 61.84 s | **59.37 s** | 62.93 s |
-| **合计（vs 基线）** | 177.7 s | 129.8 s（-26.9%） | **106.9 s（-39.8%）** | 119.5 s †（-32.8%） | 118.4 s †（-33.4%） |
-| ppl（wiki / c4） | 6.5852 / 9.6725 | 7.7955 / 11.2631 | 7.7947 / 11.2676 | 7.7954 / 11.2711 | 7.8064 / 11.2769 |
+| wikitext2（145 samples） | 87.19 s | 57.57 s | **40.06 s** | 42.33 s | 46.00 s |
+| c4（256 samples） | 90.52 s | 78.94 s | **56.42 s** | 59.61 s | 61.70 s |
+| **合计（vs 基线）** | 177.7 s | 136.5 s（-23.2%） | **96.5 s（-45.7%）** | 101.9 s（-42.6%） | 107.7 s（-39.4%） |
+| ppl（wiki / c4） | 6.5852 / 9.6725 | 7.7875 / 11.2624 | 7.7926 / 11.2675 | 7.7911 / 11.2718 | 7.7972 / 11.2741 |
 
-† wiki 的 WxFP4/WxFP8 疑首轮 Triton JIT 污染（未复跑确认），c4 数字干净；合计与
-百分比受此影响仅供参考。
+*fp16 基线为旧批次数字（跨批参考）。旧跨批拼合表（WxFP4/WxFP8 wiki 有 Triton
+JIT 污染）由本同批表取代；P5-2 合并前同批对照（git da4bd33，0930.1.eval.s1.log，
+同 checkpoint 同口径）合计 wxa16 131.2 / wxa8 97.9 / wxfp4 99.5 / wxfp8 103.7 s
+——**P5-2 前后基本持平**（-1.5% ~ +4.1%：wxa8 略快；wxa16 wiki +10% 但 c4
+持平；wxfp8/wxfp4 wiki 略快、c4 慢 6–8%），ppl 四模式全部一致（±0.003 内）
+→ **合并 kernel 在 eval 口径零质量代价**。eval sequential bs=16 为小 B 形态，
+P5-2 红利兑现在 decode launch 链与大 prefill 填充，此口径不敏感。
 
-- WxA8 vs WxA16：wiki -15.1% / c4 -19.4%，ppl 持平；MoE 单独贡献 -7.0%/-6.7%，
-  attention 路径贡献 -13.2%/-16.8%。WxA8 全路径数字基于 260831-u8 checkpoint
-  （attention 均匀码本，MoE 与 260824 同型），与 WxA16（6eabe23）跨批次
+- WxA8 vs WxA16（同批）：wiki -30.4% / c4 -28.5%，ppl 持平；归因研究
+  （260831-u8 旧批次）为 MoE 单独 -7.0%/-6.7%、attention 路径
+  -13.2%/-16.8%，作历史参考
 - **W 侧折叠直存 e2m1 后（当前代码形态）**：同批次对照合计 **WxFP4 100.79s
   < WxA8 107.82s < WxFP8 112.24s**——WxFP4 在 35B 上为最快模式（vs WxA8 -6.5%），
   ppl 逐位一致（wiki 7.7972 / c4 11.2708）；gate_up kernel 2.0-2.4×
   （B64 40.2→16.6us；B2048 bit1 185→367 TF）。
-  与上表跨批次数字并存，对比以同批次为准
-- 35B 上 WxFP4 能登顶而 122B 不能：35B 的 bit1/4 专家占比更高，fp4 路径覆盖
-  更多权重；122B 为 2-bit 主导（见下节）
+  与主表不同批次（fold 落地当批对照）；该批「WxFP4 最快」的排名未在 260930-s1
+  同批复现——2bpw eval 由 bit2 池主导，三量化模式 MoE 同走 WxA8 int8 路径
+- 35B 的 bit1/4 专家占比高于 122B（2-bit 主导，见下节）：WxFP4 在吞吐口径
+  登顶（见上节吞吐表）；eval 小 B 口径 bit2 池主导下仍 WxA8 最快、WxFP4 次之
 - 端到端时间含约 20s 的 PPL 计算开销；首次运行 WxA8 触发 Triton JIT 编译
   （逐 expert 形状边跑边编译，端到端可虚增 10%+），测速前先捂热磁盘缓存
 - 各批次明细：[roadmaps/wxfp8-plan-260924.md](roadmaps/wxfp8-plan-260924.md) §七 WF-5、
   [roadmaps/wxfp4-plan-260924.md](roadmaps/wxfp4-plan-260924.md) WF4-4、
   [roadmaps/wxfp4-fold-plan-260927.md](roadmaps/wxfp4-fold-plan-260927.md)
+
+### Qwen3.5-35B-A3B（bpw4，RTX 5090，sequential eval，git c87966f+，261016）
+
+2026-10-22 首测（logs/1020.1.evalppl.all.log，turboquant 与 gptq 两份 4bpw
+checkpoint 同日连跑，meta.json 实测两份 bit 池均为 100% bit4）。fp16 基线
+同上节（跨批锚点）。
+
+| 数据集 | ckpt | WxA16 | **WxA8** | WxFP4 | WxFP8 |
+|---|---|---|---|---|---|
+| wikitext2（145 samples） | turboquant | 65.55 s | **52.42 s** | 55.29 s | 55.36 s |
+| wikitext2（145 samples） | gptq | 64.47 s | **52.99 s** | 54.06 s | 54.85 s |
+| c4（256 samples） | turboquant | 88.89 s | **81.23 s** | 85.18 s | 84.38 s |
+| c4（256 samples） | gptq | 84.73 s | **76.24 s** | 77.93 s | 78.15 s |
+| **合计（vs 基线 177.7 s）** | turboquant | 154.4 s（-13.1%） | **133.7 s（-24.8%）** | 140.5 s（-21.0%） | 139.7 s（-21.4%） |
+| **合计（vs 基线 177.7 s）** | gptq | 149.2 s（-16.0%） | **129.2 s（-27.3%）** | 132.0 s（-25.7%） | 133.0 s（-25.2%） |
+| ppl（wiki / c4） | turboquant | 6.8037 / 9.9446 | 6.8070 / 9.9469 | 6.9909 / 10.1548 | 6.7959 / 9.9606 |
+| ppl（wiki / c4） | gptq | 7.0322 / 10.1355 | 7.0342 / 10.1348 | 7.2582 / 10.3541 | 7.0197 / 10.1482 |
+
+- **WxFP4 的 e2m1 激活代价在 4bpw 显形（两份 checkpoint 均复现）**：ppl 比
+  同 ckpt 三模式高 +0.19~+0.23 / +0.21（turboquant wiki 6.99 vs 6.796–6.807；
+  gptq 7.26 vs 7.02–7.03），且 e2m1 一项 ≈ 整个 4bit W 量化的代价
+  （turboquant：fp16→W-only +0.219，加 e2m1 再 +0.187；gptq：+0.447 再
+  +0.224，加性、与 W 源无关）。**4bpw bit 池 100% bit4 → e2m1 覆盖全部 MoE
+  计算**；2bpw 不显形是覆盖面问题（bit1/4 池仅 2.1% expert、97.9% bit2 走
+  WxA8 int8 激活），不只是误差掩蔽。机制：e2m1 仅 1 位尾数（网格 worst
+  relerr ~20–33%，对照 e4m3 实测 2.57%）+ per-32 e8m0 限 2 的幂；格式被
+  dot_scaled/FP4 MMA 锁死，缓解只能从 scale 选择、舍入、敏感层 A 位宽分派、
+  A-error-aware W 校准入手（值得专门研究）
+- **4bpw 质量侧 turboquant 明显占优**：全模式 ppl 比 gptq 好 +0.22（wiki）/
+  +0.19（c4）（wxa16 6.8037 vs 7.0322），两份 bit 池结构相同（100% bit4）；
+  gptq eval 快 3–6% 疑后跑 JIT 热缓存（turboquant 先跑付编译），吞吐口径
+  两者持平 ≤0.6%（见上节）——速度不构成区分项，质量 turboquant 胜
+- eval 口径 4bpw 排名与 2bpw 一致（WxA8 最快、WxFP4/WxFP8 持平、WxA16 最慢），
+  与吞吐口径（WxFP4 登顶）不同：吞吐大 B 下 4bit 读取字节减半的红利在 eval
+  小 B 形态吃不到
+- 4bpw 比 2bpw 同模式慢 9–38%（wxa16 136.5→149.2–154.4 / wxa8 96.5→129.2–
+  133.7 s）：bit 池更宽、每层搬运字节与 kernel 负载更重
+
 
 ### Qwen3.5-122B-A10B（bpw2，RTX 5090，sequential eval，git da4bd33+）
 
@@ -118,12 +165,13 @@ cache 路径；每条结果都经过 cache-vs-full logits 一致性守卫（chec
 | 官方 GPTQ-Int4（单卡） | 51.7 | 329.2 | 3298.6 | 4941.3 | 3.93 / 3.95 / 3.94 | 0.644 | PASS |
 
 同批次四模式（git 3349151，P5-2 合并路径全模式落地后，1018.thrput.10；
-4bpw 为 turboquant 与 gptq 两份 checkpoint 连跑的区间，两者互差 ≤0.6%）：
+4bpw 先跑 gptq、后跑 turboquant（261016 两份 checkpoint），区间即两值——
+除 wxa16 pf4096（gptq 4796 vs turboquant 4678，2.5%）外互差 ≤0.9%）：
 
 | 模式 | pf16 | pf128 | pf2048 | pf4096 | dec（256/512/1024） | ttft | check |
 |---|---|---|---|---|---|---|---|
 | 4bpw wxa16 | 74.8–75 | 460.6–464.4 | 3535–3548 | 4678–4796 | 13.67–13.79 | 0.352 | PASS |
-| 4bpw wxa8 | 84–84.7 | 440.4–444.1 | 3607–3621 | 4930–4955 | 13.67–14.00 | 0.361 | PASS |
+| 4bpw wxa8 | 84–84.7 | 440.4–444.1 | 3611–3621 | 4938–4955 | 13.67–14.00 | 0.361 | PASS |
 | 4bpw wxfp8 | 83.7–84.3 | 442–444.6 | 3597–3609 | 4930–4944 | 13.82–13.92 | 0.362–0.363 | PASS |
 | **4bpw wxfp4** | **91.8–92.2** | **517.5–521.4** | **4110–4127** | **5443–5447** | **14.03–14.19** | **0.318–0.321** | PASS |
 | 2bpw wxa16（1/2/4 混合） | 70.8 | 430 | 3447.3 | 4798.1 | 13.24–13.29 | 0.374 | PASS |
@@ -148,9 +196,10 @@ cache 路径；每条结果都经过 cache-vs-full logits 一致性守卫（chec
   依次落地；上表同批次数字即合并路径。对拍全部 bit-exact
   （test/test_moe_merged_kernel.py，kernel 级 + 模块级含 dtype×hoist）。
   `DARTMOQ_MERGED_MOE=0` 可回退逐 expert 对照
-- **gptq 与 turboquant 权重源速度无差异**：4bpw 两份 checkpoint（turboquant /
-  gptq 261016）同批次连跑，四模式全档互差 ≤0.6%（如 wxfp4 pf2048 4127 vs
-  4110）——当前速度完全由 kernel 形态决定，与权重来源（量化算法）无关
+- **gptq 与 turboquant 权重源速度基本无差异**：4bpw 两份 checkpoint（先跑
+  gptq、后跑 turboquant，261016）同批次连跑，四模式除 wxa16 pf4096（4796 vs
+  4678，2.5% 单档波动）外全档互差 ≤0.9%（如 wxfp4 pf2048 gptq 4127 vs
+  turboquant 4110）——当前速度由 kernel 形态决定，与权重来源（量化算法）无关
 - **四激活位制互比**：prefill wxfp4 领先（pf2048 4110–4127，比其余三模式
   ~3600 档 +14%），wxa8/wxfp8 持平，wxa16 慢 ~3%；decode 四模式挤在
   13.7–14.2（wxfp4 最高 14.03–14.19），ttft wxfp4 最低（0.318）；fp4 优势来自

@@ -57,7 +57,11 @@ LAYER_TIME_RE = re.compile(r"Layer (?P<layer>\d+) total reconstruct and quantiza
 EVAL_DATASETS_RE = re.compile(r"^Datasets:\s+(?P<datasets>.+)")
 EVAL_SEQUENTIAL_RE = re.compile(r"^Sequential eval:\s+(?P<sequential>\S+)")
 EVAL_STANDBY_CPU_RE = re.compile(r"^Standby CPU:\s+(?P<standby_cpu>\S+)")
-EVAL_LOAD_QUANTIZED_RE = re.compile(r"^Load quantized checkpoint:\s+(?P<path>\S+)")
+# eval_qwen35.py 的 checkpoint 行有两代格式：旧 "Load quantized checkpoint:"
+# 与现行参数回显 "Quantized checkpoint:"（吞吐日志的 "Loading quantized
+# checkpoint from:" 带 Loading 前缀，不会被此正则误匹配）
+EVAL_LOAD_QUANTIZED_RE = re.compile(
+    r"^(?:Load )?[Qq]uantized checkpoint:\s+(?P<path>\S+)")
 # WxA8 推理模式（eval_qwen35.py 打印，位于 Quantized checkpoint 之后）
 EVAL_INFERENCE_QUANT_MODE_RE = re.compile(r"^Inference quant mode:\s+(?P<mode>\S+)")
 
@@ -150,6 +154,15 @@ class RunRecord:
     # Temporary fields for accumulating time from old logs
     _layer_times: list[float] = field(default_factory=list, repr=False)
     _ppl_eval_times: list[float] = field(default_factory=list, repr=False)
+
+    @property
+    def ckpt(self) -> str:
+        """checkpoint 目录名：吞吐批次混合多 checkpoint（gptq/turboquant/s1）
+        时区分每行来源。优先吞吐 summary 的 checkpoint: 行，其次 eval 侧。"""
+        for p in (self.checkpoint_path, self.ckpt_path, self.model_path):
+            if p:
+                return _last_path_component(p)
+        return ""
 
     def finalize(self, end_line: int) -> None:
         self.end_line = end_line
@@ -654,6 +667,9 @@ def _field_value(record: RunRecord, field: str) -> str:
 def _select_fields(records: list[RunRecord]) -> list[str]:
     """自适应选择展示列：按批次内容决定列集合。"""
     fields = list(COMMON_FIELDS)
+    # checkpoint 目录名列：混合批次（gptq/turboquant 等）必须能区分每行来源
+    if any(r.ckpt for r in records):
+        fields.insert(fields.index("model_name") + 1, "ckpt")
     # bpw 不触发 eval 列集：吞吐记录的 bpw 来自 checkpoint: 行（summary），
     # 不是量化元数据，不应把 sli/qsch/rank 等 eval 列带出来
     if any(any(getattr(r, f) for r in records)
@@ -692,6 +708,7 @@ def _export_header(field: str) -> str:
 
 PLAIN_HEADERS = {
     "model_name": "model",
+    "ckpt": "ckpt",
     "slices": "sli",
     "quant_scheme": "qsch",
     "rank_mode": "rank",
@@ -719,6 +736,7 @@ PLAIN_HEADERS = {
 
 EXPORT_HEADERS = {
     "model_name": "model",
+    "ckpt": "ckpt",
     "slices": "slices",
     "quant_scheme": "quant_scheme",
     "rank_mode": "rank_mode",
