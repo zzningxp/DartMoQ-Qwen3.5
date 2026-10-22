@@ -18,8 +18,7 @@ export PYTORCH_CUDA_ALLOC_CONF="max_split_size_mb:128,roundup_power2_divisions:4
 # 我们的 2bpw checkpoint（四种 kernel 模式，checkpoint 同一份）
 # modelname="$PWD/models/qwen3.5-2bpw-260930-s1/"
 modelname="$PWD/models/qwen3.5-35B-4bpw-261016-gptq/"
-# modelname="$PWD/models/qwen3.5-35B-4bpw-261016-turboquant/"
-# modelname="$PWD/models/qwen3.5-112B-2bpw-260930-s1/"
+
 
 python benchmarks/bench_throughput.py --quant-dir $modelname \
     --prefill-lens 16,128,2048,4096 --decode-tokens 256,512,1024

@@ -8,8 +8,9 @@ Triton kernel 量化推理支持三种精度模式（共用同一份 packed chec
 - **WxA8** ✅：INT8 激活张量 + INT8 Tensor Core（MoE + attention 全路径）
 - **WxFP8** ✅：e4m3 激活 + FP8 Tensor Core（MoE 路径；attention 混合部署保 WxA8。
   定位是 WxFP4 的基础设施预备步骤）
-- **WxFP4** ✅ 保守版落地 + W 侧折叠直存（bit1/4 expert：e2m1 激活 + FP4 MX MMA，
-  权重加载期折叠为直存 e2m1，kernel 零查表；bit2 主力与 attention 维持 WxA8。
+- **WxFP4** ✅ 保守版落地 + W 侧折叠直存 + bit 池合并 kernel（bit1/4 expert：
+  e2m1 激活 + FP4 MX MMA；小池权重加载期折叠为直存 e2m1 零查表、大池 in-kernel
+  LUT 免折叠副本；bit2 主力与 attention 维持 WxA8。
   ⚠ 需 dart312-t38 环境——triton ≥3.8 + ptxas 12.8，见路线图）。
   Triton 原生 `mma.kind::mxf4nvf4`，dense 492 TF（1.39× fp8）；
   另含面向普通 MoE 的专家级纯 MX GEMM 路径
@@ -115,43 +116,63 @@ cache 路径；每条结果都经过 cache-vs-full logits 一致性守卫（chec
 |---|---|---|---|---|---|---|---|
 | 官方 FP8（双卡） | 215.6 | 1657.9 | 10009.8 | 10082.3 | 15.77 / 15.82 / 15.84 | 0.142 | PASS |
 | 官方 GPTQ-Int4（单卡） | 51.7 | 329.2 | 3298.6 | 4941.3 | 3.93 / 3.95 / 3.94 | 0.644 | PASS |
-| 4bpw wxa16（全 4bit） | 43 | 163 | 1416–1428 | 2403–2411 | 11.00–11.13 | 0.884–0.888 | PASS |
-| 4bpw wxa8 | 111.5 | 492.7 | **3619.4** | 4898.8 | 13.33–13.36 | **0.322** | PASS |
-| 4bpw wxa8（逐 expert，旧基线） | 46.2–46.4 | 181 | 1604–1611 | 2692–2701 | 11.26–11.39 | 0.794–0.796 | PASS |
-| 4bpw wxfp8 | 84.7–85.1 | 445–446.2 | 3605.4–3620 | **4932.2–4959.9** | **13.93–14.03** | 0.36–0.361 | PASS |
-| 4bpw wxfp8（逐 expert，旧基线） | 46.4–46.5 | 181–184 | 1606–1609 | 2680–2686 | 11.30–11.43 | 0.791–0.797 | PASS |
-| 4bpw wxfp4（逐 expert + LUT） | 45.4 | 178.6 | 1567.3 | 2641.0 | 11.12–11.14 | 0.806 | PASS |
-| 2bpw wxa16（1/2/4 混合） | 43 | 160.3 | 1421.7 | 2421.6 | 10.91–10.97 | 0.890 | PASS |
-| 2bpw wxa8 | 77.9 | 407.2 | **3648.8** | 5186.8 | 11.69 | 0.406 | PASS |
-| 2bpw wxa8（逐 expert，旧基线） | 44.6 | 177.6 | 1611.2 | 2765.6 | 9.78–9.84 | 0.824 | PASS |
-| 2bpw wxfp8 | 77.2 | 402.3 | 3590.9 | **5188.2** | **11.62–11.64** | **0.404** | PASS |
-| 2bpw wxfp8（逐 expert，旧基线） | 45.2 | 180.6 | 1628.2 | 2785.0 | 9.92–9.93 | 0.819 | PASS |
-| 2bpw wxfp4 | 44.9 | 176.8 | 1611.5 | 2760.6 | 9.95–9.96 | 0.824 | PASS |
 
-- **P5-2 合并路径（2026-10-20 落地，wxa8 + wxfp8）**：按 bit 池合并多 expert 为单次
-  grouped kernel launch，消灭逐 expert 的 Python/torch 调度链——4bpw 与 2bpw
-  的 prefill 均 **~2.2×**（wxa8/wxfp8 两模式同幅）、decode **+17~23%**、MoE 段
-  57.3→41.3ms（wxa8 4bpw）；prefill 反超官方 GPTQ-Int4，与官方 FP8 的差距
-  收窄到 decode 1.12~1.18× / prefill 2.77×（per-GPU 口径：官方 FP8 双卡是
-  device_map 串行切分无重叠，双卡只解决容量不折半差距）。`DARTMOQ_MERGED_MOE=0`
-  可回退逐 expert 对照；wxa16/wxfp4 的合并同型为下一步
-- **wxfp8 合并后 decode 反超 wxa8**（4bpw 13.93–14.03 vs 13.33–13.36，+5%）：
-  逐 expert 时代两模式 decode 持平（11.3 vs 11.3），调度链消失后 FP8 Tensor
-  Core 的算力优势才兑现（MoE 段 39.9 vs 41.3ms）；prefill 两模式持平
-  （3620 vs 3619），小 prefill（pf16/pf128）wxa8 仍更快。2bpw 两模式全档
-  基本持平（bit2 主导，kernel 形态相同）
-- **4bpw vs 2bpw**（同合并路径）：decode 4bpw 快 14~21%（wxa8 13.34 vs 11.69；
-  wxfp8 14.03 vs 11.63），2bpw 仅 pf4096 赢回 ~6%——低 bit 混合路径（1/2-bit
-  解包 + per-bit 分池）的固定开销在开销主导的场景里净亏，带宽收益只在长
-  prefill 兑现（合并后带宽收益可见度从 +3% 提高到 +6%）
-- 4bpw wxfp4 为「逐 expert + WFF-5 预算跳过 fold 的 in-kernel LUT」双重旧路径
-  叠加的数字（首个可跑通的 4bpw wxfp4，此前 OOM），待 fp4 合并接线后重测
+同批次四模式（git 3349151，P5-2 合并路径全模式落地后，1018.thrput.10；
+4bpw 为 turboquant 与 gptq 两份 checkpoint 连跑的区间，两者互差 ≤0.6%）：
+
+| 模式 | pf16 | pf128 | pf2048 | pf4096 | dec（256/512/1024） | ttft | check |
+|---|---|---|---|---|---|---|---|
+| 4bpw wxa16 | 74.8–75 | 460.6–464.4 | 3535–3548 | 4678–4796 | 13.67–13.79 | 0.352 | PASS |
+| 4bpw wxa8 | 84–84.7 | 440.4–444.1 | 3607–3621 | 4930–4955 | 13.67–14.00 | 0.361 | PASS |
+| 4bpw wxfp8 | 83.7–84.3 | 442–444.6 | 3597–3609 | 4930–4944 | 13.82–13.92 | 0.362–0.363 | PASS |
+| **4bpw wxfp4** | **91.8–92.2** | **517.5–521.4** | **4110–4127** | **5443–5447** | **14.03–14.19** | **0.318–0.321** | PASS |
+| 2bpw wxa16（1/2/4 混合） | 70.8 | 430 | 3447.3 | 4798.1 | 13.24–13.29 | 0.374 | PASS |
+| 2bpw wxa8 | 77.7 | 408.8 | 3645.3 | 5232.6 | 11.78–11.84 | 0.398 | PASS |
+| 2bpw wxfp8 | 78.2 | 405.7 | 3626.4 | 5206.6 | 11.76–11.83 | 0.402 | PASS |
+| 2bpw wxfp4 | 78 | 409.3 | **3655.8** | 5225.2 | 11.45–11.67 | 0.402 | PASS |
+
+逐 expert 旧基线（P5-2 之前，对照用）：
+
+| 模式 | pf16 | pf128 | pf2048 | pf4096 | dec | ttft | check |
+|---|---|---|---|---|---|---|---|
+| 4bpw wxa8（逐 expert） | 46.2–46.4 | 181 | 1604–1611 | 2692–2701 | 11.26–11.39 | 0.794–0.796 | PASS |
+| 4bpw wxfp8（逐 expert） | 46.4–46.5 | 181–184 | 1606–1609 | 2680–2686 | 11.30–11.43 | 0.791–0.797 | PASS |
+| 4bpw wxfp4（逐 expert + LUT） | 45.4 | 178.6 | 1567.3 | 2641.0 | 11.12–11.14 | 0.806 | PASS |
+| 2bpw wxa8（逐 expert） | 44.6 | 177.6 | 1611.2 | 2765.6 | 9.78–9.84 | 0.824 | PASS |
+| 2bpw wxfp8（逐 expert） | 45.2 | 180.6 | 1628.2 | 2785.0 | 9.92–9.93 | 0.819 | PASS |
+| 2bpw wxfp4（逐 expert） | 44.9 | 176.8 | 1611.5 | 2760.6 | 9.95–9.96 | 0.824 | PASS |
+
+- **P5-2 合并路径收官（2026-10-22，四模式全落地）**：按 bit 池合并多 expert 为
+  单次 grouped kernel launch，消灭逐 expert 的 Python/torch 调度链。wxa8/wxfp8
+  （10-20）与 wxa16（10-21）、wxfp4（10-22，in-kernel LUT + WFF-5 小池折叠直读）
+  依次落地；上表同批次数字即合并路径。对拍全部 bit-exact
+  （test/test_moe_merged_kernel.py，kernel 级 + 模块级含 dtype×hoist）。
+  `DARTMOQ_MERGED_MOE=0` 可回退逐 expert 对照
+- **gptq 与 turboquant 权重源速度无差异**：4bpw 两份 checkpoint（turboquant /
+  gptq 261016）同批次连跑，四模式全档互差 ≤0.6%（如 wxfp4 pf2048 4127 vs
+  4110）——当前速度完全由 kernel 形态决定，与权重来源（量化算法）无关
+- **四激活位制互比**：prefill wxfp4 领先（pf2048 4110–4127，比其余三模式
+  ~3600 档 +14%），wxa8/wxfp8 持平，wxa16 慢 ~3%；decode 四模式挤在
+  13.7–14.2（wxfp4 最高 14.03–14.19），ttft wxfp4 最低（0.318）；fp4 优势来自
+  操作数减半（A 侧 e2m1 打包 + W 侧 nibble）与 dot_scaled 块缩放 MMA。例外在
+  2bpw：量化激活三模式 decode 11.5–11.8 而 wxa16 13.2（低 bit 混合池下
+  bit2-int8 + bit1/4-e2m1 双格式激活链的每步固定成本），prefill 则三模式
+  反超 wxa16（~3600 vs 3384）
+- **与官方 FP8 的差距（仍是主要差距）**：pf2048 2.42× / pf4096 1.85× /
+  pf128 3.18× / decode 1.12× / ttft 2.24×。拆分诊断（由官方 json latency
+  逐档外推）：长档边际速率 125–131 vs 官方 98.6 μs/tok（1.3×，kernel 效率）
+  + 每次 prefill 调用 ~180–240ms 固定开销（官方 ~2–15ms）两个独立问题，
+  差距随 prefill 变长收窄。下一步：pf2048 单步分层 profile（attention/
+  dense/MoE/搬运拆分，P8-1 同法）+ wxfp4 合并 kernel tile cfg 扫描
+  （LUT 档锚点 TF 仅 folded 直读的一半，有 1.6× cfg 空间）进行中
 - 全部差异的逐项分析（四个问题的根因拆解）见
   [roadmaps/throughput-analysis-261020.md](roadmaps/throughput-analysis-261020.md)
 - 口径与明细：[roadmaps/throughput-bench-261019.md](roadmaps/throughput-bench-261019.md)；
   日志 1015.thrput.1（2bpw 逐 expert）/ 1018.thrput.1.w4（4bpw 逐 expert）/
   1018.thrput.2.official.fp8 / 1018.thrput.3.official.gptq4int /
-  1018.thrput.4–5（wxa8 合并）/ 1018.thrput.7（wxfp8 合并）
+  1018.thrput.4–5（wxa8 合并）/ 1018.thrput.7（wxfp8 合并）/
+  1018.thrput.8.new.fp16.2 + .9.new.fp4 + .10.new.all（wxa16/wxfp4 合并，
+  同批次四模式）
 
 ## 下游任务评测（lm-eval 七任务，对齐 BitsMoE 口径）
 
@@ -423,6 +444,11 @@ python benchmarks/bench_throughput.py --quant-dir models/<ckpt>/ --mode wxa8 \
   - **W 侧 load 期折叠直存 e2m1**：索引→e2m1 映射挪到 ctx 构建期一次完成，
     kernel 直读零查表（bit-exact；bit4 零膨胀、bit1 全模型 +47MB）；
     gate_up kernel 2.0-2.4×、eval wall -9.8%，**WxFP4 成为最快模式**
+  - **P5-2 bit 池合并 kernel**（2026-10-22）：同一 bit 池多 expert 单次
+    launch，W 侧 in-kernel LUT 为自然设计（大池免折叠副本，WFF-5 的 +10GB
+    问题消失；≤64MB 小池直读折叠副本 bit-exact）；对拍 kernel 级
+    （LUT/folded 四方位）+ 模块级（dtype×hoist）全 bit-exact，合并后
+    prefill +14% / decode 持平微胜（见吞吐小节）
   - **端到端**：ppl 与 WxA8 持平（wiki +0.0007 / c4 +0.0035）且全面优于 WxFP8；
     c4 比 WxA8 快 4.9%
   - 激进版（全 expert 迁移，3-4）已立项挂起，入口条件三条见 roadmap；
