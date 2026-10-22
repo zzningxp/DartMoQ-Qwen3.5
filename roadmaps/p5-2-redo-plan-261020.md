@@ -74,3 +74,31 @@
   vs 492.7）wxa8 仍更快；2bpw 两模式全档持平（bit2 主导、kernel 形态相同）；
   与官方 FP8 decode 差距收窄至 **1.12×**（15.77/14.03）。ppl eval 待本人跑
   （bit-exact 预期：合并 kernel 同 tile 分解同累加顺序，模块 A/B 已零差）。
+- 2026-10-21：**wxa16 合并同型落地（待本人主流程验证）**——
+  `triton_kernels.py` 增 `_turboquant_fused_matmul_merged_kernel_gf` + 两个
+  merged wrapper（block_info/expert_info 骨架复用 a8 的
+  `_build_merged_block_info`，import 不重复实现；wxa16 语义差异：无激活
+  量化/无 xs、acc_g/total_acc 用 tl.float16（`out_dtype=tl.float16`）、
+  norms masked other=1.0、旋转在 wrapper 外——gate_up 整池一次
+  batch_rotate_input（hoisted 或现算）、down 逐 expert `seed + start`）；
+  WxA16 基类 `_expert_compute` 加合并门控（精确类 + env + pools_ok +
+  **groups_ok** + gf 双侧标志）。groups_ok 是 bring-up 补的：test_quant_io
+  小形状 inter/gs=1 触发合并 wrapper 的 num_groups>=2 拒绝（逐 expert
+  wrapper 有 ==1 回退分支，合并版设计上要求调用侧回退）——真实模型
+  gate_up 16 组 / down 4 组恒满足。对拍（t38 自测）：kernel 级 a16
+  decode/prefill × bit1/2/4 全 bit-exact，模块级 a16 A/B bit-exact
+  （B=12/2048）；test_quant_io 全绿（wxa8 0.01336 / wxfp8 0.05042 与记录
+  一致，子类链零扰动）。**a16 特有口径注记：tile 表两档 BLOCK_K 不同
+  （gate_up small 128 / large 32），fp16 累加顺序跨档会变——合并
+  （B_total 选档）与逐 expert（B_e 选档）跨档时非位级一致（舍入级，
+  两者都正确）；真实 decode（双 small）/ eval bs=16（双 small）/ 大
+  prefill（双 large）均同档，ppl 位级校验仍成立**。perf 预览（64 expert
+  真实形状）：decode 2.22× / prefill 2.43×。待本人 bench（默认 --mode
+  wxa16）+ ppl（run.evalppl.sh wxa16 行）。
+- 2026-10-21（续）：**勘误官方 FP8 双卡口径**（详见
+  throughput-analysis-261020.md 变更记录）——bench 走 device_map=auto，
+  是 accelerate 连续层块 naive 切分：单请求流严格串行、无 TP、无流水线
+  重叠、无 EPLB（transformers 无 expert parallelism 概念）；双卡只解决
+  容量（35GB>31.4GB）不折算力。原「单卡等价 ~5000 / per-GPU 3.1×→1.4×」
+  作废，per-GPU prefill 差距按全量口径：合并前 6.2×、合并后 2.77×
+  （10009 vs 3619）。

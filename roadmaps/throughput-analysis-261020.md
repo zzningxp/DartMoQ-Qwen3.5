@@ -35,8 +35,12 @@ launch 本身。（B=32 的 eval profile 结论「warm 循环 GPU-bound」与 B=
   kernel**（一次 launch 覆盖全部 active expert，fp8 权重 × 128×128 block
   scale × fp8 tensor core，源头是 DeepGEMM 系 kernel）。没有 per-expert
   Python 循环、没有逐 expert launch。
-- **双卡红利**：35GB 装不进单卡，device_map=auto 两卡切分，prefill 两卡
-  并行——6.2× 里约一半是卡数。单卡等价 ~5000 tok/s，per-GPU 差距 **3.1×**。
+- **双卡是容量需求，不是算力红利（2026-10-21 勘误）**：35GB 装不进单卡
+  31.4GB，device_map=auto 按连续层块切到两卡；但这是 accelerate 的 naive
+  模型切分——单请求流下执行**严格串行**（前半层输出拷到 GPU1 后才开算
+  后半，期间 GPU0 空闲），既非 tensor parallel 也无流水线重叠，wall time
+  ≈ 40 层串行总和。**双卡不带来算力 ×2**（单卡装得下的话 wall time 基本
+  不变），per-GPU 差距就是全量 6.2×，不存在「单卡等价 ~5000」。
 - **attention 保 BF16**：官方只量化 experts（modules_to_not_convert 列了
   attn/conv/embed/lm_head/visual/mtp），attention 走原生 BF16 GEMM。虽然
   本机没装 flash-linear-attention、delta rule 落到 torch 参考实现（慢），
@@ -46,7 +50,8 @@ launch 本身。（B=32 的 eval profile 结论「warm 循环 GPU-bound」与 B=
 
 ## 2）我们的 4bpw 为什么比 FP8 慢不少（最关键）
 
-prefill 6.2×（单卡等价 3.1×）、decode 1.4×。拆 88.7ms/step（MoE 57.3ms
+prefill 6.2×（per-GPU 即 6.2×，双卡串行无重叠——见 §1 勘误）、decode
+1.4×。拆 88.7ms/step（MoE 57.3ms
 占 65%）与 pf2048 的 32ms/层：
 
 1. **MoE kernel 形态（主因）**：main 上逐 expert 循环是唯一路径，代价随 B
@@ -70,7 +75,7 @@ prefill 6.2×（单卡等价 3.1×）、decode 1.4×。拆 88.7ms/step（MoE 57.
    attention 是 8-bit 均匀码本（identity，免查表），反而轻。
 3. **激活量化链**：我们 wxa8 每层 per-token-per-group 旋转+量化（已 hoist
    优化）；官方 dynamic fp8 是 per-tensor 缩放直进 tensor core。
-4. **decode 差距小（1.4×）而 prefill 差距大（3.1×/卡）的机制**：decode
+4. **decode 差距小（1.4×）而 prefill 差距大（6.2×）的机制**：decode
    单 token 只激活 6-8 个专家——sort/scatter 数据量与循环长度小一个量级，
    且我们小 B tile 配置是 P5-3 专门调过的；fp8 侧 decode 每步还付跨卡
    同步。prefill 是 256 expert 全激活、逐 expert 串行被放大的场景。
@@ -115,7 +120,7 @@ Lloyd-Max 无法转 wxa8 是该配置特有的坑）。
 
 | 差距 | 量化 | 主因 |
 |---|---|---|
-| FP8 vs 我们 4bpw（prefill） | 6.2×（单卡 3.1×） | grouped kernel vs per-expert 循环 + 双卡 + BF16 attention |
+| FP8 vs 我们 4bpw（prefill） | 6.2× | grouped kernel vs per-expert 循环 + BF16 attention（双卡仅容量，见 §1 勘误） |
 | FP8 vs 我们 4bpw（decode） | 1.4× | 同上但小 B 场景我们撑住更多 |
 | 我们 4bpw vs 2bpw（decode） | 4bpw 快 13% | 低 bit 混合路径固定开销惩罚 |
 | Int4 vs 我们 4bpw（prefill） | Int4 快 2.06× | TritonV2 大 B GEMM |
@@ -127,8 +132,9 @@ Lloyd-Max 无法转 wxa8 是该配置特有的坑）。
   既有 profile 结论）；勘误 dec 单位误读。
 - 2026-10-20 深夜：**P5-2 合并路径落地（wxa8）后差距更新**——4bpw wxa8：
   pf2048 1603→3619.4、decode 11.27→13.34、MoE 段 57.3→41.3ms/step；与官方
-  FP8 差距收窄为 **decode 1.18×（15.77 vs 13.34）/ prefill 单卡等价 ~1.4×**
-  （fp8 双卡 10009 的单卡等价 ~5000 vs 3619）；prefill 反超官方 GPTQ-Int4
+  FP8 差距收窄为 **decode 1.18×（15.77 vs 13.34）/ prefill 2.77×
+  （10009 vs 3619，per-GPU 全量口径——§1 勘误后双卡不折半）**；
+  prefill 反超官方 GPTQ-Int4
   （3298）。剩余 41.3ms 的构成：down 逐 expert 旋转量化（v2 折进合并
   kernel）+ 激活链（工作 3）+ attention（工作 2）。§2 的机制分析（调度链
   /SM 填充）已被合并路径直接验证——消灭调度链正是主要收益来源。
@@ -139,3 +145,12 @@ Lloyd-Max 无法转 wxa8 是该配置特有的坑）。
   FP8 Tensor Core 的算力优势被调度链掩盖，合并后才兑现；这同时说明该
   差距成分是「kernel 形态 × 数据类型」的乘积效应，不是单纯的 kernel
   形态问题。2bpw 两模式全档持平（bit2 主导）。
+- 2026-10-21：**勘误「单卡等价」口径**（起因：核查官方 FP8 双卡的并行
+  形态）——bench 走 `get_qwen35_model(device_map="auto")`，是 accelerate
+  按连续层块的 naive 切分：单请求流下**严格串行**、无 TP、无流水线重叠，
+  双卡只解决容量（35GB>31.4GB）不带来算力 ×2；且 transformers 路径无
+  expert parallelism 概念，EPLB 不适用（那是 vLLM/SGLang 在 EP 下的特性，
+  config 也无相关字段）。原「6.2× 里一半是卡数 / 单卡等价 ~5000 /
+  per-GPU 3.1×→1.4×」的推导作废；per-GPU prefill 差距按全量口径：
+  合并前 6.2×、合并后 2.77×。注意这同时意味着 vLLM TP=2（真正层内切分）
+  的官方 FP8 prefill 上限比本基线更高，对比时须标注。

@@ -132,7 +132,8 @@ cache 路径；每条结果都经过 cache-vs-full logits 一致性守卫（chec
   grouped kernel launch，消灭逐 expert 的 Python/torch 调度链——4bpw 与 2bpw
   的 prefill 均 **~2.2×**（wxa8/wxfp8 两模式同幅）、decode **+17~23%**、MoE 段
   57.3→41.3ms（wxa8 4bpw）；prefill 反超官方 GPTQ-Int4，与官方 FP8 的差距
-  收窄到 decode 1.12~1.18× / prefill 单卡等价 ~1.4×。`DARTMOQ_MERGED_MOE=0`
+  收窄到 decode 1.12~1.18× / prefill 2.77×（per-GPU 口径：官方 FP8 双卡是
+  device_map 串行切分无重叠，双卡只解决容量不折半差距）。`DARTMOQ_MERGED_MOE=0`
   可回退逐 expert 对照；wxa16/wxfp4 的合并同型为下一步
 - **wxfp8 合并后 decode 反超 wxa8**（4bpw 13.93–14.03 vs 13.33–13.36，+5%）：
   逐 expert 时代两模式 decode 持平（11.3 vs 11.3），调度链消失后 FP8 Tensor
@@ -433,7 +434,8 @@ python benchmarks/bench_throughput.py --quant-dir models/<ckpt>/ --mode wxa8 \
   - bench_throughput.py P0 口径（batch=1 prefill/decode + cache 一致性守卫），
     我方 checkpoint 四模式 + 官方 FP8（双卡）/GPTQ-Int4（gptqmodel TritonV2）
   - 核心发现：与官方 FP8 的差距主因是 per-expert 循环 vs grouped kernel
-    （prefill 单卡等价 3.1×）；低 bit 混合路径有固定开销惩罚（2bpw decode
+    （prefill per-GPU 6.2×；FP8 双卡系 device_map 串行切分、无算力红利）；
+    低 bit 混合路径有固定开销惩罚（2bpw decode
     慢 4bpw 13%）；我们小 B 场景反超 gptqmodel Int4 decode 2.9×
   - 详见 [roadmaps/throughput-bench-261019.md](roadmaps/throughput-bench-261019.md)
     与 [roadmaps/throughput-analysis-261020.md](roadmaps/throughput-analysis-261020.md)

@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from collections import defaultdict
 import math
+import os
 import time
 import gc
 
@@ -20,6 +21,8 @@ from turboquant_utils.triton_kernels import (
     triton_fused_matmul_grouped_slice_in_features,
     triton_fused_matmul_grouped_slice_rows_gf,
     triton_fused_matmul_grouped_slice_in_features_gf,
+    triton_fused_matmul_merged_rows_gf,
+    triton_fused_matmul_merged_in_features_gf,
     convert_to_group_first,
 )
 from turboquant_utils.cuda_profiler import CudaStageProfiler
@@ -582,32 +585,13 @@ class WxA16BitPartitionedGroupMoE(nn.Module):
         Returns:
             {bit_str: x_rot}，只包含判定为划算的 bit。
         """
-        # 旋转前统一 cast 到 fp16：kernel wrapper 的 fast path 对非 fp16 输入
-        # 本来就做 x.half() 后再旋转（per-expert 路径每 expert cast 一次），
-        # 提升只是把这步提到循环外做一次，数学等价。
-        # 本模型真实运行时输入是 bf16（qwen35_utils.py:22），旋转与 matmul 均在 fp16 完成。
-        x_rot_src = x if x.dtype == torch.float16 else x.half()
-
-        T = x.shape[0]
-        cum = np.asarray(tokens_per_expert)
-        counts = np.diff(np.concatenate(([0], cum)))  # 每个 expert 的 token 数
-
-        out = {}
-        for bit_str, ctx in bit_ctx.items():
-            # 只有 gf 主路径（num_groups >= 2 且对齐）支持 x_is_rotated
-            if not ctx["gf_gate_up"]:
-                continue
-            gs = ctx["gate_up_group_size"]
-            in_f = ctx["gate_up_in_features"]
-            if in_f % gs != 0 or in_f // gs < 2:
-                continue
-
-            rows = int(counts[self._expert_mask_by_bit[bit_str]].sum())
-            if rows <= T * self.rotation_hoist_threshold:
-                continue  # 预旋转不划算（长尾 bit）
-
-            out[bit_str] = batch_rotate_input(x_rot_src, gs, ctx["gate_up_seed"])
-
+        # 预旋转保持激活 dtype（真实模型 bf16），不得在此 cast 到 fp16：
+        # 下游 dtype 链以 x_rot.dtype 为 orig_dtype 决定 kernel 输出的
+        # cast 目标——若预旋转输出 fp16 而 x 是 bf16，gate_up/down 输出
+        # 都会是 fp16，最终 bf16.index_add_(fp16) 报 dtype 错误
+        # （index_add_ 硬性要求 self/source 同型）。cast 到 fp16 由
+        # wrapper 在 kernel 入口统一做（逐 expert: x.half()；merged:
+        # wrapper 内同序 cast），旋转本身与输入同型，两条路径逐点一致。
         T = x.shape[0]
         cum = np.asarray(tokens_per_expert)
         counts = np.diff(np.concatenate(([0], cum)))  # 每个 expert 的 token 数
@@ -757,9 +741,24 @@ class WxA16BitPartitionedGroupMoE(nn.Module):
         """expert 循环计算 + scatter 回写（默认实现：逐 expert）。
 
         P5-2 重做：从 forward 原样抽出，允许子类整体覆盖为合并路径
-        （WxA8 的按 bit 池 grouped kernel）。返回计时计数与结束时刻，
+        （WxA8/WxFP8 的按 bit 池 grouped kernel）。WxA16 本类默认也走
+        合并路径（2026-10-21 接入）。返回计时计数与结束时刻，
         字段与 forward 的 last_timings 对齐。
         """
+        # 合并路径仅 WxA16 本类生效（精确类判定：WxA8/WxFP8/WxFP4 子类
+        # 各有自己的覆盖/回退链，不能误入本类的 fp16 语义合并路径）；
+        # 要求 gf 主路径 + 池内 inter 一致 + 两侧 num_groups >= 2，
+        # 否则回退逐 expert
+        if (self.__class__ is WxA16BitPartitionedGroupMoE
+                and os.environ.get("DARTMOQ_MERGED_MOE", "1") != "0"
+                and self._merged_pools_ok()
+                and self._merged_groups_ok(bit_ctx)
+                and all(c.get("gf_gate_up") and c.get("gf_down")
+                        for c in bit_ctx.values())):
+            return self._expert_compute_merged(
+                x, bit_ctx, x_rot_by_bit, sorted_tokens, sorted_weights,
+                tokens_per_expert, final_hidden_states, prof)
+
         time_dequant_total = 0.0
         time_gemm_total = 0.0
         time_triton_total = 0.0
@@ -852,6 +851,131 @@ class WxA16BitPartitionedGroupMoE(nn.Module):
             t_compute_end=time.time(),
         )
 
+    # ------------------------------------- P5-2 同型：WxA16 合并路径
+
+    def _expert_compute_merged(self, x, bit_ctx, x_rot_by_bit, sorted_tokens,
+                               sorted_weights, tokens_per_expert,
+                               final_hidden_states, prof):
+        """按 bit 池合并多 expert（wxa16 版）：每池一次 gather、整池旋转
+        （hoisted 或整池一次 batch_rotate_input）、一次合并 gate_up、一次
+        silu×up、逐 expert 旋转（v1 保留）+ 一次合并 down、一次整池 scatter。
+
+        与 WxA8/WxFP8 的合并编排逐点对应（池/expert_info 构建复用共享
+        工具），wxa16 差异：无激活量化、旋转在 wrapper 外（gate_up 整池
+        一次 / down 逐 expert 一次 bmm）、输出 dtype 链对齐逐 expert
+        wrapper（fp16 kernel 输出直建输入 dtype / down 后 cast 回激活 dtype）。
+
+        数学与逐 expert 路径等价：合并 kernel 同 tile 分解、同累加顺序——
+        同 B 档位下 bit-exact（tile 表两档 BLOCK_K 不同，跨档时仅舍入级
+        差异；真实 decode（双 small）/ prefill（双 large）均同档，
+        见 test/test_moe_merged_kernel.py）。
+        """
+        time_triton_total = 0.0
+        pools, active_experts_count, active_bits_count = self._merged_pools(
+            tokens_per_expert)
+
+        for bit_str, members in pools.items():
+            ctx = bit_ctx[bit_str]
+            bit = members[0][1]
+            inter = members[0][3] - members[0][2]
+            gs_gu = ctx["gate_up_group_size"]
+            in_f = ctx["gate_up_in_features"]
+            gs_dn = ctx["down_group_size"]
+
+            # 池内 token/权重（各成员行段按序拼接，一次 gather）
+            pool_tokens = torch.cat(
+                [sorted_tokens[ts:ts + n] for _e, _b, _s, _e2, ts, n in members])
+            pool_weights = torch.cat(
+                [sorted_weights[ts:ts + n] for _e, _b, _s, _e2, ts, n in members])
+
+            # gate_up 输入：hoisted 则整池切片；否则整池一次旋转
+            # （旋转逐行独立，整池旋转后切片 ≡ 逐 expert 旋转，P6-1 同判据）
+            hoisted = x_rot_by_bit.get(bit_str)
+            if hoisted is not None:
+                x_pool = hoisted[pool_tokens]
+            else:
+                src = x[pool_tokens]
+                if src.dtype != torch.float16:
+                    src = src.half()
+                x_pool = batch_rotate_input(src, gs_gu, ctx["gate_up_seed"])
+
+            # 合并 gate_up（列切片 2*start / 2*inter，池内统一）
+            expert_info_gu = self._merged_expert_info_rows(members)
+
+            with prof.stage("merged_gate_up"):
+                t_k = time.time()
+                gu = triton_fused_matmul_merged_rows_gf(
+                    x_pool,
+                    ctx["gate_up"]["indices_packed_gf"],
+                    ctx["gate_up_codebook"],
+                    ctx["gate_up"]["norms_gf"],
+                    expert_info_gu, gs_gu, in_f,
+                    bit_width=bit,
+                    norms_prescaled=ctx["gate_up_norms_prescaled"])
+                time_triton_total += time.time() - t_k
+                # 非预旋转池：x_pool 按逐 expert 同序 cast 到 fp16 再旋转，
+                # wrapper 输出跟随 fp16；转回 x.dtype 对齐下游激活链——
+                # act_dtype、down 输出与 final_hidden_states 必须同型，
+                # index_add_ 硬性要求 self/source 一致（2bpw 长尾池走此分支）
+                if gu.dtype != x.dtype:
+                    gu = gu.to(x.dtype)
+
+            # silu×up 一次（整池扁平输出，gate 前 inter 列 up 后 inter 列；
+            # gu 已由 wrapper 直建输入 dtype，与逐 expert 的输出 dtype 一致）
+            with prof.stage("silu_mul"):
+                gate = gu[:, :inter]
+                up = gu[:, inter:]
+                del gu
+                act = F.silu(gate) * up
+                del gate, up
+            act_dtype = act.dtype
+
+            # down：逐 expert 旋转（seed + start；v1 每 expert 一次 bmm）
+            act_parts = []
+            cursor = 0
+            for _e, _b, start, _e2, _ts, n in members:
+                act_e = act[cursor:cursor + n]
+                if act_e.dtype != torch.float16:
+                    act_e = act_e.half()
+                act_parts.append(
+                    batch_rotate_input(act_e, gs_dn, ctx["down_seed"] + start))
+                cursor += n
+            del act
+            expert_info_dn = self._merged_expert_info_groups(members, gs_dn)
+
+            with prof.stage("merged_down"):
+                t_k = time.time()
+                dn = triton_fused_matmul_merged_in_features_gf(
+                    torch.cat(act_parts),
+                    ctx["down"]["indices_packed_gf"],
+                    ctx["down_codebook"],
+                    ctx["down"]["norms_gf"],
+                    expert_info_dn, gs_dn,
+                    bit_width=bit,
+                    norms_prescaled=ctx["down_norms_prescaled"])
+                time_triton_total += time.time() - t_k
+            del act_parts
+
+            # 对齐逐 expert 路径：down 输出 cast 回激活 dtype（真实模型 bf16）
+            if dn.dtype != act_dtype:
+                dn = dn.to(act_dtype)
+
+            # 整池 scatter 一次（同 token 跨池出现时由 index_add_ 累加，
+            # 与逐 expert 的多 bit 累加语义一致）
+            with prof.stage("scatter"):
+                dn.mul_(pool_weights.unsqueeze(1))
+                final_hidden_states.index_add_(0, pool_tokens, dn)
+            del dn, pool_tokens, pool_weights
+
+        return dict(
+            time_triton_total=time_triton_total,
+            time_dequant_total=0.0,
+            time_gemm_total=0.0,
+            active_experts_count=active_experts_count,
+            active_bits_count=active_bits_count,
+            t_compute_end=time.time(),
+        )
+
     # ------------------------------------- P5-2 合并路径共享工具（模式无关）
 
     def _merged_pools_ok(self):
@@ -868,6 +992,23 @@ class WxA16BitPartitionedGroupMoE(nn.Module):
                 if bit_str in sizes and sizes[bit_str] != s:
                     return False
                 sizes[bit_str] = s
+        return True
+
+    def _merged_groups_ok(self, bit_ctx):
+        """合并路径前置：两侧都落 gf 主路径（num_groups >= 2）。
+
+        逐 expert wrapper 有 num_groups==1 的回退分支（单旋转矩阵 +
+        传统布局 kernel），合并版没有——小测试形状（如 test_quant_io
+        的 inter/gs=1）须回退逐 expert。真实模型 gate_up 2048/128=16、
+        down 512/128=4 组，恒满足。
+        """
+        for expert_idx in range(self.num_experts):
+            for bit_str, _bit, start, end in self._active_bits_by_expert[expert_idx]:
+                ctx = bit_ctx[bit_str]
+                if ctx["gate_up_in_features"] // ctx["gate_up_group_size"] < 2:
+                    return False
+                if (end - start) // ctx["down_group_size"] < 2:
+                    return False
         return True
 
     def _merged_pools(self, tokens_per_expert):
