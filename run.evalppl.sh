@@ -3,8 +3,8 @@
 # MODEL_PATH=""
 #       https://huggingface.co/allenai/OLMoE-1B-7B-0924
 
-export CUDA_VISIBLE_DEVICES=0,1
-# export CUDA_VISIBLE_DEVICES=0
+# export CUDA_VISIBLE_DEVICES=0,1
+export CUDA_VISIBLE_DEVICES=1
 export HF_DATASETS_OFFLINE=1 
 export PYTORCH_CUDA_ALLOC_CONF="max_split_size_mb:128,roundup_power2_divisions:4"
 

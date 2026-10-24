@@ -65,7 +65,7 @@ EVAL_LOAD_QUANTIZED_RE = re.compile(
 # WxA8 推理模式（eval_qwen35.py 打印，位于 Quantized checkpoint 之后）
 EVAL_INFERENCE_QUANT_MODE_RE = re.compile(r"^Inference quant mode:\s+(?P<mode>\S+)")
 
-# Throughput 日志（benchmarks/bench_throughput.py）
+# Throughput 日志（bench_throughput.py，2026-10-23 从 benchmarks/ 移到根）
 THROUGHPUT_START_RE = re.compile(
     r"^\[model\]\s+(?P<model>\S+)\s+on\s+\S+\s+\|\s*mode:\s*(?P<mode>\S+)")
 THROUGHPUT_MODEL_RE = re.compile(

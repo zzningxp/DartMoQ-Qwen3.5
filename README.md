@@ -489,7 +489,7 @@ pip install "gptqmodel==7.3.6" "fbgemm-gpu==1.4.0" "torchao==0.17.0" \
 sh run.throughput.official.sh   # FP8 35GB 需双卡，脚本内已设好
 
 # 单条运行（自由组合）
-python benchmarks/bench_throughput.py --quant-dir models/<ckpt>/ --mode wxa8 \
+python bench_throughput.py --quant-dir models/<ckpt>/ --mode wxa8 \
     --prefill-lens 16,128,2048,4096 --decode-tokens 256,512,1024
 ```
 

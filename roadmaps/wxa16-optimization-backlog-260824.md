@@ -681,6 +681,64 @@ ppl 11.268 / 7.7944 无损失。收益小于预期（delta rule 只是全模型�
 >    → graph 优先；moe_gemm 类 kernel 时间 >15ms → kernel 效率（P5 系：
 >    tile 扫描续跑 / rotate_quantize 折进 kernel / scatter 融合）同步动。
 
+> **状态补充（2026-10-23，官方侧 profile 判据落地 + 实施启动）**：
+> 1. **判据命中（官方 FP8 侧，1023.profile.decode 复跑对拍一致）**：decode
+>    4614 launch/步、GPU busy 12.6%、idle gap 57.5ms（84% of 68.4ms）；
+>    真计算仅 10.9ms（dense FP8 gemm 3.97——已贴带宽下限 ~1.4×、
+>    copy_misc 3.98——胶水搬运比 gemm 还贵、attn 仅 0.20）。prefill 128 档
+>    同构（4952 launch/forward、busy 19.8%）→ 短 prefill 固定开销同源。
+>    **graph 后理论区间 ~12-15ms/step（60-80 tok/s），现实预期 30-50**。
+> 2. **首个实施目标定为官方 FP8 decode**（本人 2026-10-23 决定）：收益
+>    最大（84% idle）且路径最干净——无我方自定义模块，StaticCache/
+>    静态 mask/捕获 fla recurrent 与 fbgemm w8a8 的全部经验直接迁移我方
+>    主线。口径注意：官方数字若以 graph 版收录须另立口径标注（官方+graph），
+>    不与原基线混表。
+> 3. **实施步骤（benchmarks/graph_decode.py）**：① 查官方建模 cache 形态
+>    （GDN recurrent 定长 + full-attn KV 增长，StaticCache/cache_position
+>    支持度）→ ② 静态化（cache 槽位预分配 + 位置计数走 device tensor
+>    in-place 递增，mask 静态化）→ ③ 捕获单 decode step（先捂热再捕，
+>    argmax/.item() 留图外）→ ④ N 步重放，**硬判据 = greedy token 序列与
+>    eager decode_loop 完全一致 + logits 逐步对拍**，tok/s ≥2× 为通过线。
+> 4. **新增已核实风险**：官方 FP8 走 hub kernel（kernels-community/
+>    finegrained-fp8），其惰性加载的 publisher 信任校验联网在 mirror 不稳
+>    时挂死/SSL 断（1023 三跑三态实踩）——已修：DARTMOQ_TRUST_HUB_KERNELS=1
+>    放行短路（bench_throughput.load_bench_model），官方脚本与 run.profile.sh
+>    已带。
+
+> **状态补充（2026-10-23 晚，官方 FP8 整步 graph 判定不可行，深夜改分段路线）**：
+> 1. **官方 FP8 capture 两连败**：graph_decode.py native 与 buffer 双模式均
+>    `cudaErrorStreamCaptureInvalidated`（mask 因素排除）。最小探针
+>    （test/test_graph_capture_crossdev.py，torch 2.9+cu128/5090，先侧流
+>    捂热再捕）钉死机制：单设备 sum/matmul capture+replay 全 OK；**任何
+>    跨设备 `.to()` 一律判死 capture**——capture 只在单侧捕获流上进行，
+>    跨设备流协调（对端 event wait 越过捕获边界）结构性非法。官方 FP8
+>    双卡 device_map 每步 152 次 Memcpy DtoD（1023.profile），框架内修不掉；
+>    单卡又装不下（31.4GB vs 32GB）。**整步一张图路线到此为止。**
+> 2. **（深夜修订，本人定调：官方 FP8 不弃）改分段 capture（--strategy
+>    segment）**：整步图死 ≠ 官方侧死。手写逐层 decode step 绕开 wrapper
+>    （wrapper 隐藏的跨设备 .to() 是判死根源），按设备边界切两段**各自
+>    捕获成图**（卡0 段：embed+rotary+前半层；卡1 段：后半层+norm+lm_head），
+>    唯一一次跨设备拷贝（h_mid 中间激活）留图外由 host 执行，每步 host
+>    调用 4614 → ~15。正确性三道门：单一边界断言、capture 前 16 步手写
+>    eager closed-loop 对拍（不过不捕）、token/logits 双对拍。我方单卡
+>    模型 PoC 后续同样复用这套机制。官方 FP8 eager 参考 61.2-61.5ms/step
+>    （16.3 tok/s，与 bench 60.9 口径互证），理论地板 11-15ms。
+> 3. **分段加载实踩（1023.graph.seg.off）**：手写字典 device_map 对官方
+>    FP8 量化权重**落卡不生效**——层键虽过 hook 匹配检查（warning 只报
+>    mtp 不匹配），权重仍按 checkpoint 顺序全堆 GPU1，30.38GiB OOM（最后
+>    512MiB 正是 fp8 口径 lm_head）。修法：device_map=auto + max_memory
+>    限卡0容量（auto 落卡路径 bench 长期验证有效），切分层加载后按每层
+>    参数真实设备反推，不再预设。
+> 4. **副产品**：graph_decode eager 段（DynamicCache，prompt 128）61.2-61.5ms
+>    与 bench decode 60.9ms 口径互证，benchmark 无系统性偏差再添一证。
+> 5. **hub kernel 网络问题二次实踩**：trust 放行后在线路径仍有
+>    list_repo_refs 联网（kernels/_versions.py），mirror 断连直接崩进程
+>    （1019.thrput.4 bench+graph 双崩）。终修：kernel 快照补全量（35 文件）
+>    + HF_HUB_OFFLINE=1 纯缓存零网络，官方两脚本已带。
+> 6. **graph_decode.py 已扩多档**：--prompt-len/--steps 均逗号多档全交叉
+>    （16,128,2048,4096 × 64,256,512,1024），eager 每档 prompt 只跑最长
+>    steps 档（greedy 前缀对拍），capture 单步图与 prompt 长度无关一次复用。
+
 ---
 
 ## 二、已评估 / 已否决 / 已降级（明确不做，避免重复踩坑）

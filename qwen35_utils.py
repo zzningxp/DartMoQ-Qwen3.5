@@ -15,23 +15,35 @@ DEV = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
 
 
-def get_qwen35_model(model_path, device_map="auto", model_class=None):
+def get_qwen35_model(model_path, device_map="auto", max_memory=None,
+                     model_class=None, experts_implementation=None):
     """外部 HF 模型通用加载（bench / 基线用）。
 
     model_class: 结构类，默认 AutoModelForCausalLM。官方 Qwen3.5 发布的
     ConditionalGeneration 结构（含 visual/mtp，权重 key 带 language_model
     前缀）需传 AutoModelForImageTextToText 才能对上权重名。
+    max_memory: 透传 from_pretrained（device_map=auto 时限制各卡分配上限，
+    控制 eager auto 布置的层切分点；1023.graph.seg 手写字典对量化权重
+    落卡不生效，auto+max_memory 是实测有效路径）。
+    experts_implementation: None=不传走框架默认解析（grouped_mm 可用则
+    grouped_mm，不可用静默回退 eager）；显式传 "grouped_mm" 时检查不过会
+    raise 不再静默回退。1024.graph 判定：FP8Experts 的 eager 路径有
+    nonzero()+host 专家循环，CUDA graph capture 必死；grouped_mm 路径
+    官方按 cuda-graph 安全设计（histc 替代 bincount），是 capture 前提。
     """
     if model_class is None:
         model_class = AutoModelForCausalLM
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-    model = model_class.from_pretrained(
-        model_path,
+    kwargs = dict(
         torch_dtype=torch.bfloat16,
         low_cpu_mem_usage=True,
         device_map=device_map,
+        max_memory=max_memory,
         trust_remote_code=True
     )
+    if experts_implementation is not None:
+        kwargs["experts_implementation"] = experts_implementation
+    model = model_class.from_pretrained(model_path, **kwargs)
     model.seqlen = 2048
     return model, tokenizer
 
