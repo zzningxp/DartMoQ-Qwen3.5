@@ -317,11 +317,22 @@ def seg_main(args, model, model_id, mode_label, sample):
     # 平局步翻转（1023.seg.dbg：DIFF@14）
     rdt = text.embed_tokens.weight.dtype
     dummy0 = torch.zeros(1, 1, H, dtype=rdt, device=dev0)
-    pe0 = text.rotary_emb(dummy0, pos_buf[1:])
-    cos0_buf, sin0_buf = pe0[0].clone(), pe0[1].clone()
+    # rotary 的 AlignDevicesHook 把调用路由到 dispatch 时记下的
+    # execution_device（cuda:1）：即使 inv_freq 已搬到 cuda:0，hook 仍把输入
+    # 搬到 cuda:1 执行 → hooked 调用产出的 pe 实际在 cuda:1（1024 第四轮
+    # 实锤：hookless capture 时 layer3 apply_rotary 的 q(cuda:0)×cos(cuda:1)
+    # 设备不匹配才暴露）。cos/sin 不落本段消费侧设备则两条路都死：
+    # ① hooked capture 时逐层 hook 的 send_to_device 跨设备拷贝判死（首轮
+    # 异常链的 tuple genexpr 即此）；② hookless 时直接设备不匹配。
+    # 故 rotary 一律走未包装 forward（_old_forward，在 dummy 所在卡本地算），
+    # 再显式 .to(段设备) 兜底；feed() 在计时循环内，同路径避免每步两次 D2D。
+    rotary_raw = getattr(text.rotary_emb, "_old_forward", None) or \
+        text.rotary_emb.forward
+    pe0 = rotary_raw(dummy0, pos_buf[1:])
+    cos0_buf, sin0_buf = pe0[0].to(dev0).clone(), pe0[1].to(dev0).clone()
     del pe0
-    pe1 = text.rotary_emb(dummy1, pos_buf1[1:])
-    cos1_buf, sin1_buf = pe1[0].clone(), pe1[1].clone()
+    pe1 = rotary_raw(dummy1, pos_buf1[1:])
+    cos1_buf, sin1_buf = pe1[0].to(dev1).clone(), pe1[1].to(dev1).clone()
     del pe1
 
     layers = text.layers
@@ -352,7 +363,10 @@ def seg_main(args, model, model_id, mode_label, sample):
         return seg_b(h_mid_in)
 
     def feed(pos, token):
-        """图外静态 buffer 更新：两卡各自的 mask/位置与 rotary cos/sin。"""
+        """图外静态 buffer 更新：两卡各自的 mask/位置与 rotary cos/sin。
+
+        rotary 走 rotary_raw（未包装 forward）：hook 会把调用路由到
+        cuda:1 再 D2D 搬回，本函数在计时循环内，必须本卡直算。"""
         ids_buf.fill_(token)
         pos_buf.fill_(pos)
         pos_buf1.fill_(pos)
@@ -360,10 +374,10 @@ def seg_main(args, model, model_id, mode_label, sample):
             if m is not None:
                 m.fill_(float("-inf"))
                 m[..., : pos + 1].zero_()
-        pe0_ = text.rotary_emb(dummy0, pos_buf[1:])
+        pe0_ = rotary_raw(dummy0, pos_buf[1:])
         cos0_buf.copy_(pe0_[0])
         sin0_buf.copy_(pe0_[1])
-        pe1_ = text.rotary_emb(dummy1, pos_buf1[1:])
+        pe1_ = rotary_raw(dummy1, pos_buf1[1:])
         cos1_buf.copy_(pe1_[0])
         sin1_buf.copy_(pe1_[1])
 
@@ -525,12 +539,23 @@ def seg_main(args, model, model_id, mode_label, sample):
                              "fix loop semantics before capture")
 
     # ---- capture：两段各自捕获（每卡一图；gB replay 须切到其捕获设备）----
+    # 每设备独立 capture 流：torch.cuda.graph 的 default_capture_stream 是
+    # 类级惰性单例（首次使用时在当前设备创建——本流程是 cuda:0）。B 段在
+    # cuda:1 上复用它时，capture 流与工作设备不同卡：cuda:1 的工作落到该卡
+    # legacy 默认流（不进图）→ 空图（capture_end 警告 "The CUDA Graph is
+    # empty"）→ replay 无操作、g_logits 恒为 capture 期值。global 模式判死
+    # 该状态，relaxed 放行成假成功（1024 第五轮保真门 MISMATCH tf=23.2 /
+    # graph=[264,264,264] 实锤）。必须显式传 per-device stream。
+    cap_streams = {}
+
     def _try_capture(dev, fn, mode=None):
         """单次 capture 尝试；失败时清掉粘滞错误后返回异常（不抛出）。"""
         g = torch.cuda.CUDAGraph()
+        s = cap_streams.get(dev) or cap_streams.setdefault(
+            dev, torch.cuda.Stream(device=dev))
         try:
             with torch.cuda.device(dev):
-                with torch.cuda.graph(g, capture_error_mode=mode or
+                with torch.cuda.graph(g, stream=s, capture_error_mode=mode or
                                       args.capture_error_mode):
                     fn()
             return g, None
@@ -555,7 +580,8 @@ def seg_main(args, model, model_id, mode_label, sample):
             for k in range(1, split + 1):
                 probes.append((f"layers[0:{k}]", _run_part(0, k, True, False, side)))
             # 监视探针放最后（首败即停，不能挡住真实路径定位）：rotary 原始
-            # 模块已判非法（1023.seg.4），此处持续留档其内部算子行为
+            # 模块 1023.seg.4 曾判非法，1024 查明真因是其 hook 把调用路由到
+            # cuda:1 的跨设备搬运（算子本身无辜）；此处持续留档观察
             probes.append(("rotary module (raw, known-illegal monitor)",
                            lambda: text.rotary_emb(dummy0, pos_buf[1:])))
             _pos = pos_buf[1:]
@@ -684,7 +710,7 @@ def seg_main(args, model, model_id, mode_label, sample):
                         for tag3, f_mlp, f_tm in combos:
                             layers[idx].mlp.forward = f_mlp or saved_mlp
                             tm.forward = f_tm or saved_tm
-                            _, e4 = _try_capture(dev, layer_call)
+                            _, e4 = _try_capture(dev, lambda: layer_call(h0))
                             verdict = "OK" if e4 is None else \
                                 f"FAILS: {type(e4).__name__}: " \
                                 f"{str(e4).splitlines()[0]}"
@@ -736,6 +762,56 @@ def seg_main(args, model, model_id, mode_label, sample):
 
     cap_out = {}  # capture 期间产生的静态输出张量（h_mid / logits）
     cap_mode = args.capture_error_mode  # 实际生效的 capture 模式（记入报告）
+    hooks_off = False  # capture 期间是否摘除了 accelerate hook（记入报告）
+    saved_hooks = []  # (module, hook, hooked_forward) 恢复清单
+
+    def disable_hooks():
+        """临时摘除 accelerate hook：capture 期专用，capture 完必须 restore。
+
+        1024 两轮实锤：① 异常链最内层是 accelerate operations.py
+        send_to_device——DecoderLayer 级 AlignDevicesHook 的 pre_forward 对
+        (cos,sin) 等 tuple 实参递归 .to(device)，跨设备拷贝在 capture 期
+        判死（legacy stream vs capturing stream 依赖违规）；② 但同一批 hook
+        恰是 wrapper 前向跨卡搬运的载体（剥掉后 static_prefill 在 layer18
+        边界 cuda:0/cuda:1 不匹配）——所以只能「capture 期临时摘除、捕获完
+        立即装回」。机制（accelerate/hooks.py add_hook_to_module 源码）：
+        hook 通过替换 module.forward 生效，原始 forward 存在 _old_forward——
+        摘除=换回 _old_forward + _hf_hook 置 None（GDN 的
+        force_accelerate_hooks 也会因此跳过），不动 hook 对象本身。
+        正确性：seg 手写循环所有输入已按层预置设备，hook 对齐本就是 no-op，
+        且 gate 带 hook 通过已证 eager 语义；capture 后保真硬门兜底。"""
+        nonlocal hooks_off
+        for m in model.modules():
+            hook = getattr(m, "_hf_hook", None)
+            if hook is not None:
+                saved_hooks.append((m, hook, m.forward))
+                m.forward = getattr(m, "_old_forward", m.forward)
+                m._hf_hook = None
+        hooks_off = True
+        print(f"[seg] accelerate hooks disabled for capture: "
+              f"{len(saved_hooks)} modules", flush=True)
+
+    def restore_hooks():
+        nonlocal hooks_off
+        for m, hook, hooked_fwd in saved_hooks:
+            m.forward = hooked_fwd
+            m._hf_hook = hook
+        saved_hooks.clear()
+        hooks_off = False
+        print("[seg] accelerate hooks restored", flush=True)
+
+    if args.strip_hooks == "always":
+        disable_hooks()
+
+    # hook 清单（capture 前留档）：哪个模块挂了哪类 hook、执行设备指向哪
+    hooked = [(name, type(getattr(m, "_hf_hook")).__name__,
+               str(getattr(getattr(m, "_hf_hook"), "execution_device", None)))
+              for name, m in model.named_modules()
+              if getattr(m, "_hf_hook", None) is not None]
+    print(f"[seg] accelerate hooks: {len(hooked)} hooked modules; "
+          f"sample: {[('.'.join(n.split('.')[-2:]), t, d)
+                       for n, t, d in hooked[:6]]}", flush=True)
+
     print(f"[seg] capturing segment A (embed+rotary+layers[0:{split}]) "
           f"on {dev0} (capture_error_mode={cap_mode}) ...", flush=True)
     torch.cuda.synchronize()
@@ -756,12 +832,31 @@ def seg_main(args, model, model_id, mode_label, sample):
             print("[seg] capture A OK under relaxed — the illegal call is "
                   "strict-mode-only (library malloc/query), not a real error",
                   flush=True)
+    if eA is not None and not hooks_off and args.strip_hooks != "never":
+        # 第三级重试：capture 期临时摘除 accelerate hook（机制见
+        # disable_hooks 注释；1024 异常链实锤 hook pre_forward 的
+        # send_to_device 跨设备 .to()）。摘除不重跑 sanity——gate 已带 hook
+        # 验证过同一手写 eager 路径，hook 对齐在 seg 路径是 no-op，硬判据
+        # 在 capture 后的保真门。
+        print("[seg] capture A still failing; disable accelerate hooks "
+              "during capture and retry ...", flush=True)
+        disable_hooks()
+        cap_out.clear()
+        torch.cuda.empty_cache()
+        gA, eA = _try_capture(dev0, lambda: cap_out.update(h_mid=seg_a()),
+                              cap_mode)
+        if eA is None:
+            print("[seg] capture A OK with accelerate hooks disabled — "
+                  "hook pre_forward cross-device .to() was the culprit",
+                  flush=True)
     if eA is not None:
         print(f"[seg] CAPTURE A FAILED: {type(eA).__name__}: {eA}\n"
               f"[seg] hints: fp8 w8a8 / fla kernel / accelerate hook inside "
               f"segment —— running bisect ...", flush=True)
         dump_exc_chain("seg", eA)
         bisect_why("A", dev0)
+        if hooks_off:
+            restore_hooks()
         sys.exit(2)
     h_mid_out = cap_out["h_mid"]
     print(f"[seg] capturing segment B (layers[{split}:{n}]+norm+lm_head) "
@@ -779,15 +874,34 @@ def seg_main(args, model, model_id, mode_label, sample):
         if eB is None:
             cap_mode = "relaxed"
             print("[seg] capture B OK under relaxed mode", flush=True)
+    if eB is not None and not hooks_off and args.strip_hooks != "never":
+        # 与 A 对称的第三级重试（A 成功不等于 B 免疫——B 段含 norm/lm_head）
+        print("[seg] capture B still failing; disable accelerate hooks "
+              "during capture and retry ...", flush=True)
+        disable_hooks()
+        cap_out.pop("logits", None)
+        torch.cuda.empty_cache()
+        gB, eB = _try_capture(dev1, lambda: cap_out.update(logits=seg_b(h_mid_in)),
+                              cap_mode)
+        if eB is None:
+            print("[seg] capture B OK with accelerate hooks disabled",
+                  flush=True)
     if eB is not None:
         print(f"[seg] CAPTURE B FAILED: {type(eB).__name__}: {eB}\n"
               f"[seg] running bisect ...", flush=True)
         dump_exc_chain("seg", eB)
         bisect_why("B", dev1)
+        if hooks_off:
+            restore_hooks()
         sys.exit(2)
     g_logits = cap_out["logits"]
-    print(f"[seg] both segments captured (capture_error_mode={cap_mode})",
-          flush=True)
+    hooks_were_off = hooks_off  # 记入报告（restore 会把 hooks_off 清回 False）
+    if hooks_off:
+        # 捕获完成立即装回：后续 wrapper prefill（static_prefill/_run_n 的
+        # 跨卡流）依赖 hook 搬运；replay 不跑 Python，与 hook 无关
+        restore_hooks()
+    print(f"[seg] both segments captured (capture_error_mode={cap_mode}, "
+          f"hooks_disabled_for_capture={hooks_were_off})", flush=True)
 
     def graph_step():
         gA.replay()
@@ -902,6 +1016,7 @@ def seg_main(args, model, model_id, mode_label, sample):
             "split_at": split, "prompt_len_list": plen_list,
             "steps_list": steps_list, "warmup_steps": args.warmup_steps,
             "capture_error_mode": cap_mode,
+            "hooks_disabled_for_capture": hooks_were_off,
             "githash": get_git_hash(),
             "gpu": torch.cuda.get_device_name(0),
             "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -975,6 +1090,14 @@ def main():
                          "API（malloc/查询）也会判死 capture；relaxed 放行这类"
                          "调用（单线程 GPU 负载下安全）。segment capture 失败时"
                          "自动以 relaxed 重试一次当探针，成功即沿用并记录报告")
+    ap.add_argument("--strip-hooks", choices=["auto", "always", "never"],
+                    default="auto",
+                    help="accelerate hook 的 capture 期摘除策略：auto=capture "
+                         "失败时自动临时摘除重试（1024 异常链实锤 hook "
+                         "pre_forward 的跨设备 send_to_device 判死 capture；"
+                         "摘除仅覆盖 capture 窗口，捕获完立即装回——wrapper "
+                         "prefill 的跨卡搬运依赖 hook）；always=首次 capture "
+                         "前即摘除（A/B 对照用）；never=不摘除（留档复现）")
     ap.add_argument("--strategy", choices=["whole", "segment"], default="whole",
                     help="whole=整步一张图（仅单卡模型合法）；segment=按设备边界"
                          "切段逐层手跑，跨设备拷贝留图外（官方 FP8 双卡路线）")
