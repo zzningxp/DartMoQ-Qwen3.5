@@ -29,11 +29,15 @@ from quantization.wxa16.bit_partitioned_moe import WxA16BitPartitionedGroupMoE
 from turboquant_utils.rotation import generate_batch_rotation_matrices
 from turboquant_utils.triton_kernels_fp8 import (
     build_fp8_codebook,
+    get_wxfp8_config,
     rotate_quantize_fused_fp8,
+    rotate_quantize_fused_fp8_pooled,
     wxfp8_matmul_grouped_slice_in_features_gf,
     wxfp8_matmul_grouped_slice_rows_gf,
     wxfp8_matmul_merged_in_features_gf,
+    wxfp8_matmul_merged_in_features_gf_static,
     wxfp8_matmul_merged_rows_gf,
+    wxfp8_matmul_merged_rows_gf_static,
 )
 
 
@@ -53,6 +57,9 @@ class WxFP8BitPartitionedGroupMoE(WxA16BitPartitionedGroupMoE):
         # bit context 需要重建（要追加 e4m3 码本）
         moe._bit_ctx_cache = None
         moe._fp8_ctx_ready = None
+        # 类切换后已构建的静态派发状态（若有人提前触发过）与新 kernel 语义
+        # 不再匹配，作废重建
+        moe._static_decode_state = None
         return moe
 
     # ---------------------------------------------------------------- context
@@ -332,3 +339,52 @@ class WxFP8BitPartitionedGroupMoE(WxA16BitPartitionedGroupMoE):
             active_bits_count=active_bits_count,
             t_compute_end=time.time(),
         )
+
+    # ------------------------------------------------- 静态派发（graph decode）
+
+    _STATIC_DISPATCH_READY = True
+
+    @staticmethod
+    def _static_cfg_getter(bit):
+        def getter(direction, B):
+            return get_wxfp8_config(bit, direction=direction, B=B)
+        return getter
+
+    def _static_pool_compute(self, ps, x, tokens_c, weights_c, mask_rows,
+                             final_hidden_states):
+        """单个 bit 池的静态计算（e4m3 语义，与 _expert_compute_merged 同数学）。
+
+        结构与 WxA8 版逐点对应：融合旋转+量化（gate_up 全量一次 / down 池
+        内逐成员 pooled kernel），cb_scale 折进激活 scale。kernel 输出恒 fp16。
+        """
+        src = x if x.dtype == torch.float16 else x.half()
+        x_f8_all, x_s_all = rotate_quantize_fused_fp8(
+            src, ps.rot_gu, ps.gs_gu, ps.in_f // ps.gs_gu,
+            extra_scale=ps.cb_scale_gu)
+        x_pool = x_f8_all.index_select(0, tokens_c)
+        xs_pool = x_s_all.index_select(0, tokens_c)
+        del x_f8_all, x_s_all
+        gu = wxfp8_matmul_merged_rows_gf_static(
+            x_pool, xs_pool, ps.idx_gu_gf, ps.cb_gu_f8, ps.norms_gu_gf,
+            ps.expert_info_gu, ps.block_info_gu, ps.n_slice, ps.n_limit,
+            ps.gs_gu, ps.in_f, bit_width=ps.bit,
+            norms_prescaled=ps.prescaled_gu, cfg=ps.cfg_gu)
+        del x_pool, xs_pool
+        act = F.silu(gu[:, :ps.inter]) * gu[:, ps.inter:]
+        del gu
+        act = act * mask_rows.unsqueeze(1).to(act.dtype)
+        act16 = act if act.dtype == torch.float16 else act.half()
+        a_f8, a_s = rotate_quantize_fused_fp8_pooled(
+            act16, ps.rot_bank, ps.expert_info_dn, ps.block_info_b32,
+            ps.gs_dn, ps.g_count, extra_scale=ps.cb_scale_dn)
+        del act16
+        dn = wxfp8_matmul_merged_in_features_gf_static(
+            a_f8, a_s, ps.idx_dn_gf, ps.cb_dn_f8, ps.norms_dn_gf,
+            ps.expert_info_dn, ps.block_info_dn, ps.gs_dn, ps.g_count,
+            bit_width=ps.bit, norms_prescaled=ps.prescaled_dn, cfg=ps.cfg_dn)
+        del a_f8, a_s
+        if dn.dtype != x.dtype:
+            dn = dn.to(x.dtype)
+        dn = dn * weights_c.unsqueeze(1)
+        final_hidden_states.index_add_(0, tokens_c, dn)
+        del dn, act

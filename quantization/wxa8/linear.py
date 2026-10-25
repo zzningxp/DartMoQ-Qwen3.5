@@ -75,6 +75,9 @@ def _dummy_cb(device):
 class WxA8Linear(WxA16Linear):
     """WxA8 attention linear（8-bit 均匀码本 + INT8 激活）。"""
 
+    # 码本步长缓存（_ensure_gf 一次性计算；None 表示尚未计算）
+    _cb_step = None
+
     @classmethod
     def from_wxa16(cls, linear: WxA16Linear) -> "WxA8Linear":
         """把 WxA16Linear 原地切到 WxA8（零拷贝，与 MoE 的 from_wxa16 同理）。
@@ -124,6 +127,13 @@ class WxA8Linear(WxA16Linear):
         # 原始 buffer 移到 CPU 释放显存（与 MoE 的 offload_original_to_cpu 一致）
         self.packed_indices = self.packed_indices.cpu()
         self.norms = self.norms.cpu()
+        # 码本步长是加载期常量：原先每 forward 在 GPU 上重算并 float(step)
+        # 读回 host，引入一次 D2H 同步（eager 下每个 attention linear 一次；
+        # CUDA graph capture 下直接非法——capture 期 kernel 不执行、无数据可读）。
+        # 这里随 gf 布局一次性算好缓存为 Python float，forward 作为 kernel 标量
+        # 传入（capture 时按常量固化，数值不变）。与 MoE 侧 ctx["*_cb_step"]
+        # 的常量缓存（P6-2）同一思路。
+        self._cb_step = uniform_codebook_step(self.codebook.to(device))
         self._gf_built = True
 
     @torch.no_grad()
@@ -144,7 +154,7 @@ class WxA8Linear(WxA16Linear):
             gs, self.seed, G, stride=gs, device=src.device, dtype=torch.float16)
         x_i8, x_scale = rotate_quantize_fused(
             src, rot, gs, G,
-            extra_scale=uniform_codebook_step(self.codebook.to(x.device)))
+            extra_scale=self._cb_step)
 
         out = wxa8_matmul_grouped_gf(
             x_i8, x_scale, self._indices_gf, _dummy_cb(x.device), self._norms_gf,

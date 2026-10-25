@@ -27,15 +27,22 @@ import torch.nn.functional as F
 from quantization.wxa8.bit_partitioned_moe import WxA8BitPartitionedGroupMoE
 from quantization.wxa16.bit_partitioned_moe import WxA16BitPartitionedGroupMoE
 from turboquant_utils.rotation import generate_batch_rotation_matrices
-from turboquant_utils.triton_kernels_a8 import rotate_quantize_fused
+from turboquant_utils.triton_kernels_a8 import (
+    get_wxa8_config,
+    rotate_quantize_fused,
+)
 from turboquant_utils.triton_kernels_fp4 import (
+    _merged_fp4_default_cfg,
     build_e2m1_codebook,
     fold_indices_to_e2m1,
     rotate_quantize_fused_fp4,
+    rotate_quantize_fused_fp4_pooled,
     wxfp4_matmul_grouped_slice_in_features_gf_swapped,
     wxfp4_matmul_grouped_slice_rows_gf_swapped,
     wxfp4_matmul_merged_in_features_gf,
+    wxfp4_matmul_merged_in_features_gf_static,
     wxfp4_matmul_merged_rows_gf,
+    wxfp4_matmul_merged_rows_gf_static,
 )
 
 
@@ -57,6 +64,9 @@ class WxFP4BitPartitionedGroupMoE(WxA8BitPartitionedGroupMoE):
         moe._bit_ctx_cache = None
         moe._a8_ctx_ready = None
         moe._fp4_ctx_ready = None
+        # 类切换后已构建的静态派发状态（若有人提前触发过）与新 kernel 语义
+        # 不再匹配，作废重建
+        moe._static_decode_state = None
         return moe
 
     # WFF-5 修复（2026-10-20）：fold 预算。e2m1 折叠副本只在**小池**时值得
@@ -394,3 +404,60 @@ class WxFP4BitPartitionedGroupMoE(WxA8BitPartitionedGroupMoE):
         del dn, pool_tokens, pool_weights
 
         return t_pool
+
+    # ------------------------------------------------- 静态派发（graph decode）
+
+    _STATIC_DISPATCH_READY = True
+
+    @staticmethod
+    def _static_cfg_getter(bit):
+        """按池 bit 分派选档：FP4_BITS 池用 fp4 默认 tile，其余用 wxa8。"""
+        if bit in WxFP4BitPartitionedGroupMoE.FP4_BITS:
+            return lambda direction, B: _merged_fp4_default_cfg(B)
+        return lambda direction, B: get_wxa8_config(bit, direction=direction, B=B)
+
+    def _static_pool_compute(self, ps, x, tokens_c, weights_c, mask_rows,
+                             final_hidden_states):
+        """单个 bit 池的静态计算（按池 bit 分派，与 _merged_pool_compute 同数学）。
+
+        FP4_BITS 池：e2m1 预转置激活（gate_up 全量一次融合旋转量化后**列**
+        gather；down 池内逐成员 pooled kernel，预转置写出）；其余池走
+        WxA8 的 int8 静态实现（原样复用）。fp4 无 extra_scale 通道（cb 类
+        常量在权重侧 fold 进 nib/residual，激活侧恒 1）。
+        """
+        if ps.bit not in self.FP4_BITS:
+            return super()._static_pool_compute(
+                ps, x, tokens_c, weights_c, mask_rows, final_hidden_states)
+
+        src = x if x.dtype == torch.float16 else x.half()
+        x_f4_all, x_s_all = rotate_quantize_fused_fp4(
+            src, ps.rot_gu, ps.gs_gu, ps.in_f // ps.gs_gu)
+        x_pool = x_f4_all.index_select(1, tokens_c)
+        xs_pool = x_s_all.index_select(0, tokens_c)
+        del x_f4_all, x_s_all
+        gu = wxfp4_matmul_merged_rows_gf_static(
+            x_pool, xs_pool, ps.idx_gu_gf, ps.nib_gu, ps.ws_gu, ps.norms_gu_gf,
+            ps.expert_info_gu, ps.block_info_gu, ps.n_slice, ps.n_limit,
+            ps.gs_gu, ps.in_f, ps.bit,
+            norms_prescaled=ps.prescaled_gu, w_e2m1_gf=ps.e2m1_gu,
+            cfg=ps.cfg_gu)
+        del x_pool, xs_pool
+        act = F.silu(gu[:, :ps.inter]) * gu[:, ps.inter:]
+        del gu
+        act = act * mask_rows.unsqueeze(1).to(act.dtype)
+        act16 = act if act.dtype == torch.float16 else act.half()
+        a_f4, a_s = rotate_quantize_fused_fp4_pooled(
+            act16, ps.rot_bank, ps.expert_info_dn, ps.block_info_b32,
+            ps.gs_dn, ps.g_count)
+        del act16
+        dn = wxfp4_matmul_merged_in_features_gf_static(
+            a_f4, a_s, ps.idx_dn_gf, ps.nib_dn, ps.ws_dn, ps.norms_dn_gf,
+            ps.expert_info_dn, ps.block_info_dn, ps.gs_dn, ps.bit,
+            norms_prescaled=ps.prescaled_dn, w_e2m1_gf=ps.e2m1_dn,
+            cfg=ps.cfg_dn)
+        del a_f4, a_s
+        if dn.dtype != x.dtype:
+            dn = dn.to(x.dtype)
+        dn = dn * weights_c.unsqueeze(1)
+        final_hidden_states.index_add_(0, tokens_c, dn)
+        del dn, act

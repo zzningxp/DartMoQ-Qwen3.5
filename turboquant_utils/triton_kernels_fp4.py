@@ -737,6 +737,33 @@ def _merged_fp4_default_cfg(B_total):
     return BLOCK_B, 128, 128, (4 if B_total <= 256 else 8), 2
 
 
+def _launch_wxfp4_merged_gf(
+    a, a_s, w_src, nib_arg, w_s, norms_used,
+    expert_info_dev, block_info, out, n_extent,
+    group_size, num_groups, bit_width,
+    w_folded, slice_is_groups, cfg,
+):
+    """wxfp4 merged kernel 统一发射入口（host 编排路径与静态派发路径共用）。
+
+    参数序与 _wxfp4_merged_kernel_gf 形参一一对应；w_src/nib_arg 由调用方
+    按 W_FOLDED 分支预先解析（folded 时 nib 占位传 w_src 本身）；expert_info_dev
+    必须是 (E,4) int32 设备张量。
+    """
+    BLOCK_B, BLOCK_N, BLOCK_K, nw, ns = cfg
+    _wxfp4_merged_kernel_gf[(block_info.shape[0],)](
+        a, a_s, w_src, nib_arg, w_s, norms_used,
+        expert_info_dev, block_info, out,
+        out.shape[0], n_extent,
+        w_src.stride(0), norms_used.stride(0), a_s.stride(0),
+        w_s.stride(0), out.stride(0),
+        GROUP_SIZE=group_size, NUM_GROUPS=num_groups,
+        BIT_WIDTH=bit_width, W_FOLDED=w_folded,
+        SLICE_IS_GROUPS=slice_is_groups,
+        BLOCK_B=BLOCK_B, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        num_warps=nw, num_stages=ns,
+    )
+
+
 def wxfp4_matmul_merged_rows_gf(
     x_f4_t, x_s, indices_packed_gf, nib, w_s, norms_gf,
     expert_info, group_size, in_features, bit_width: int,
@@ -793,18 +820,13 @@ def wxfp4_matmul_merged_rows_gf(
     w_src = w_e2m1_gf if w_e2m1_gf is not None else indices_packed_gf
     nib_arg = w_src if w_e2m1_gf is not None else nib
 
-    _wxfp4_merged_kernel_gf[(block_info.shape[0],)](
+    _launch_wxfp4_merged_gf(
         x_f4_t, x_s, w_src, nib_arg, w_s, norms_used,
         torch.tensor(expert_info, dtype=torch.int32, device=x_f4_t.device),
-        block_info, out,
-        B_total, n_limit,
-        w_src.stride(0), norms_used.stride(0), x_s.stride(0),
-        w_s.stride(0), out.stride(0),
-        GROUP_SIZE=group_size, NUM_GROUPS=num_groups,
-        BIT_WIDTH=bit_width, W_FOLDED=w_e2m1_gf is not None,
-        BLOCK_B=BLOCK_B, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
-        num_warps=nw, num_stages=ns,
-    )
+        block_info, out, n_limit,
+        group_size, num_groups, bit_width,
+        w_e2m1_gf is not None, slice_is_groups=False,
+        cfg=(BLOCK_B, BLOCK_N, BLOCK_K, nw, ns))
     return out
 
 
@@ -858,19 +880,69 @@ def wxfp4_matmul_merged_in_features_gf(
     w_src = w_e2m1_gf if w_e2m1_gf is not None else indices_packed_gf
     nib_arg = w_src if w_e2m1_gf is not None else nib
 
-    _wxfp4_merged_kernel_gf[(block_info.shape[0],)](
+    _launch_wxfp4_merged_gf(
         x_f4_t, x_s, w_src, nib_arg, w_s, norms_used,
         torch.tensor(expert_info, dtype=torch.int32, device=x_f4_t.device),
-        block_info, out,
-        B_total, N,
-        w_src.stride(0), norms_used.stride(0), x_s.stride(0),
-        w_s.stride(0), out.stride(0),
-        GROUP_SIZE=group_size, NUM_GROUPS=g_count,
-        BIT_WIDTH=bit_width, W_FOLDED=w_e2m1_gf is not None,
-        SLICE_IS_GROUPS=True,
-        BLOCK_B=BLOCK_B, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
-        num_warps=nw, num_stages=ns,
-    )
+        block_info, out, N,
+        group_size, g_count, bit_width,
+        w_e2m1_gf is not None, slice_is_groups=True,
+        cfg=(BLOCK_B, BLOCK_N, BLOCK_K, nw, ns))
+    return out
+
+
+def wxfp4_matmul_merged_rows_gf_static(
+    x_f4_t, x_s, indices_packed_gf, nib, w_s, norms_gf,
+    expert_info_dev, block_info, n_slice, n_limit,
+    group_size, in_features, bit_width: int,
+    norms_prescaled: bool = False, w_e2m1_gf=None, cfg=None,
+):
+    """gate_up 合并版·静态派发（CUDA graph decode 用）。
+
+    与 wxfp4_matmul_merged_rows_gf 同一 kernel、同一 tile 数学；差别仅在
+    编排来源：expert_info（(E,4) int32，行段列每步设备端重写、列切片列
+    为加载期常量）与 block_info（最坏情况静态调度表）均为设备常驻张量。
+    B_total 取 x_f4_t.shape[1]（静态容量）。函数内零 host 读、零 H2D。
+    """
+    norms_used = norms_gf if norms_prescaled else (
+        norms_gf.float() / math.sqrt(group_size))
+    out = torch.empty(x_f4_t.shape[1], n_slice, dtype=torch.float16,
+                      device=x_f4_t.device)
+    if cfg is None:
+        cfg = _merged_fp4_default_cfg(x_f4_t.shape[1])
+    w_src = w_e2m1_gf if w_e2m1_gf is not None else indices_packed_gf
+    nib_arg = w_src if w_e2m1_gf is not None else nib
+    _launch_wxfp4_merged_gf(
+        x_f4_t, x_s, w_src, nib_arg, w_s, norms_used,
+        expert_info_dev, block_info, out, n_limit,
+        group_size, in_features // group_size, bit_width,
+        w_e2m1_gf is not None, slice_is_groups=False, cfg=cfg)
+    return out
+
+
+def wxfp4_matmul_merged_in_features_gf_static(
+    x_f4_t, x_s, indices_packed_gf, nib, w_s, norms_gf,
+    expert_info_dev, block_info, group_size, bit_width: int,
+    norms_prescaled: bool = False, w_e2m1_gf=None, cfg=None,
+):
+    """down 合并版·静态派发（CUDA graph decode 用），契约同 rows 静态版。
+
+    N（完整输出列数）取 norms_gf.shape[1]（静态形状）；NUM_GROUPS 即池内
+    group 切片计数，由 x_f4_t 的 K 维隐含（kernel 不收 g_count 参数列）。
+    """
+    norms_used = norms_gf if norms_prescaled else (
+        norms_gf.float() / math.sqrt(group_size))
+    N = norms_used.shape[1]
+    out = torch.empty(x_f4_t.shape[1], N, dtype=torch.float16,
+                      device=x_f4_t.device)
+    if cfg is None:
+        cfg = _merged_fp4_default_cfg(x_f4_t.shape[1])
+    w_src = w_e2m1_gf if w_e2m1_gf is not None else indices_packed_gf
+    nib_arg = w_src if w_e2m1_gf is not None else nib
+    _launch_wxfp4_merged_gf(
+        x_f4_t, x_s, w_src, nib_arg, w_s, norms_used,
+        expert_info_dev, block_info, out, N,
+        group_size, x_f4_t.shape[0] * 2 // group_size, bit_width,
+        w_e2m1_gf is not None, slice_is_groups=True, cfg=cfg)
     return out
 
 
@@ -1130,6 +1202,114 @@ def rotate_quantize_fused_fp4(x: torch.Tensor, rot: torch.Tensor,
     _rotate_quantize_kernel_fp4[grid](
         x, rot, x_f4, x_s, B, K_total, rot.stride(0),
         GROUP_SIZE=group_size, NUM_GROUPS=num_groups, BLOCK_B=BLOCK_B,
+        num_warps=4, num_stages=3,
+    )
+    return x_f4, x_s
+
+
+@triton.jit
+def _rotate_quantize_kernel_fp4_pooled(
+    x_ptr,        # (B_cap, K_total) fp16 —— 池缓冲（行序 = 成员序）
+    rot_ptr,      # 旋转矩阵库（TOTAL, G0_STRIDE），第 k 个矩阵基址 = k*stride
+    expert_info_ptr,  # (E, 4) int32 [token_start, token_count, rot_base, g_count]
+    block_info_ptr,   # (num_blocks, 2) int32 [member_idx, block_b]
+    x_f4_ptr,     # (K_total//2, B_cap) uint8 —— e2m1 预转置输出
+    x_s_ptr,      # (B_cap, K_total//32) uint8 —— e8m0
+    B_cap, K_total,
+    ROT_G0_STRIDE,
+    GROUP_SIZE: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,
+    BLOCK_B: tl.constexpr = 32,
+):
+    """池内逐成员旋转 + e2m1/e8m0 量化（静态派发 down 方向）。
+
+    与 `_rotate_quantize_kernel_fp4` 同一数学、同一量化尾（含预转置写出）；
+    差别只在旋转矩阵来源：down 的 seed 含 expert 偏移，整批不能共用一个
+    矩阵。按"成员 × 行块"的最坏情况静态调度表分发程序，行段与矩阵基序号
+    由 kernel 运行时从 expert_info 读（列 2 = start // group_size，与 GEMM
+    的 group 切片语义一致，共用同一份缓冲）。token_count=0 的成员整块早退。
+    """
+    pid = tl.program_id(0)
+    pid_g = tl.program_id(1)
+    bi = block_info_ptr + pid * 2
+    midx = tl.load(bi + 0).to(tl.int32)
+    blk_b = tl.load(bi + 1).to(tl.int32)
+
+    ei = expert_info_ptr + midx * 4
+    token_start = tl.load(ei + 0).to(tl.int32)
+    token_count = tl.load(ei + 1).to(tl.int32)
+    rot_base = tl.load(ei + 2).to(tl.int32)
+    if token_count <= 0:
+        return
+
+    rb = token_start + blk_b * BLOCK_B + tl.arange(0, BLOCK_B)
+    mask_b = rb < token_start + token_count
+
+    x_off = rb[:, None] * K_total + pid_g * GROUP_SIZE + tl.arange(0, GROUP_SIZE)[None, :]
+    x_tile = tl.load(x_ptr + x_off, mask=mask_b[:, None], other=0.0)
+
+    acc = tl.zeros((BLOCK_B, GROUP_SIZE), dtype=tl.float32)
+    rj = tl.arange(0, GROUP_SIZE)
+    rk = tl.arange(0, GROUP_SIZE)
+    p_off = (rot_base + pid_g) * ROT_G0_STRIDE + rj[:, None] * GROUP_SIZE + rk[None, :]
+    p_tile = tl.load(rot_ptr + p_off)
+    acc += tl.dot(x_tile, tl.trans(p_tile), out_dtype=tl.float32)
+
+    # ---- 按 32 子块量化（与 _rotate_quantize_kernel_fp4 逐行对应）----
+    NBLK: tl.constexpr = GROUP_SIZE // 32
+    acc3 = tl.reshape(acc, (BLOCK_B, NBLK, 32))
+    amax = tl.max(tl.abs(acc3), axis=2)
+    amax = tl.maximum(amax, 1e-30)
+    e = tl.ceil(tl.log2(amax / 6.0))
+    e = tl.minimum(tl.maximum(e, -127.0), 127.0)
+    sb_off = rb[:, None] * (K_total // 32) + pid_g * NBLK + tl.arange(0, NBLK)[None, :]
+    tl.store(x_s_ptr + sb_off, (e + 127.0).to(tl.int32).to(tl.uint8), mask=mask_b[:, None])
+
+    y = acc3 / tl.exp2(e)[:, :, None]
+    y = tl.minimum(tl.maximum(y, -6.0), 6.0)
+    ay = tl.abs(y)
+    mag = tl.where(ay < 0.25, 0,
+          tl.where(ay < 0.75, 1,
+          tl.where(ay < 1.25, 2,
+          tl.where(ay < 1.75, 3,
+          tl.where(ay < 2.5, 4,
+          tl.where(ay < 3.5, 5,
+          tl.where(ay < 5.0, 6, 7))))))).to(tl.uint8)
+    sign = (y < 0).to(tl.uint8)
+    nib = (mag & 0x7) | (sign << 3)
+
+    nib2 = tl.reshape(nib, (BLOCK_B, GROUP_SIZE // 2, 2))
+    lo, hi = tl.split(nib2)
+    byte = (lo | (hi << 4)).to(tl.uint8)
+
+    rj2 = tl.arange(0, GROUP_SIZE // 2)
+    f4_off = (pid_g * (GROUP_SIZE // 2) + rj2)[:, None] * B_cap + rb[None, :]
+    tl.store(x_f4_ptr + f4_off, tl.trans(byte), mask=mask_b[None, :])
+
+
+def rotate_quantize_fused_fp4_pooled(x: torch.Tensor, rot_bank: torch.Tensor,
+                                     expert_info: torch.Tensor,
+                                     block_info: torch.Tensor,
+                                     group_size: int, num_groups: int):
+    """池内逐成员旋转 + e2m1/e8m0 量化的 python wrapper（静态派发用）。
+
+    参数语义与 triton_kernels_a8.rotate_quantize_fused_pooled 一一对应；
+    fp4 无 extra_scale 通道（cb 类常量只能进 GEMM epilogue）。
+
+    Returns:
+        x_f4: (K_total//2, B_cap) uint8 预转置；x_s: (B_cap, K_total//32) uint8
+    """
+    B_cap, K_total = x.shape
+    if K_total != num_groups * group_size:
+        raise ValueError(f"K_total ({K_total}) != num_groups*group_size "
+                         f"({num_groups * group_size})")
+    x_f4 = torch.empty((K_total // 2, B_cap), dtype=torch.uint8, device=x.device)
+    x_s = torch.empty((B_cap, K_total // 32), dtype=torch.uint8, device=x.device)
+    grid = (block_info.shape[0], num_groups)
+    _rotate_quantize_kernel_fp4_pooled[grid](
+        x, rot_bank, expert_info, block_info, x_f4, x_s,
+        B_cap, K_total, rot_bank.stride(0),
+        GROUP_SIZE=group_size, NUM_GROUPS=num_groups, BLOCK_B=32,
         num_warps=4, num_stages=3,
     )
     return x_f4, x_s

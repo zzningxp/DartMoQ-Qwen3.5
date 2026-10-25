@@ -226,6 +226,93 @@ def rotate_quantize_fused_fp8(x: torch.Tensor, rot: torch.Tensor,
     return x_f8, x_scale
 
 
+@triton.jit
+def _rotate_quantize_kernel_fp8_pooled(
+    x_ptr,            # (B_cap, K_total) fp16 —— 池缓冲（行序 = 成员序）
+    rot_ptr,          # 旋转矩阵库（TOTAL, G0_STRIDE），第 k 个矩阵基址 = k*stride
+    expert_info_ptr,  # (E, 4) int32 [token_start, token_count, rot_base, g_count]
+    block_info_ptr,   # (num_blocks, 2) int32 [member_idx, block_b]
+    x_f8_ptr,         # (B_cap, K_total) e4m3 输出
+    x_s_ptr,          # (B_cap, NUM_GROUPS) fp16 输出 scale
+    K_total,
+    ROT_G0_STRIDE,
+    GROUP_SIZE: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,
+    EXTRA_SCALE: tl.constexpr,
+    BLOCK_B: tl.constexpr = 32,
+):
+    """池内逐成员旋转 + e4m3 量化（静态派发 down 方向）。
+
+    与 `_rotate_quantize_kernel_fp8` 同一数学、同一量化尾；差别只在旋转
+    矩阵来源：down 的 seed 含 expert 偏移，整批不能共用一个矩阵。按"成员
+    × 行块"的最坏情况静态调度表分发程序，行段与矩阵基序号由 kernel 运行时
+    从 expert_info 读（列 2 = start // group_size，与 GEMM 的 group 切片
+    语义一致，共用同一份缓冲）。token_count=0 的成员整块早退。
+    """
+    pid = tl.program_id(0)
+    pid_g = tl.program_id(1)
+    bi = block_info_ptr + pid * 2
+    midx = tl.load(bi + 0).to(tl.int32)
+    blk_b = tl.load(bi + 1).to(tl.int32)
+
+    ei = expert_info_ptr + midx * 4
+    token_start = tl.load(ei + 0).to(tl.int32)
+    token_count = tl.load(ei + 1).to(tl.int32)
+    rot_base = tl.load(ei + 2).to(tl.int32)
+    if token_count <= 0:
+        return
+
+    rb = token_start + blk_b * BLOCK_B + tl.arange(0, BLOCK_B)
+    mask_b = rb < token_start + token_count
+
+    x_off = rb[:, None] * K_total + pid_g * GROUP_SIZE + tl.arange(0, GROUP_SIZE)[None, :]
+    x_tile = tl.load(x_ptr + x_off, mask=mask_b[:, None], other=0.0)
+
+    acc = tl.zeros((BLOCK_B, GROUP_SIZE), dtype=tl.float32)
+    rj = tl.arange(0, GROUP_SIZE)
+    rk = tl.arange(0, GROUP_SIZE)
+    p_off = (rot_base + pid_g) * ROT_G0_STRIDE + rj[:, None] * GROUP_SIZE + rk[None, :]
+    p_tile = tl.load(rot_ptr + p_off)
+    acc += tl.dot(x_tile, tl.trans(p_tile), out_dtype=tl.float32)
+
+    amax = tl.max(tl.abs(acc), axis=1)
+    scale_unf = tl.where(amax < 1e-8 * 448.0, 1e-8, amax / 448.0)
+
+    q_f8 = (acc / scale_unf[:, None]).to(tl.float8e4nv)
+    tl.store(x_f8_ptr + x_off, q_f8, mask=mask_b[:, None])
+    tl.store(x_s_ptr + rb * NUM_GROUPS + pid_g,
+             (scale_unf * EXTRA_SCALE).to(tl.float16), mask=mask_b)
+
+
+def rotate_quantize_fused_fp8_pooled(x: torch.Tensor, rot_bank: torch.Tensor,
+                                     expert_info: torch.Tensor,
+                                     block_info: torch.Tensor,
+                                     group_size: int, num_groups: int,
+                                     extra_scale: float = 1.0):
+    """池内逐成员旋转 + e4m3 量化的 python wrapper（静态派发用）。
+
+    参数语义与 triton_kernels_a8.rotate_quantize_fused_pooled 一一对应；
+    extra_scale 传 cb_scale。
+    """
+    B_cap, K_total = x.shape
+    if K_total != num_groups * group_size:
+        raise ValueError(f"K_total ({K_total}) != num_groups*group_size "
+                         f"({num_groups * group_size})")
+    x_f8 = torch.empty((B_cap, K_total), dtype=torch.float8_e4m3fn,
+                       device=x.device)
+    x_scale = torch.empty((B_cap, num_groups), dtype=torch.float16,
+                          device=x.device)
+    grid = (block_info.shape[0], num_groups)
+    _rotate_quantize_kernel_fp8_pooled[grid](
+        x, rot_bank, expert_info, block_info, x_f8, x_scale,
+        K_total, rot_bank.stride(0),
+        GROUP_SIZE=group_size, NUM_GROUPS=num_groups,
+        EXTRA_SCALE=extra_scale, BLOCK_B=32,
+        num_warps=4, num_stages=3,
+    )
+    return x_f8, x_scale
+
+
 # ===========================================================================
 # WF-3：融合反量化 + FP8 matmul kernel（group-first 布局）
 # ===========================================================================
@@ -638,6 +725,31 @@ def _wxfp8_merged_kernel_gf(
              mask=mask_b[:, None] & mask_n[None, :])
 
 
+def _launch_wxfp8_merged_gf(
+    x_f8, x_scale, indices_packed_gf, cb_f8, norms_used,
+    expert_info_dev, block_info, out, n_extent,
+    group_size, num_groups, bit_width, slice_is_groups, cfg,
+):
+    """wxfp8 merged kernel 统一发射入口（host 编排路径与静态派发路径共用）。
+
+    参数序与 _wxfp8_merged_kernel_gf 形参一一对应；expert_info_dev 必须是
+    (E,4) int32 设备张量（kernel 运行时读行段/列段）。
+    """
+    BLOCK_B, BLOCK_N, BLOCK_K, num_warps, num_stages = cfg
+    _wxfp8_merged_kernel_gf[(block_info.shape[0],)](
+        x_f8, x_scale, indices_packed_gf, cb_f8, norms_used,
+        expert_info_dev, block_info, out,
+        out.shape[0], x_f8.shape[1], n_extent,
+        indices_packed_gf.stride(0), norms_used.stride(0), x_scale.stride(0),
+        out.stride(0),
+        GROUP_SIZE=group_size, NUM_GROUPS=num_groups,
+        BIT_WIDTH=bit_width, N_LEVELS=cb_f8.shape[0],
+        SLICE_IS_GROUPS=slice_is_groups,
+        BLOCK_B=BLOCK_B, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        num_warps=num_warps, num_stages=num_stages,
+    )
+
+
 def wxfp8_matmul_merged_rows_gf(
     x_f8, x_scale, indices_packed_gf, cb_f8, norms_gf,
     expert_info, group_size, in_features, bit_width: int = 2,
@@ -681,18 +793,12 @@ def wxfp8_matmul_merged_rows_gf(
     out = torch.empty(B_total, n_slice, dtype=torch.float16, device=x_f8.device)
     n_limit = max(row[2] for row in expert_info) + n_slice
 
-    _wxfp8_merged_kernel_gf[(block_info.shape[0],)](
+    _launch_wxfp8_merged_gf(
         x_f8, x_scale, indices_packed_gf, cb_f8, norms_full,
         torch.tensor(expert_info, dtype=torch.int32, device=x_f8.device),
-        block_info, out,
-        B_total, x_f8.shape[1], n_limit,
-        indices_packed_gf.stride(0), norms_full.stride(0), x_scale.stride(0),
-        out.stride(0),
-        GROUP_SIZE=group_size, NUM_GROUPS=num_groups,
-        BIT_WIDTH=bit_width, N_LEVELS=cb_f8.shape[0],
-        BLOCK_B=BLOCK_B, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
-        num_warps=num_warps, num_stages=num_stages,
-    )
+        block_info, out, n_limit,
+        group_size, num_groups, bit_width, slice_is_groups=False,
+        cfg=(BLOCK_B, BLOCK_N, BLOCK_K, num_warps, num_stages))
     return out
 
 
@@ -734,17 +840,56 @@ def wxfp8_matmul_merged_in_features_gf(
                                           N, x_f8.device)
     out = torch.empty(B_total, N, dtype=torch.float16, device=x_f8.device)
 
-    _wxfp8_merged_kernel_gf[(block_info.shape[0],)](
+    _launch_wxfp8_merged_gf(
         x_f8, x_scale, indices_packed_gf, cb_f8, norms_slice,
         torch.tensor(expert_info, dtype=torch.int32, device=x_f8.device),
-        block_info, out,
-        B_total, x_f8.shape[1], N,
-        indices_packed_gf.stride(0), norms_slice.stride(0), x_scale.stride(0),
-        out.stride(0),
-        GROUP_SIZE=group_size, NUM_GROUPS=g_count,
-        BIT_WIDTH=bit_width, N_LEVELS=cb_f8.shape[0],
-        SLICE_IS_GROUPS=True,
-        BLOCK_B=BLOCK_B, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
-        num_warps=num_warps, num_stages=num_stages,
-    )
+        block_info, out, N,
+        group_size, g_count, bit_width, slice_is_groups=True,
+        cfg=(BLOCK_B, BLOCK_N, BLOCK_K, num_warps, num_stages))
+    return out
+
+
+def wxfp8_matmul_merged_rows_gf_static(
+    x_f8, x_scale, indices_packed_gf, cb_f8, norms_gf,
+    expert_info_dev, block_info, n_slice, n_limit,
+    group_size, in_features, bit_width: int = 2,
+    norms_prescaled: bool = True, cfg=None,
+):
+    """gate_up 合并版·静态派发（CUDA graph decode 用）。
+
+    与 wxfp8_matmul_merged_rows_gf 同一 kernel、同一 tile 数学；差别仅在
+    编排来源：expert_info 与 block_info 均为设备常驻张量（行段每步设备端
+    重写）。函数内零 host 读、零 H2D、零形状变化——capture 期合法。
+    """
+    norms_full = norms_gf if norms_prescaled else (
+        norms_gf.float() / math.sqrt(group_size))
+    out = torch.empty(x_f8.shape[0], n_slice, dtype=torch.float16,
+                      device=x_f8.device)
+    if cfg is None:
+        cfg = get_wxfp8_config(bit_width, direction="gate_up", B=x_f8.shape[0])
+    _launch_wxfp8_merged_gf(
+        x_f8, x_scale, indices_packed_gf, cb_f8, norms_full,
+        expert_info_dev, block_info, out, n_limit,
+        group_size, in_features // group_size, bit_width,
+        slice_is_groups=False, cfg=cfg)
+    return out
+
+
+def wxfp8_matmul_merged_in_features_gf_static(
+    x_f8, x_scale, indices_packed_gf, cb_f8, norms_gf,
+    expert_info_dev, block_info, group_size, g_count,
+    bit_width: int = 2, norms_prescaled: bool = True, cfg=None,
+):
+    """down 合并版·静态派发（CUDA graph decode 用），契约同 rows 静态版。"""
+    norms_slice = norms_gf if norms_prescaled else (
+        norms_gf.float() / math.sqrt(group_size))
+    N = norms_slice.shape[1]
+    out = torch.empty(x_f8.shape[0], N, dtype=torch.float16,
+                      device=x_f8.device)
+    if cfg is None:
+        cfg = get_wxfp8_config(bit_width, direction="down", B=x_f8.shape[0])
+    _launch_wxfp8_merged_gf(
+        x_f8, x_scale, indices_packed_gf, cb_f8, norms_slice,
+        expert_info_dev, block_info, out, N,
+        group_size, g_count, bit_width, slice_is_groups=True, cfg=cfg)
     return out

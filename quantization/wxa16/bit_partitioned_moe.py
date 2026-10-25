@@ -23,10 +23,16 @@ from turboquant_utils.triton_kernels import (
     triton_fused_matmul_grouped_slice_in_features_gf,
     triton_fused_matmul_merged_rows_gf,
     triton_fused_matmul_merged_in_features_gf,
+    triton_fused_matmul_merged_rows_gf_static,
+    triton_fused_matmul_merged_in_features_gf_static,
+    _get_fused_grouped_config,
     convert_to_group_first,
 )
 from turboquant_utils.cuda_profiler import CudaStageProfiler
-from turboquant_utils.rotation import batch_rotate_input
+from turboquant_utils.rotation import (
+    batch_rotate_input,
+    generate_batch_rotation_matrices,
+)
 
 
 class WxA16Weights(nn.Module):
@@ -263,6 +269,187 @@ class WxA16Weights(nn.Module):
         weights._gate_up_packed = None
         weights._down_packed = None
         return weights
+
+
+# ---------------- 静态派发（CUDA graph decode）----------------
+# host 编排（bincount 读回 host → Python 池字典 → 变长拼接 → host 构建
+# 调度表再上传）在 capture 期非法，且会把捕获那一刻的路由烤死进图。
+# 静态派发把同一套数学换成全定形设备算子：容量上界固定的池缓冲 +
+# 设备端统计/游标/位次 + 最坏情况调度表（空专家块全掩码空转）+ 预建
+# 旋转矩阵库（复用 generate_batch_rotation_matrices 的批量缓存，跨层
+# 同 key 共享）。kernel 本身零改动——运行时从 expert_info/block_info
+# 设备张量读行段。每层的 bit 池结构（几个池、各池 expert 数）是量化时
+# 定死的加载期常量，直接固化成该层图节点；唯一动态量（路由分布）变成
+# expert_info 行段里的设备端数据。
+
+# decode 才走静态派发；更大行数（prefill/大 batch）保持原 host 编排路径
+_STATIC_DISPATCH_ENV = "DARTMOQ_STATIC_DISPATCH"
+_STATIC_DISPATCH_MAX_CAPACITY = 64
+
+
+class _StaticPoolState:
+    """单 bit 池的静态派发常量与容量缓冲（CUDA graph decode 用）。
+
+    成员分两类：加载期常量（expert_info 的列切片列、最坏情况调度表、
+    kernel 入参、旋转矩阵库引用）与容量上界固定的复用缓冲（tokens/
+    weights/slot_local 缓冲、expert_info 的行段列）。每步前向由设备端
+    定形算子原地重写后者，无 host 读取、无 H2D、无形状变化——capture
+    期合法；重放期路由变化通过行段列（token_start/token_count）体现，
+    kernel 运行时读取。
+    """
+
+    def __init__(self, bit_str, members, ctx, capacity, act_dtype,
+                 cfg_getter=None):
+        # members: [(expert_idx, start, end)]，按 expert 升序（与 _merged_pools
+        # 的成员顺序一致）；start/end 是该 expert 在本 bit packed 布局上的段
+        # cfg_getter: direction/B → tile 配置（各模式 kernel 的选档函数不同，
+        # 由 MoE 实例按 bit 提供；None 回退 A16 的 _get_fused_grouped_config）
+        self.bit_str = bit_str
+        self.bit = int(bit_str)
+        self.capacity = capacity
+        self.num_members = len(members)
+        starts = [s for _e, s, _t in members]
+        inter = members[0][2] - members[0][1]
+        for _e, s, t in members:
+            if t - s != inter:
+                raise RuntimeError(
+                    f"static dispatch: bit {bit_str} pool has non-uniform "
+                    f"inter size, merged kernel cannot handle it")
+        self.inter = inter
+
+        gs_gu = ctx["gate_up_group_size"]
+        gs_dn = ctx["down_group_size"]
+        in_f = ctx["gate_up_in_features"]
+        if not ctx["gf_gate_up"] or not ctx["gf_down"]:
+            raise RuntimeError(
+                f"static dispatch: bit {bit_str} lacks group-first layout")
+        if in_f % gs_gu != 0 or in_f // gs_gu < 2:
+            raise RuntimeError(
+                f"static dispatch: bit {bit_str} gate_up num_groups < 2")
+        if inter % gs_dn != 0 or inter // gs_dn < 2:
+            raise RuntimeError(
+                f"static dispatch: bit {bit_str} down num_groups < 2")
+        if any(s % gs_dn for s in starts):
+            raise RuntimeError(
+                f"static dispatch: bit {bit_str} down start not group-aligned")
+        self.gs_gu, self.gs_dn = gs_gu, gs_dn
+        self.in_f = in_f
+        self.g_count = inter // gs_dn
+        self.n_slice = 2 * inter
+        self.n_limit = 2 * max(starts) + self.n_slice
+
+        device = ctx["gate_up_codebook"].device
+        self.member_ids = torch.tensor([e for e, _s, _t in members],
+                                       dtype=torch.long, device=device)
+
+        # expert_info 模板：(token_start, token_count, slice_start, slice_count)
+        # 行段列（0,1）每步设备端重写；列切片列（2,3）常量
+        ei_gu = torch.zeros(self.num_members, 4, dtype=torch.int32, device=device)
+        ei_gu[:, 2] = torch.tensor([2 * s for s in starts],
+                                   dtype=torch.int32, device=device)
+        ei_gu[:, 3] = self.n_slice
+        ei_dn = torch.zeros(self.num_members, 4, dtype=torch.int32, device=device)
+        ei_dn[:, 2] = torch.tensor([s // gs_dn for s in starts],
+                                   dtype=torch.int32, device=device)
+        ei_dn[:, 3] = self.g_count
+        self.expert_info_gu, self.expert_info_dn = ei_gu, ei_dn
+        self.start_gs_lut = ei_dn[:, 2].to(torch.long)
+
+        # kernel 入参常量（与 bit_ctx 同源，避免每 forward 字典查找）
+        gu, dn = ctx["gate_up"], ctx["down"]
+        self.idx_gu_gf = gu["indices_packed_gf"]
+        self.norms_gu_gf = gu["norms_gf"]
+        self.cb_gu = ctx["gate_up_codebook"]
+        self.prescaled_gu = ctx["gate_up_norms_prescaled"]
+        self.idx_dn_gf = dn["indices_packed_gf"]
+        self.norms_dn_gf = dn["norms_gf"]
+        self.cb_dn = ctx["down_codebook"]
+        self.prescaled_dn = ctx["down_norms_prescaled"]
+        self.gu_seed = ctx["gate_up_seed"]
+        self.N_dn = self.norms_dn_gf.shape[1]
+
+        # 各模式的 kernel 入参常量：ctx 里存在则抓引用。A16 路径只用上面的
+        # cb_gu/cb_dn；wxa8/wxfp8 的 cb 常量与 int8/e4m3 码本、wxfp4 的
+        # nib/ws/fold 副本由各模式子类的 _static_pool_compute 读取。
+        # gate_up 旋转每池统一（seed 无 expert 偏移），此处一次生成整批矩阵
+        self.cb_step_gu = ctx.get("gate_up_cb_step", 1.0)
+        self.cb_scale_gu = ctx.get("gate_up_cb_scale", 1.0)
+        self.cb_step_dn = ctx.get("down_cb_step", 1.0)
+        self.cb_scale_dn = ctx.get("down_cb_scale", 1.0)
+        self.cb_gu_i8 = ctx.get("gate_up_cb_i8")
+        self.cb_dn_i8 = ctx.get("down_cb_i8")
+        self.cb_gu_f8 = ctx.get("gate_up_cb_f8")
+        self.cb_dn_f8 = ctx.get("down_cb_f8")
+        self.nib_gu = ctx.get("gate_up_nib")
+        self.ws_gu = ctx.get("gate_up_ws")
+        self.e2m1_gu = ctx["gate_up"].get("indices_e2m1_gf")
+        self.nib_dn = ctx.get("down_nib")
+        self.ws_dn = ctx.get("down_ws")
+        self.e2m1_dn = ctx["down"].get("indices_e2m1_gf")
+        self.rot_gu = generate_batch_rotation_matrices(
+            gs_gu, ctx["gate_up_seed"], in_f // gs_gu, stride=gs_gu,
+            device=device, dtype=torch.float16)
+
+        # launch 配置与最坏情况调度表：每 expert 全 B-block × 全 N-block，
+        # 空专家的块由 kernel 的行掩码空转（安全性见 kernel 的 mask_b 逻辑）
+        if cfg_getter is None:
+            def cfg_getter(direction, B, _bit=self.bit):
+                return _get_fused_grouped_config(
+                    _bit, direction=direction, B=B)
+        self.cfg_gu = cfg_getter("gate_up", capacity)
+        self.cfg_dn = cfg_getter("down", capacity)
+        self.block_info_gu = self._worst_case_blocks(
+            capacity, self.cfg_gu[0], self.cfg_gu[1], self.n_slice)
+        self.block_info_dn = self._worst_case_blocks(
+            capacity, self.cfg_dn[0], self.cfg_dn[1], self.N_dn)
+        # 行块调度表（pooled 旋转量化 kernel 用）：BLOCK_B 恒 32
+        self.block_info_b32 = self._b32_blocks(capacity)
+
+        # down 旋转矩阵库：seed = down_seed + j*gs，j ∈ [0, 池总 group 数)。
+        # 逐 expert 路径的 batch_rotate_input(seed + start) 与此同一索引空间
+        # （start 是 gs 的倍数），故 bank 按全局 seed 序展开即可——复用批量
+        # 旋转缓存，跨层同 (gs, seed) 的池共享同一份 bank
+        total_groups = (max(starts) + inter) // gs_dn
+        self.rot_bank = generate_batch_rotation_matrices(
+            gs_dn, ctx["down_seed"], total_groups, stride=gs_dn,
+            device=device, dtype=torch.float16)
+        self.j_arange = torch.arange(self.g_count, dtype=torch.long, device=device)
+
+        # 容量缓冲（C+1：最后一格是丢弃槽——非本池行写入它，永不读出，
+        # 保证 index_copy_ 的目标下标唯一、结果确定）
+        C = capacity
+        self.tokens_buf = torch.zeros(C + 1, dtype=torch.long, device=device)
+        self.weights_buf = torch.zeros(C + 1, dtype=act_dtype, device=device)
+        self.slot_local_buf = torch.zeros(C + 1, dtype=torch.long, device=device)
+
+    def _worst_case_blocks(self, capacity, block_b, block_n, n_extent):
+        """最坏情况调度表：(E × ceil(C/BLOCK_B) × ceil(N/BLOCK_N), 3) int32。"""
+        n_b = (capacity + block_b - 1) // block_b
+        n_n = (n_extent + block_n - 1) // block_n
+        blocks = [(e, b, n) for e in range(self.num_members)
+                  for b in range(n_b) for n in range(n_n)]
+        return torch.tensor(blocks, dtype=torch.int32,
+                            device=self.member_ids.device).contiguous()
+
+    def _b32_blocks(self, capacity):
+        """行块静态调度表（pooled 旋转量化 kernel 用）：(E × ceil(C/32), 2) int32。"""
+        n_b = (capacity + 31) // 32
+        blocks = [(e, b) for e in range(self.num_members) for b in range(n_b)]
+        return torch.tensor(blocks, dtype=torch.int32,
+                            device=self.member_ids.device).contiguous()
+
+
+class _StaticDispatchState:
+    """一层 MoE 的静态派发总状态：容量上界 + 池列表 + expert → 池/成员 LUT。"""
+
+    def __init__(self, capacity, pools, expert_bit, expert_local):
+        self.capacity = capacity
+        self.pools = pools
+        self.expert_bit = expert_bit      # (num_experts,) long：expert → 池序号
+        self.expert_local = expert_local  # (num_experts,) long：expert → 池内成员序号
+        dev = expert_bit.device
+        self.ones_c = torch.ones(capacity, dtype=torch.int32, device=dev)
+        self.arange_c = torch.arange(capacity, dtype=torch.int64, device=dev)
 
 
 class WxA16BitPartitionedGroupMoE(nn.Module):
@@ -1056,6 +1243,169 @@ class WxA16BitPartitionedGroupMoE(nn.Module):
             cursor += n
         return info
 
+    # ---------------- 静态派发（CUDA graph decode）方法 ----------------
+
+    def _build_static_decode_state(self, x):
+        """构建静态派发状态（首个符合条件的 forward 执行一次，eager 期）。
+
+        DARTMOQ_STATIC_DISPATCH=1 显式开启；前置不满足时直接报错而非静默
+        回退 host 编排（静默回退会让 capture 在别的位置死掉，反而难排查）。
+        """
+        capacity = x.shape[0] * self.top_k
+        self._ensure_active_bits()
+        bit_ctx = self._get_bit_context(x.device)
+        pools = []
+        expert_bit = torch.full((self.num_experts,), -1,
+                                dtype=torch.long, device=x.device)
+        expert_local = torch.full((self.num_experts,), -1,
+                                  dtype=torch.long, device=x.device)
+        for bit_str in self.bit_weights.keys():
+            members = []
+            for e in range(self.num_experts):
+                for bs, _b, s, t in self._active_bits_by_expert[e]:
+                    if bs == bit_str:
+                        members.append((e, s, t))
+            if not members:
+                continue
+            ps = _StaticPoolState(bit_str, members, bit_ctx[bit_str],
+                                  capacity, x.dtype,
+                                  cfg_getter=self._static_cfg_getter(
+                                      int(bit_str)))
+            bi = len(pools)
+            expert_bit[ps.member_ids] = bi
+            expert_local[ps.member_ids] = torch.arange(
+                ps.num_members, dtype=torch.long, device=x.device)
+            pools.append(ps)
+            print(f"[static-dispatch] pool bit={bit_str} experts={ps.num_members} "
+                  f"inter={ps.inter} gs=({ps.gs_gu},{ps.gs_dn}) capacity={capacity} "
+                  f"blocks(gu/dn)=({ps.block_info_gu.shape[0]},{ps.block_info_dn.shape[0]}) "
+                  f"rot_bank={ps.rot_bank.shape[0]}x{ps.gs_dn}x{ps.gs_dn}", flush=True)
+        if not pools:
+            raise RuntimeError("static dispatch: no active bit pool found")
+        self._static_decode_state = _StaticDispatchState(
+            capacity, pools, expert_bit, expert_local)
+
+    def _forward_static_decode(self, x, topk_weights, topk_indices,
+                               final_hidden_states):
+        """设备端定形派发的 MoE 计算（与 _expert_compute_merged 同数学）。
+
+        全部算子定形、无 host 读取：统计（index_add_）→ 池内游标（cumsum）
+        → 行位次（C×C 定形比较）→ 池缓冲散写（index_copy_，含丢弃槽）→
+        kernel（运行时读 expert_info 行段）→ 权重加权 scatter（index_add_）。
+        padding 行（容量上界与真实行数之差）输入置零、权重为零，对合法
+        token 恒等加零（bitwise 安全）。gate_up 旋转整批预提升（P6-1 等价，
+        rotate(x)[idx] ≡ rotate(x[idx])）；down 逐行从旋转库按所属 expert
+        的 group 偏移选矩阵。
+        """
+        st = self._static_decode_state
+        T = x.shape[0]
+        C = st.capacity
+        dev = x.device
+
+        flat_e = topk_indices.reshape(-1).long()
+        flat_w = topk_weights.reshape(-1).to(x.dtype)
+        flat_t = torch.arange(T, device=dev).repeat_interleave(self.top_k)
+
+        # 设备端统计 + 行内位次（同一 expert 的先前行数）
+        counts = torch.zeros(self.num_experts, dtype=torch.int32, device=dev)
+        counts.index_add_(0, flat_e, st.ones_c)
+        same = flat_e.unsqueeze(0) == flat_e.unsqueeze(1)
+        prior = same.long().tril(-1).sum(1)
+        pool_of_row = st.expert_bit.index_select(0, flat_e)
+        local_of_row = st.expert_local.index_select(0, flat_e)
+
+        for bi, ps in enumerate(st.pools):
+            m_counts = counts.index_select(0, ps.member_ids)
+            cursors = m_counts.cumsum(0, dtype=torch.int32)
+            cursors = cursors - m_counts  # 排他前缀和 = 池内行游标
+            ps.expert_info_gu[:, 0].copy_(cursors)
+            ps.expert_info_gu[:, 1].copy_(m_counts)
+            ps.expert_info_dn[:, 0].copy_(cursors)
+            ps.expert_info_dn[:, 1].copy_(m_counts)
+
+            pool_total = m_counts.sum()
+            in_pool = pool_of_row == bi
+            # 非本池行的局部索引指向别的池（合法于彼池、可能越界于本池），
+            # clamp 到本池范围防 gather 越界；其行游标本就不参与 dst
+            # （torch.where 丢弃），仅保证索引合法
+            row_cursor = cursors.index_select(
+                0, local_of_row.clamp(0, ps.num_members - 1)).to(torch.long)
+            dst = torch.where(in_pool, row_cursor + prior, C)  # 丢弃槽 = C
+
+            ps.tokens_buf.zero_()
+            ps.tokens_buf.index_copy_(0, dst, flat_t)
+            ps.weights_buf.zero_()
+            ps.weights_buf.index_copy_(0, dst, flat_w)
+            ps.slot_local_buf.zero_()
+            ps.slot_local_buf.index_copy_(0, dst, local_of_row)
+            tokens_c = ps.tokens_buf[:C]
+            weights_c = ps.weights_buf[:C]
+            mask_rows = st.arange_c < pool_total
+
+            self._static_pool_compute(
+                ps, x, tokens_c, weights_c, mask_rows, final_hidden_states)
+
+        return final_hidden_states
+
+    # 各模式子类声明：本类的 _static_pool_compute 已按自身 kernel 语义实现
+    # （未声明的子类被 forward 的静态派发钩子挡掉，防把基类数值烤进图）
+    _STATIC_DISPATCH_READY = True
+
+    @staticmethod
+    def _static_cfg_getter(bit):
+        """静态池的 tile 选档函数（本模式 kernel 的 config 入口）。"""
+        def getter(direction, B):
+            return _get_fused_grouped_config(bit, direction=direction, B=B)
+        return getter
+
+    def _static_pool_compute(self, ps, x, tokens_c, weights_c, mask_rows,
+                             final_hidden_states):
+        """单个 bit 池的静态计算（A16 默认；与 _merged_pool_compute 同数学）。
+
+        输入侧：整批预旋转（gate_up seed 每池统一，P6-1 等价）后按池 gather，
+        padding 行置零；down 侧逐行从旋转库按所属 expert 的 group 偏移选矩阵。
+        子类按各自 kernel 语义覆盖（wxa8/wxfp8/wxfp4）。
+        """
+        C = ps.capacity
+        # gate_up：整批预旋转（T 行）后按池 gather，padding 行置零
+        x_rot = batch_rotate_input(x, ps.gs_gu, ps.gu_seed)
+        x_pool = x_rot.index_select(0, tokens_c)
+        x_pool = x_pool * mask_rows.unsqueeze(1).to(x_pool.dtype)
+        gu = triton_fused_matmul_merged_rows_gf_static(
+            x_pool, ps.idx_gu_gf, ps.cb_gu, ps.norms_gu_gf,
+            ps.expert_info_gu, ps.block_info_gu, ps.n_slice, ps.n_limit,
+            ps.gs_gu, ps.in_f, bit_width=ps.bit,
+            norms_prescaled=ps.prescaled_gu, cfg=ps.cfg_gu)
+        if gu.dtype != x.dtype:
+            gu = gu.to(x.dtype)
+        act = F.silu(gu[:, :ps.inter]) * gu[:, ps.inter:]
+        del gu, x_pool
+
+        # down：逐行按所属 expert 的 group 偏移从旋转库选矩阵
+        act16 = act if act.dtype == torch.float16 else act.half()
+        G = ps.g_count
+        j = ps.start_gs_lut.index_select(
+            0, ps.slot_local_buf[:C]).unsqueeze(1) + ps.j_arange
+        rot_sel = ps.rot_bank.index_select(
+            0, j.reshape(-1)).view(C, G, ps.gs_dn, ps.gs_dn)
+        act_rot = torch.bmm(
+            act16.view(C, G, ps.gs_dn).reshape(C * G, 1, ps.gs_dn),
+            rot_sel.reshape(C * G, ps.gs_dn, ps.gs_dn).transpose(1, 2),
+        ).view(C, ps.inter)
+        del act16, rot_sel, j
+        dn = triton_fused_matmul_merged_in_features_gf_static(
+            act_rot, ps.idx_dn_gf, ps.cb_dn, ps.norms_dn_gf,
+            ps.expert_info_dn, ps.block_info_dn, ps.gs_dn, ps.g_count,
+            bit_width=ps.bit, norms_prescaled=ps.prescaled_dn, cfg=ps.cfg_dn)
+        del act_rot
+        if dn.dtype != act.dtype:
+            dn = dn.to(act.dtype)
+
+        # 权重加权 scatter（padding 行权重为零 → 对 token 0 恒等加零）
+        dn = dn * weights_c.unsqueeze(1)
+        final_hidden_states.index_add_(0, tokens_c, dn)
+        del dn, act
+
     def forward(self, hidden_states):
         """
         前向推理：按 expert 处理，对每个 bit 分别反量化 + GEMM。
@@ -1120,6 +1470,24 @@ class WxA16BitPartitionedGroupMoE(nn.Module):
             del gate_output
         t_router_end = time.time()
         t3 = t_router_end
+
+        # 静态派发（CUDA graph decode）：DARTMOQ_STATIC_DISPATCH=1 且行数
+        # 不超过容量上界时走设备端定形编排；prefill/大 batch 走下方原路径
+        # （host 编排），两条路径长期并存。仅限声明了 _STATIC_DISPATCH_READY
+        # 的类：静态池计算（_static_pool_compute）与该模式的 kernel 语义
+        # 绑定，未实现的子类误入会把基类 A16 数值烤进图，这里直接挡掉
+        if (os.environ.get(_STATIC_DISPATCH_ENV, "0") == "1"
+                and type(self)._STATIC_DISPATCH_READY):
+            _st = getattr(self, "_static_decode_state", None)
+            _rows = x.shape[0] * self.top_k
+            if ((_st is None or _rows > _st.capacity)
+                    and _rows <= _STATIC_DISPATCH_MAX_CAPACITY):
+                self._build_static_decode_state(x)
+                _st = self._static_decode_state
+            if _st is not None and _rows <= _st.capacity:
+                out = self._forward_static_decode(
+                    x, topk_weights, topk_indices, final_hidden_states)
+                return out.reshape(batch_size, seq_len, hidden_dim)
 
         # 优化结构：expert -> bit
         with prof.stage("sort_prep"):

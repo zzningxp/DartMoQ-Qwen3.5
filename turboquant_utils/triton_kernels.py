@@ -1479,6 +1479,32 @@ def _turboquant_fused_matmul_merged_kernel_gf(
              mask=mask_b[:, None] & mask_n[None, :])
 
 
+def _launch_merged_matmul_gf(
+    x_rot, indices_packed_gf, codebook, norms_used,
+    expert_info_dev, block_info, out, n_extent,
+    group_size, num_groups, bit_width, slice_is_groups, cfg,
+):
+    """merged kernel 统一发射入口（host 编排路径与静态派发路径共用）。
+
+    参数序与 _turboquant_fused_matmul_merged_kernel_gf 形参一一对应；
+    expert_info_dev 必须是 (E,4) int32 设备张量（kernel 运行时读行段/
+    列段，行段可由设备端每步重写）；SLICE_IS_GROUPS 两模式语义见
+    kernel docstring。
+    """
+    BLOCK_B, BLOCK_N, BLOCK_K, num_warps, num_stages = cfg
+    _turboquant_fused_matmul_merged_kernel_gf[(block_info.shape[0],)](
+        x_rot, indices_packed_gf, codebook, norms_used,
+        expert_info_dev, block_info, out,
+        out.shape[0], x_rot.shape[1], n_extent,
+        indices_packed_gf.stride(0), norms_used.stride(0), out.stride(0),
+        GROUP_SIZE=group_size, NUM_GROUPS=num_groups,
+        BIT_WIDTH=bit_width, N_LEVELS=codebook.shape[0],
+        SLICE_IS_GROUPS=slice_is_groups,
+        BLOCK_B=BLOCK_B, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        num_warps=num_warps, num_stages=num_stages,
+    )
+
+
 def triton_fused_matmul_merged_rows_gf(
     x_rot, indices_packed_gf, codebook, norms_gf,
     expert_info, group_size, in_features, bit_width: int = 4,
@@ -1537,17 +1563,12 @@ def triton_fused_matmul_merged_rows_gf(
     out = torch.empty(B_total, n_slice, dtype=orig_dtype, device=x_rot.device)
     n_limit = max(row[2] for row in expert_info) + n_slice
 
-    _turboquant_fused_matmul_merged_kernel_gf[(block_info.shape[0],)](
+    _launch_merged_matmul_gf(
         x_rot, indices_packed_gf, codebook, norms_used,
         torch.tensor(expert_info, dtype=torch.int32, device=x_rot.device),
-        block_info, out,
-        B_total, x_rot.shape[1], n_limit,
-        indices_packed_gf.stride(0), norms_used.stride(0), out.stride(0),
-        GROUP_SIZE=group_size, NUM_GROUPS=num_groups,
-        BIT_WIDTH=bit_width, N_LEVELS=codebook.shape[0],
-        BLOCK_B=BLOCK_B, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
-        num_warps=num_warps, num_stages=num_stages,
-    )
+        block_info, out, n_limit,
+        group_size, num_groups, bit_width, slice_is_groups=False,
+        cfg=(BLOCK_B, BLOCK_N, BLOCK_K, num_warps, num_stages))
     return out
 
 
@@ -1600,16 +1621,70 @@ def triton_fused_matmul_merged_in_features_gf(
                                           N, x_rot.device)
     out = torch.empty(B_total, N, dtype=orig_dtype, device=x_rot.device)
 
-    _turboquant_fused_matmul_merged_kernel_gf[(block_info.shape[0],)](
+    _launch_merged_matmul_gf(
         x_rot, indices_packed_gf, codebook, norms_used,
         torch.tensor(expert_info, dtype=torch.int32, device=x_rot.device),
-        block_info, out,
-        B_total, x_rot.shape[1], N,
-        indices_packed_gf.stride(0), norms_used.stride(0), out.stride(0),
-        GROUP_SIZE=group_size, NUM_GROUPS=g_count,
-        BIT_WIDTH=bit_width, N_LEVELS=codebook.shape[0],
-        SLICE_IS_GROUPS=True,
-        BLOCK_B=BLOCK_B, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
-        num_warps=num_warps, num_stages=num_stages,
-    )
+        block_info, out, N,
+        group_size, g_count, bit_width, slice_is_groups=True,
+        cfg=(BLOCK_B, BLOCK_N, BLOCK_K, num_warps, num_stages))
+    return out
+
+
+def triton_fused_matmul_merged_rows_gf_static(
+    x_rot, indices_packed_gf, codebook, norms_gf,
+    expert_info_dev, block_info, n_slice, n_limit,
+    group_size, in_features, bit_width: int = 4,
+    norms_prescaled: bool = False, cfg=None,
+):
+    """gate_up 合并版·静态派发（CUDA graph decode 用）。
+
+    与 triton_fused_matmul_merged_rows_gf 同一 kernel、同一 tile 数学；差别
+    仅在编排来源：expert_info（(E,4) int32，行段列 token_start/token_count
+    由调用方每步设备端重写、列切片列是加载期常量）与 block_info（最坏情况
+    静态调度：每 expert 全 B-block × 全 N-block，空专家的块由 kernel 的行
+    掩码空转）均为设备常驻张量；n_slice/n_limit/num_groups 为静态常量。
+    函数内零 host 读、零 H2D、零形状变化——capture 期合法，重放期路由
+    变化由 kernel 运行时读 expert_info 体现。
+    """
+    orig_dtype = x_rot.dtype
+    if orig_dtype != torch.float16:
+        x_rot = x_rot.half()
+        codebook = codebook.half()
+        norms_gf = norms_gf.half()
+    norms_used = norms_gf if norms_prescaled else norms_gf / math.sqrt(group_size)
+    out = torch.empty(x_rot.shape[0], n_slice, dtype=orig_dtype, device=x_rot.device)
+    if cfg is None:
+        cfg = _get_fused_grouped_config(bit_width, direction="gate_up", B=x_rot.shape[0])
+    _launch_merged_matmul_gf(
+        x_rot, indices_packed_gf, codebook, norms_used,
+        expert_info_dev, block_info, out, n_limit,
+        group_size, in_features // group_size, bit_width,
+        slice_is_groups=False, cfg=cfg)
+    return out
+
+
+def triton_fused_matmul_merged_in_features_gf_static(
+    x_rot, indices_packed_gf, codebook, norms_gf,
+    expert_info_dev, block_info, group_size, g_count,
+    bit_width: int = 4, norms_prescaled: bool = False, cfg=None,
+):
+    """down 合并版·静态派发（CUDA graph decode 用），契约同 rows 静态版。
+
+    N（完整输出列数）取 norms_gf.shape[1]（静态形状）；g_count 为池内
+    group 切片计数（静态常量，kernel 的 NUM_GROUPS）。
+    """
+    orig_dtype = x_rot.dtype
+    if orig_dtype != torch.float16:
+        x_rot = x_rot.half()
+        codebook = codebook.half()
+        norms_gf = norms_gf.half()
+    norms_used = norms_gf if norms_prescaled else norms_gf / math.sqrt(group_size)
+    N = norms_used.shape[1]
+    out = torch.empty(x_rot.shape[0], N, dtype=orig_dtype, device=x_rot.device)
+    if cfg is None:
+        cfg = _get_fused_grouped_config(bit_width, direction="down", B=x_rot.shape[0])
+    _launch_merged_matmul_gf(
+        x_rot, indices_packed_gf, codebook, norms_used,
+        expert_info_dev, block_info, out, N,
+        group_size, g_count, bit_width, slice_is_groups=True, cfg=cfg)
     return out

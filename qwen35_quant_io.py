@@ -525,7 +525,7 @@ def convert_model_to_wxfp4(model):
                 n_attn += 1
             else:
                 n_kept += 1
-    print(f"Converted to WxFP4（保守版）: {n_moe} MoE layers"
+    print(f"Converted to WxFP4 v0.1: {n_moe} MoE layers"
           f"（bit1/4→fp4，bit2→wxa8）, {n_attn} attention/shared linears→wxa8")
     if n_kept:
         print(f"  ⚠ {n_kept} 个 8-bit linear 保持 W8A16（Lloyd-Max 码本）")

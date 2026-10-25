@@ -1149,6 +1149,16 @@ def main():
     refs, ref_logits, eager_med = run_eager_refs(
         model, sample, plen_list, steps_list, max_steps)
 
+    # 我方量化模型的 MoE 静态派发（CUDA graph 前置）：eager 基线保持
+    # host 编排口径，此处（基线之后、warmup 之前）打开；warmup 首个
+    # decode 步以 eager 方式构建池状态，随后 capture/重放全程设备端定形。
+    # 四模式（wxa16/wxa8/wxfp8/wxfp4）的静态池计算均已实现，全打开；
+    # 未实现静态化的新子类会被 MoE forward 的 _STATIC_DISPATCH_READY 守卫挡掉
+    if args.mode in ("wxa16", "wxa8", "wxfp8", "wxfp4"):
+        os.environ["DARTMOQ_STATIC_DISPATCH"] = "1"
+        print("[graph] DARTMOQ_STATIC_DISPATCH=1 "
+              f"(MoE static dispatch enabled for {args.mode})", flush=True)
+
     # ---- 2) 静态 cache + prefill（槽位按 max(prompt)+max(steps) 预分配）----
     static_cache = StaticCache(config=model.config, max_cache_len=max_cache_len)
     p0 = plen_list[0]  # 捂热/捕获/logits 对拍的基准档
