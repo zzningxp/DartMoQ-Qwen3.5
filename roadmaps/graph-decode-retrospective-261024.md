@@ -174,14 +174,47 @@ decode 阶段是 launch 密集型负载：每步数千次 host 端 kernel 发射
   `argmax().item()` 同步 ⇒ 两段串行、跨步无重叠——**第二张卡贡献显存
   容量而非吞吐**（FP8 35GB 单卡 32GB 放不下，双卡是容量所迫；与吞吐
   基准「串行切分、无算力红利」结论一致，98.64 不能按 ÷2 折算单卡）。
-  公平对比 = 官方 10.1ms/步 vs 我方 18.5ms/步（wxa8 4bpw），**差 1.83×，
-  未追平**；目标 10–12ms（83–100 tok/s，单卡追平乃至超过官方双卡总吞吐）。
-- **下一步（顺序）**：① nsys 逐段拆 18.5ms（graph 内 kernel 全署名，一次
-  看清 MoE 静态路径 / attention / lm_head / dispatch 链占比，避免拍脑袋
-  排序）；② fp4 池 decode 档 tile 重扫（BLOCK_N 128→32/64）与空块数削减
-  （decode 档 BLOCK_B 64/32→16 同方向）；③ dispatch 链融合（每层 ~25 个
-  小 kernel × 40 层 ≈ 图内 1000 节点）；④ 2bpw NaN 逐层溯源（问题 11
-  路线，修复前 2bpw 图路径只可测速）；⑤ 4bpw prefill 对齐（压漂移源头）。
+  并行形态精确地说：**非 TP**（每层完整落单卡、无权重切分，TP2 才有
+  decode 带宽聚合的近 2×，那是 vLLM 引擎路径的红利），**也非带重叠的
+  PP**（batch=1 闭环贪心下一步依赖当前 token，无流水线可重叠）——是
+  accelerate 连续层块的 naive 切分，且比假想单卡多付每步一次跨卡拷贝
+  （h_mid 4KB）与两段 replay 同步，故单卡等效 < 10.1ms、真实差距
+  **≥ 1.83×**。公平对比 = 官方 10.1ms/步 vs 我方 18.5ms/步（wxa8 4bpw），
+  未追平；目标 10–12ms（83–100 tok/s，单卡追平乃至超过官方双卡总吞吐）。
+- **后续优化路线（自 54 tok/s 起，261025 估算版；nsys 拆解后改预算制）**：
+
+| 阶段 | 手段 | ms/步 | tok/s | 里程碑 |
+|---|---|---|---|---|
+| 现状（wxa8 4bpw） | — | 18.5 | 54.0 | — |
+| 近期：编排/配置级 | dispatch 链融合 + 空块削减 + 图内小 kernel 合并 | ~14–16 | 62–71 | 第一个 checkpoint |
+| 中期：kernel 效率级 | MoE 静态 GEMM 贴 grouped FP8、attention B=1 专优 | ~8–10 | 100–125 | 单卡 ≥ 官方双卡 98.64 |
+| 长期：引擎级（L2） | 我方 MoE kernel 进 vLLM 类引擎 | ~5–7 | 140–200 | vLLM 单卡等效 |
+| 物理地板 | 纯带宽 | ~1.5–1.6 | ~630 | 不可达，仅示 headroom |
+
+  - 近期清单（顺序）：① nsys 逐段拆 18.5ms（`run.nsys.graph.sh` 已就绪，
+    cudaProfilerApi 时间窗只录 pass B 图重放段——图重放与 host 路径共用
+    同名 merged kernel，必须时间窗隔离；本表由 ±30% 估算变预算）；
+    ② dispatch 链融合（~1000 图内节点 → ~100，估省 1.3–1.8ms）；
+    ③ 空块削减（BLOCK_N 重扫 / expert-persistent，估省 0.4–0.7ms）+
+    fp4 池 decode 档 tile 重扫（BLOCK_N 128→32/64，wxfp4 专属
+    20.1→~18.5）+ 2bpw 池数倒挂修复（21.9 → 与 4bpw 持平）；④ 图内
+    杂项小 kernel 合并（rotate-quantize 链、norm、router glue，估省
+    0.5–1.5ms）
+  - 中期清单：⑤ MoE 静态 GEMM 效率对标 grouped FP8（我方活跃权重字节
+    仅其一半，效率追平即反超）；⑥ attention 量化线性层 B=1 专优（P8
+    backlog；GDN recurrent 单步融合）；lm_head 0.4ms 已近带宽上限不动
+  - 保真并线（不挡吞吐、挡可用性）：2bpw NaN 逐层溯源（问题 11，修复前
+    2bpw 图路径只可测速）；4bpw prefill 对齐（压漂移源头）
+  - 长期（L2）：我方 MoE kernel 进 vLLM 类引擎（TP2+Graph+全融合形态；
+    社区 2×5090 实测 252–274 tok/s = 3.65–3.97ms/步 已贴 roofline，为
+    该形态的天花板参照）
+- **估算依据**：带宽地板 = bs=1 + top-8 每步只读**活跃** ~2.5–2.8GB
+  （MoE 活跃 1.0/0.6GB + dense W8 ~1.2–1.4GB + lm_head 0.62GB + 状态
+  ~0.1GB）÷ 1.76TB/s ≈ 1.5–1.6ms——不是「全模型 ~10ms」口径（那适用
+  大 batch 服务）；官方 10.1ms 与 vLLM 双卡 3.6ms 均离各自地板 5×+
+  ⇒ batch=1 decode 真瓶颈是 kernel 数量/延迟/小 GEMM 效率，非带宽；
+  2bpw 权重字节更少反而比 4bpw 慢 3.4ms = 开销主导的存在性证明
+  （低位池多 → launch/空块/调度翻倍）
 
 ## 关于混合精度静态图的优化特点：
 

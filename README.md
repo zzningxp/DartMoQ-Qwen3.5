@@ -294,10 +294,13 @@ teacher-forced max_abs（nan = logits 含 NaN）：
   kernel 读 expert_info 后 `token_count<=0` 整块退出 → 18.5–23.7ms
   （再 2.4–2.7×，vs eager 合计 3.3–4.0×）
 - **官方 98.64 tok/s 口径修正**：双卡 device_map 分段 + 闭环贪心每步
-  `argmax().item()` 同步 ⇒ 两段串行、跨步无重叠——第二张卡贡献显存容量
-  而非吞吐（FP8 35GB 单卡放不下，双卡系容量所迫；与上节「串行切分、无
-  算力红利」一致，98.64 不能 ÷2 折算单卡）。公平对比 = 官方 10.1ms/步 vs
-  我方 18.5ms/步（wxa8 4bpw），差 1.83×；目标 10–12ms
+  `argmax().item()` 同步 ⇒ 两段串行、跨步无重叠——**非 TP**（每层完整落
+  单卡、无权重切分；TP2 的带宽聚合 ~2× 是 vLLM 引擎路径红利，此处不享），
+  **也非带重叠的 PP**（batch=1 闭环贪心无流水线可重叠），是 accelerate
+  连续层块 naive 切分：第二张卡贡献显存容量而非吞吐（FP8 35GB 单卡放不下，
+  双卡系容量所迫），且每步多付一次跨卡拷贝，单卡等效 < 10.1ms。公平对比
+  = 官方 10.1ms/步 vs 我方 18.5ms/步（wxa8 4bpw），差距 ≥ 1.83×；目标
+  10–12ms
 - **模式排名翻转**：早退前由空块废 flop 决定（fp4 BLOCK_B=32 废最少 → 最快），
   早退后由活跃 expert kernel 效率决定——量化三模式 BLOCK_N 32/32/128 与
   18.5/18.7/20.1ms 单调对应（decode 活跃 8 expert 的 gate_up/down 块数
@@ -315,9 +318,20 @@ teacher-forced max_abs（nan = logits 含 NaN）：
 - **对 ppl/eval 无影响**：eval 走 host 编排路径 + DynamicCache
   （DARTMOQ_STATIC_DISPATCH 仅 graph_decode 设置），与静态图路径不相交，
   早退分支 host 路径不触发——已测 ppl 数字全部有效
-- 待办：nsys 逐段拆 18.5ms → fp4 池 decode tile 重扫 → dispatch 链融合
-  （~1000 图内小节点）→ 2bpw NaN 逐层溯源 → 4bpw prefill 对齐；复盘与
-  方法论详见 [roadmaps/graph-decode-retrospective-261024.md](roadmaps/graph-decode-retrospective-261024.md)
+- **优化路线（自 54 tok/s 起，261025 估算、nsys 拆解后改预算制）**：近期
+  （编排级）dispatch 链融合（~1000 图内节点 → ~100）+ 空块削减 + fp4 池
+  decode tile 重扫（128→32/64）+ 2bpw 池数倒挂修复 → **~14–16ms（62–71
+  tok/s）**；中期（kernel 级）MoE 静态 GEMM 贴 grouped FP8 效率 + attention
+  B=1 专优 → **~8–10ms（100–125 tok/s，单卡超官方双卡 98.64）**；长期
+  （L2 引擎化）我方 MoE kernel 进 vLLM 类引擎 → **~5–7ms（140–200
+  tok/s）**；带宽地板 ~1.5–1.6ms（bs=1 top-8 每步只读活跃 ~2.5–2.8GB——
+  官方与 vLLM 双卡均离各自地板 5×+，batch=1 decode 瓶颈在 kernel 数量/
+  延迟非带宽；2bpw 权重字节更少反而慢 3.4ms 即开销主导佐证）。并线保真：
+  2bpw NaN 逐层溯源、4bpw prefill 对齐；第一步 = nsys 拆解
+  （run.nsys.graph.sh 已就绪，cudaProfilerApi 时间窗隔离同名 kernel）。
+  分档依据与逐项清单详见
+  [roadmaps/graph-decode-retrospective-261024.md](roadmaps/graph-decode-retrospective-261024.md)
+  §四
 
 ## 下游任务评测（lm-eval 七任务，对齐 BitsMoE 口径）
 
@@ -618,5 +632,8 @@ python bench_throughput.py --quant-dir models/<ckpt>/ --mode wxa8 \
   吞吐），公平对比 10.1 vs 18.5ms（1.83×）。保真门：4bpw 状态漂移
   （prefill 起源、待对齐）、2bpw 闭环 step1 NaN（跨四模式、待逐层溯源，
   修复前 2bpw 图路径只可测速）；对 ppl/eval 无影响（eval 走 host 路径）。
-  待办：nsys 逐段拆解、fp4 池 decode tile 重扫、dispatch 链融合。详见
+  优化路线（自 54 tok/s，261025 估算）：近期编排级 ~14–16ms → 中期
+  kernel 级 ~8–10ms（100–125 tok/s，单卡超官方双卡）→ 长期 L2 引擎化
+  ~5–7ms（140–200 tok/s）；带宽地板 ~1.6ms（活跃读 ~2.7GB/步，瓶颈在
+  kernel 数量/延迟非带宽）。详见
   [roadmaps/graph-decode-retrospective-261024.md](roadmaps/graph-decode-retrospective-261024.md)
