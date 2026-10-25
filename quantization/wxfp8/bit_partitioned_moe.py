@@ -385,6 +385,7 @@ class WxFP8BitPartitionedGroupMoE(WxA16BitPartitionedGroupMoE):
         del a_f8, a_s
         if dn.dtype != x.dtype:
             dn = dn.to(x.dtype)
-        dn = dn * weights_c.unsqueeze(1)
-        final_hidden_states.index_add_(0, tokens_c, dn)
+        # padding 行显式清零再乘零权重（防 0×inf/NaN，见基类 _static_scatter_tail）
+        self._static_scatter_tail(dn, tokens_c, weights_c, mask_rows,
+                                  final_hidden_states)
         del dn, act

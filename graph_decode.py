@@ -100,8 +100,17 @@ def eager_reference(model, sample, prompt_len, steps):
     dev = emb_device(model)
     ids = sample[:prompt_len].unsqueeze(0).to(dev)
     mask = torch.ones(1, prompt_len, dtype=torch.long, device=dev)
+    ev0 = torch.cuda.Event(enable_timing=True)
+    ev1 = torch.cuda.Event(enable_timing=True)
+    ev0.record()
     out = model(input_ids=ids, attention_mask=mask,
                 past_key_values=None, use_cache=True)
+    ev1.record()
+    ev0.synchronize()
+    ev1.synchronize()
+    # prefill 计时（与 static_prefill 的 StaticCache 口径对比速度差）
+    print(f"[eager] prefill DynamicCache len={prompt_len}: "
+          f"{ev0.elapsed_time(ev1):.1f} ms", flush=True)
     past = out.past_key_values
     tokens, logits, step_ms = [int(out.logits[0, -1].argmax().item())], \
         [out.logits[0, -1].float().cpu()], []
@@ -186,8 +195,18 @@ def static_prefill(model, sample, prompt_len, cache):
     """静态 cache 下的 eager prefill（图外），返回末位 logits。"""
     dev = emb_device(model)
     ids = sample[:prompt_len].unsqueeze(0).to(dev)
+    ev0 = torch.cuda.Event(enable_timing=True)
+    ev1 = torch.cuda.Event(enable_timing=True)
+    ev0.record()
     out = model(input_ids=ids, attention_mask=None,
                 past_key_values=cache, use_cache=True)
+    ev1.record()
+    ev0.synchronize()
+    ev1.synchronize()
+    # prefill 计时（每次调用都打：B2 复跑多实例，可顺带看方差；
+    # 与 eager_reference 的 DynamicCache 口径对比速度差）
+    print(f"[static] prefill StaticCache len={prompt_len}: "
+          f"{ev0.elapsed_time(ev1):.1f} ms", flush=True)
     logits = out.logits[0, -1].float().cpu()
     del out
     return logits

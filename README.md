@@ -312,9 +312,13 @@ teacher-forced max_abs（nan = logits 含 NaN）：
   13–17，wxa16 闭环 MATCH 全程说明漂移未翻转实际轨迹 argmax（parity 大 ≠
   token 流必分叉）；2bpw = 闭环 step1 logits 含 **NaN**（四模式同签名，
   argmax 落 0）——喂入 token 已排除（prefill_tok_match=True 仍 NaN），
-  wxfp4/wxfp8 的 pass C bitwise 0 说明图路径本身可精确保真，NaN 经特定
-  prefill 状态实例（原子序 1–2 ulp）命中静态路径数据依赖边界；修复前 2bpw
-  图路径只可测速不可出文本
+  wxfp4/wxfp8 的 pass C bitwise 0 说明图路径本身可精确保真。**根因已定位
+  并修复（261025）**：静态 GEMM 的 store 掩码从不写 padding 行（≥ pool_total，
+  多池拆分必有），`torch.empty` 残留非有限时 scatter 尾 0 × inf/NaN = NaN
+  污染 token 0（4bpw 单池无 padding 故从不触发；残留取决于分配历史 → 实例
+  依赖）——修复 = `_static_scatter_tail`（四模式共用）masked_fill_ 显式清零
+  padding 行；toy 注入 A/B 四模式全绿（旧行为复现 NaN、修复后 bitwise 一致），
+  待全模型复跑闭环确认
 - **对 ppl/eval 无影响**：eval 走 host 编排路径 + DynamicCache
   （DARTMOQ_STATIC_DISPATCH 仅 graph_decode 设置），与静态图路径不相交，
   早退分支 host 路径不触发——已测 ppl 数字全部有效
@@ -630,8 +634,9 @@ python bench_throughput.py --quant-dir models/<ckpt>/ --mode wxa8 \
   4bpw 18.5–20.1ms/步（45–54 tok/s 单卡，vs eager 3.3–4.0×）、2bpw
   21.9–23.7ms。官方 98.64 tok/s 为双卡串行切分口径（第二卡贡献显存非
   吞吐），公平对比 10.1 vs 18.5ms（1.83×）。保真门：4bpw 状态漂移
-  （prefill 起源、待对齐）、2bpw 闭环 step1 NaN（跨四模式、待逐层溯源，
-  修复前 2bpw 图路径只可测速）；对 ppl/eval 无影响（eval 走 host 路径）。
+  （prefill 起源、待对齐）、2bpw 闭环 step1 NaN（根因 = padding 行
+  torch.empty 残留 0×inf/NaN，已修复待全模型复跑）；对 ppl/eval 无影响
+  （eval 走 host 路径）。
   优化路线（自 54 tok/s，261025 估算）：近期编排级 ~14–16ms → 中期
   kernel 级 ~8–10ms（100–125 tok/s，单卡超官方双卡）→ 长期 L2 引擎化
   ~5–7ms（140–200 tok/s）；带宽地板 ~1.6ms（活跃读 ~2.7GB/步，瓶颈在

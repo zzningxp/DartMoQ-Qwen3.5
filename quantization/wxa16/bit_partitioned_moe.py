@@ -1358,6 +1358,25 @@ class WxA16BitPartitionedGroupMoE(nn.Module):
             return _get_fused_grouped_config(bit, direction=direction, B=B)
         return getter
 
+    @staticmethod
+    def _static_scatter_tail(dn, tokens_c, weights_c, mask_rows,
+                             final_hidden_states):
+        """静态池 scatter 尾（四模式共用）：padding 行显式清零后加权累加。
+
+        dn 的 padding 行（行号 ≥ pool_total）不属于任何成员的行段，GEMM
+        kernel 的 store 掩码（rb < token_start + token_count）从不写入它们，
+        内容是 torch.empty 的分配器残留；weights_c 在 padding 行虽为 0，但
+        0 × inf/NaN = NaN——残留非有限时经 index_add_ 把 token 0 污染成
+        NaN（2bpw 多池拆分必有 padding 行故显形；4bpw 单池 pool_total=C
+        无 padding，同一缺陷不触发。残留是否非有限取决于 prefill 的分配
+        历史 → 呈实例依赖；host 路径无 padding 行故从不触发）。
+        masked_fill_ 按掩码覆写（非算术），对任意残留安全；定形定形状、
+        设备端掩码，capture 合法。开销 = 每池每层一个小 fill 节点。
+        """
+        dn.masked_fill_(~mask_rows.unsqueeze(1), 0)
+        dn.mul_(weights_c.unsqueeze(1))
+        final_hidden_states.index_add_(0, tokens_c, dn)
+
     def _static_pool_compute(self, ps, x, tokens_c, weights_c, mask_rows,
                              final_hidden_states):
         """单个 bit 池的静态计算（A16 默认；与 _merged_pool_compute 同数学）。
@@ -1401,9 +1420,10 @@ class WxA16BitPartitionedGroupMoE(nn.Module):
         if dn.dtype != act.dtype:
             dn = dn.to(act.dtype)
 
-        # 权重加权 scatter（padding 行权重为零 → 对 token 0 恒等加零）
-        dn = dn * weights_c.unsqueeze(1)
-        final_hidden_states.index_add_(0, tokens_c, dn)
+        # 权重加权 scatter（padding 行显式清零再乘零权重，防 0×inf/NaN
+        # 污染 token 0，见 _static_scatter_tail）
+        self._static_scatter_tail(dn, tokens_c, weights_c, mask_rows,
+                                  final_hidden_states)
         del dn, act
 
     def forward(self, hidden_states):
