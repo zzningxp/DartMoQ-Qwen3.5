@@ -41,6 +41,9 @@ launch 本身。（B=32 的 eval profile 结论「warm 循环 GPU-bound」与 B=
   后半，期间 GPU0 空闲），既非 tensor parallel 也无流水线重叠，wall time
   ≈ 40 层串行总和。**双卡不带来算力 ×2**（单卡装得下的话 wall time 基本
   不变），per-GPU 差距就是全量 6.2×，不存在「单卡等价 ~5000」。
+  （261025 补充：graph_decode seg 路径代码级证实同一结论——闭环贪心每步
+  `argmax().item()` 同步，两段串行、跨步无重叠，第二卡只贡献显存容量；
+  见 [graph-decode-retrospective-261024.md](graph-decode-retrospective-261024.md) §四）
 - **attention 保 BF16**：官方只量化 experts（modules_to_not_convert 列了
   attn/conv/embed/lm_head/visual/mtp），attention 走原生 BF16 GEMM。虽然
   本机没装 flash-linear-attention、delta rule 落到 torch 参考实现（慢），

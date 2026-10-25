@@ -251,8 +251,10 @@ fla 前口径——同批次四模式（git 3349151，P5-2 合并路径全模式
   反超 wxa16（~3600 vs 3384）
 - **与官方 FP8 的差距（双侧均 fla 后口径，wxfp4 4bpw）**：pf2048 3.39–3.45× /
   pf4096 2.46× / pf128 2.77–2.81× / pf16 1.69–1.82× / decode 1.17× / ttft
-  1.88–1.97×。表面比 fla 前（2.42×/1.85×/3.18×）在长档拉大，但其中 ~2× 是
-  双卡 TP 本身；单卡真实差距看外推拆解：**边际速率 66.1 vs 46.4 μs/tok
+  1.88–1.97×。表面比 fla 前（2.42×/1.85×/3.18×）在长档拉大；官方双卡系
+  device_map 串行切分、无算力红利（261021 勘误，见
+  [roadmaps/throughput-analysis-261020.md](roadmaps/throughput-analysis-261020.md)
+  §1），表面比值不可按 ÷2 折算，真实差距看外推拆解：**边际速率 66.1 vs 46.4 μs/tok
   （1.42×，fla 前 125–131 vs 98.6 = 1.3×，MoE kernel 效率）+ 每次 prefill
   固定开销 ~220ms vs 官方 ~10ms（launch 链；fla 只省掉其中 ~24ms，pf2048
   一档它占我们总时的 62%）**。fla 把双方 attention 段同时打到顶后，剩余差距
@@ -268,6 +270,54 @@ fla 前口径——同批次四模式（git 3349151，P5-2 合并路径全模式
   1018.thrput.4–5（wxa8 合并）/ 1018.thrput.7（wxfp8 合并）/
   1018.thrput.8.new.fp16.2 + .9.new.fp4 + .10.new.all（wxa16/wxfp4 合并，
   同批次四模式）
+
+### CUDA Graph Decode（整步静态图重放，graph_decode.py，2026-10-25）
+
+batch=1、plen=128、steps=1024、RTX 5090 单卡整步 capture（mask=native）；
+git 8023c96+，logs/1023.graph.seg.5.ours.log。eager 为同进程 DynamicCache
+参考，replay 为事件计时上限参考；单位 ms/步，parity 为 pass C
+teacher-forced max_abs（nan = logits 含 NaN）：
+
+| ckpt | 模式 | eager | graph | replay | 加速 | tok/s | 闭环 tokens | parity |
+|---|---|---|---|---|---|---|---|---|
+| 4bpw | wxa8 | 73.8 | **18.5** | 18.4 | 3.99× | **54.01** | DIFF@19 | 14.23 |
+| 4bpw | wxfp8 | 74.6 | 18.7 | 18.4 | 3.99× | 53.47 | DIFF@12 | 16.62 |
+| 4bpw | wxa16 | 76.7 | 19.7 | 19.2 | 3.90× | 50.82 | MATCH | 13.47 |
+| 4bpw | wxfp4 | 72.1 | 20.1 | 19.6 | 3.58× | 49.68 | DIFF@2 | 14.98 |
+| 2bpw | wxa8 | 74.2 | 21.9 | 21.5 | 3.39× | 45.65 | DIFF@1 | nan |
+| 2bpw | wxfp8 | 74.2 | 21.9 | 21.5 | 3.38× | 45.58 | DIFF@1 | 0 |
+| 2bpw | wxfp4 | 76.6 | 22.0 | 21.4 | 3.48× | 45.43 | DIFF@1 | 0 |
+| 2bpw | wxa16 | 78.5 | 23.7 | 23.0 | 3.31× | 42.12 | DIFF@2 | nan |
+
+- **静态派发 + 空 expert 早退是吞吐主杠杆**：早退前 49–63ms/步（空 expert
+  块仅掩 token 行、权重流带与 dot 照跑，每步废 2–4 TFLOP），四个 merged
+  kernel 读 expert_info 后 `token_count<=0` 整块退出 → 18.5–23.7ms
+  （再 2.4–2.7×，vs eager 合计 3.3–4.0×）
+- **官方 98.64 tok/s 口径修正**：双卡 device_map 分段 + 闭环贪心每步
+  `argmax().item()` 同步 ⇒ 两段串行、跨步无重叠——第二张卡贡献显存容量
+  而非吞吐（FP8 35GB 单卡放不下，双卡系容量所迫；与上节「串行切分、无
+  算力红利」一致，98.64 不能 ÷2 折算单卡）。公平对比 = 官方 10.1ms/步 vs
+  我方 18.5ms/步（wxa8 4bpw），差 1.83×；目标 10–12ms
+- **模式排名翻转**：早退前由空块废 flop 决定（fp4 BLOCK_B=32 废最少 → 最快），
+  早退后由活跃 expert kernel 效率决定——量化三模式 BLOCK_N 32/32/128 与
+  18.5/18.7/20.1ms 单调对应（decode 活跃 8 expert 的 gate_up/down 块数
+  256/512 vs 64/128，5090 有 170 SM，fp4 大 tile 填充不足；B=1 下权重字节
+  减半非主导）。2bpw 三量化模式持平（bit≤2 池共享 int8 码本 kernel 族）；
+  fp4 池 decode tile 重扫（128→32/64）为下一明确杠杆
+- **保真门两类分叉（pass B2 闭环诊断定性）**：4bpw = prefill 起漂
+  （StaticCache vs DynamicCache，与官方 FP8 DIFF@14 同机制）随步数累积到
+  13–17，wxa16 闭环 MATCH 全程说明漂移未翻转实际轨迹 argmax（parity 大 ≠
+  token 流必分叉）；2bpw = 闭环 step1 logits 含 **NaN**（四模式同签名，
+  argmax 落 0）——喂入 token 已排除（prefill_tok_match=True 仍 NaN），
+  wxfp4/wxfp8 的 pass C bitwise 0 说明图路径本身可精确保真，NaN 经特定
+  prefill 状态实例（原子序 1–2 ulp）命中静态路径数据依赖边界；修复前 2bpw
+  图路径只可测速不可出文本
+- **对 ppl/eval 无影响**：eval 走 host 编排路径 + DynamicCache
+  （DARTMOQ_STATIC_DISPATCH 仅 graph_decode 设置），与静态图路径不相交，
+  早退分支 host 路径不触发——已测 ppl 数字全部有效
+- 待办：nsys 逐段拆 18.5ms → fp4 池 decode tile 重扫 → dispatch 链融合
+  （~1000 图内小节点）→ 2bpw NaN 逐层溯源 → 4bpw prefill 对齐；复盘与
+  方法论详见 [roadmaps/graph-decode-retrospective-261024.md](roadmaps/graph-decode-retrospective-261024.md)
 
 ## 下游任务评测（lm-eval 七任务，对齐 BitsMoE 口径）
 
@@ -560,3 +610,13 @@ python bench_throughput.py --quant-dir models/<ckpt>/ --mode wxa8 \
     慢 4bpw 13%）；我们小 B 场景反超 gptqmodel Int4 decode 2.9×
   - 详见 [roadmaps/throughput-bench-261019.md](roadmaps/throughput-bench-261019.md)
     与 [roadmaps/throughput-analysis-261020.md](roadmaps/throughput-analysis-261020.md)
+
+- **CUDA Graph Decode（2026-10-25 我方模型四模式落地）**：整步静态图 +
+  MoE 静态派发（device 端定形算子替换 host 编排）+ 空 expert 早退；
+  4bpw 18.5–20.1ms/步（45–54 tok/s 单卡，vs eager 3.3–4.0×）、2bpw
+  21.9–23.7ms。官方 98.64 tok/s 为双卡串行切分口径（第二卡贡献显存非
+  吞吐），公平对比 10.1 vs 18.5ms（1.83×）。保真门：4bpw 状态漂移
+  （prefill 起源、待对齐）、2bpw 闭环 step1 NaN（跨四模式、待逐层溯源，
+  修复前 2bpw 图路径只可测速）；对 ppl/eval 无影响（eval 走 host 路径）。
+  待办：nsys 逐段拆解、fp4 池 decode tile 重扫、dispatch 链融合。详见
+  [roadmaps/graph-decode-retrospective-261024.md](roadmaps/graph-decode-retrospective-261024.md)

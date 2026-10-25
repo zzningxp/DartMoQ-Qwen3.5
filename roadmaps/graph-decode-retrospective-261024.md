@@ -5,7 +5,10 @@
 decode 阶段是 launch 密集型负载：每步数千次 host 端 kernel 发射，GPU 大量时间耗在 launch 队列而不是计算。CUDA graph 的原理是把一步的全部 kernel 录成 DAG（capture），之后每步一次提交重放（replay），host 开销从"每 kernel 一次"降为"每步一次"。
 
 - 目标：官方 FP8 基线 16 tok/s → 60–80 tok/s。
-- 结果先行：官方 FP8 达 **98.64 tok/s（6.0×，git c4e2831）**；我方量化模型打通中（阻塞点全量审计完成、常量类已修、结构类静态化进行中，见 §二）。
+- 结果先行：官方 FP8 达 **98.64 tok/s（6.0×，git c4e2831，双卡）**；我方量化模型
+  四模式全落地（静态派发 + 空 expert 早退，261025），4bpw 18.5–20.1ms/步
+  （45–54 tok/s 单卡）、2bpw 21.9–23.7ms；保真门两类分叉已定性（4bpw 状态
+  漂移 / 2bpw 闭环 NaN），见 §二 问题 10/11 与 §四。
 
 ---
 
@@ -55,7 +58,7 @@ decode 阶段是 launch 密集型负载：每步数千次 host 端 kernel 发射
 
 ---
 
-## 二、我方量化模型（单卡整步路径，进行中）
+## 二、我方量化模型（单卡整步路径，静态化已落地）
 
 ### 问题 7：不同 checkpoint 死点不同 → 全量审计而非逐个修
 
@@ -70,13 +73,73 @@ decode 阶段是 launch 密集型负载：每步数千次 host 端 kernel 发射
 - **附带收益**：2bpw eager decode 91.5 → 77.6 ms/步（−15.2%），仅此一项。
 - **同类排除项**（有设备常驻缓存、录制安全）：分组旋转矩阵缓存、码本 buffer、占位码本。
 
-### 问题 9：结构类非法点——MoE 派发的 host 编排（静态化进行中）
+### 问题 9：结构类非法点——MoE 派发的 host 编排（静态化已落地 261025）
 
 - **技术原因**：MoE 前向的派发链是 host 驱动的：token 统计读回 host 得到每专家行偏移 → Python 字典按路由组织"bit 池" → 变长张量拼接 → kernel 的专家调度表在 host 构建后传设备。录制会把"捕获那一刻的路由"烤死进图，重放换路由即错。这不是 bug 而是 eager 时代的编排方式与图模式的根本冲突。
 - **静态化设计**（三条支柱，kernel 零改动）：其一，合并 kernel 本身已是设备驱动——专家行段与块调度表运行时从设备张量读取，调度表可按最坏情况静态化（空专家的块全掩码安全退出）；其二，decode 每层总行数恒等于 top-k，只有各 bit 池间的分布动态——固定容量池缓冲 + 设备端统计（index_add）/池内游标（cumsum）/行内位次（定形比较算子）组装，padding 行置零、权重为零的 scatter 对合法 token 恒等加零；其三，gate_up 旋转在 decode 下无条件预提升（token 数为 1，数学等价），down 向逐专家旋转改为按 bit 全局预建旋转矩阵库 + 设备索引选取（依赖旋转 seed 跨层共享，实现时验证）。
 - **测试设计要点**：对拍用例必须包含"录制用路由 A、重放换路由 B"——这是唯一能抓住烤死路由类错误的用例；另做静态路径 vs eager 容差对拍、图重放 vs 手动同路径 bitwise 硬门、SM 填充度分析。
 
 ---
+
+### 问题 10：静态 GEMM 空块不早退——每步 2–4 TFLOP 废 MMA（已修，261025 实测）
+
+- **现象**：四模式全模型 capture 通过但 graph 49–63ms/步（15.8–20.4 tok/s），
+  远逊官方 10.1ms；模式间差异小且与权重字节量弱相关（4bpw≈2bpw）。
+- **技术原因**：静态派发按最坏情况铺 grid（每池 E×N-tile），空 expert 的块仅被
+  mask_b 掩 token 行，权重 load（w_mask 不含 mask_b）与 tl.dot 照跑——每层全
+  256 expert 满 tile 计算，每步废 MMA ≈2–4 TFLOP（40 层 × E×(2·512·2048+
+  2048·512)×2×BLOCK_B），小 tile + 码本 gather 有效吞吐仅 55–90 TFLOPS，MoE
+  静态路径独占 40–50ms。host 编排路径成员恒非空，缺陷只在静态路径显形——
+  故既有 eval/ppl 对它全然无感。
+- **解决途径**：四个 merged kernel（a16/a8/fp8/fp4）读 expert_info 后
+  `token_count <= 0` 整块早退（对齐 pooled rotate kernel 写法）。toy 四模式
+  parity 仍 bitwise 0，merged/integration 回归全绿。
+- **结果（8023c96+，logs/1023.graph.seg.5.ours.log，全表见 §四）**：全模式
+  18.5–23.7ms/步（早退前 49–63，再 2.4–2.7×；vs eager 合计 3.3–4.0×）。
+  **模式排名翻转**：早退前排名由空块废 flop 决定（fp4 BLOCK_B=32 废最少 →
+  49ms 最快）；早退后由活跃 expert kernel 效率决定——量化三模式 BLOCK_N
+  32/32/128 与 18.5/18.7/20.1ms 单调对应（decode 活跃 8 expert 的
+  gate_up/down 块数 256/512 vs 64/128，5090 有 170 SM，fp4 大 tile 填充
+  不足；权重字节减半在 B=1 非主导，活跃权重流仅 ~0.3–0.7ms/步）。2bpw
+  三量化模式持平 21.9–22.0ms（bit≤2 池共享 int8 码本 kernel 族），wxa16
+  2bpw 最慢 23.7（低 bit 混合池双格式激活链固定成本，与吞吐小节结论一致）。
+
+### 问题 11：保真门两类分叉——4bpw 状态漂移与 2bpw 闭环 NaN（B2 诊断定性，261025）
+
+- **现象**：4bpw 四模式 pass C parity 13.5–16.6（wxa16 闭环却 MATCH 全部
+  1024 步）；2bpw 四模式闭环全部 DIFF@1/2，其中 wxfp4/wxfp8 pass C
+  parity=0、wxa8/wxa16 pass C parity=nan。
+- **技术原因（B2 闭环诊断 + NaN 捕获/prefill_tok_match 标记定性）**：
+  - **4bpw = state divergence**：prefill parity 0.75–1.05（StaticCache vs
+    DynamicCache 的 GDN prefill 状态差，与官方 FP8 DIFF@14 同机制），漂移
+    随步数累积（早期步 ~1.3 → 1024 步 max 13–17），首个 argmax 翻转步因
+    模式/实例而异（DIFF@2/12/19/∞）。wxa16 闭环 MATCH 说明漂移未翻转实际
+    轨迹的 argmax——parity 大 ≠ token 流必分叉，两个口径各测各的（旧
+    「parity 16.7 却 MATCH」矛盾由此解释）。官方「漂移有界 3.0」判据下
+    我方 4bpw 超界（13–17），需 prefill 对齐从源头压缩。
+  - **2bpw = 闭环 step1 logits 含 NaN（真 bug，非平局翻转）**：四模式签名
+    完全一致（logits_diff=nan、graph_tok=0、eager_tok=279、eager 侧
+    top-2 gap ~2.1 非平局）⇒ 与模式无关，指向低位池公共路径（bit≤2 池
+    共享 int8 码本 kernel 族与同一 dispatch/rotate 链）。喂入 token 已被
+    排除（wxa8/wxa16 prefill_tok_match=True，喂的就是 eager token，仍
+    NaN，且其 pass C 同样 nan）；而 wxfp4/wxfp8 的 pass C bitwise 0 与
+    B2 闭环 NaN 并存 ⇒ 图重放与静态 kernel 本身可精确保真，NaN 经特定
+    prefill 状态实例进入（每次 static_prefill 独立执行，host 路径
+    index_add_ 原子序非确定 → 1–2 ulp 不同的状态命中某个数据依赖边界）。
+    host 路径 eval/ppl 从未出现该现象 ⇒ 边界在静态路径独有代码（候选：
+    pooled rotate-quantize 的 amax=0 → scale 0/0、低位池 scale 转换、
+    trash 槽读取），需逐层溯源。
+- **解决途径（进行中）**：B2 已加 graph_logits_has_nan / prefill_tok_match /
+  parity 计算不再被 `max(0.0, nan)` 吞 NaN（旧 cl_parity 0.0 实为 NaN 被吞；
+  logs_parser 的 parity 正则同步支持 nan）。下一步逐层溯源：静态派发路径
+  eager 化（DARTMOQ_STATIC_DISPATCH=1、不 capture）重试 prefill 直到复现
+  NaN 实例，再逐层 isnan 二分定位层/池/kernel，最后查激活幅值与量化
+  scale 的 0/0 或溢出边界。
+- **对既有 ppl/eval 结论无影响**：eval 走 host 编排路径 + DynamicCache
+  （DARTMOQ_STATIC_DISPATCH 仅 graph_decode 设置），与静态路径不相交；
+  早退分支 host 路径不触发。修复前 2bpw 图路径只可测速、不可出文本。
+
+
 
 ## 三、方法论沉淀
 
@@ -87,10 +150,38 @@ decode 阶段是 launch 密集型负载：每步数千次 host 端 kernel 发射
 5. **假成功识别**：relaxed 录制通过≠成功；空图签名（结束警告+重放输出恒定）要当一等公民症状对待。
 6. **双层正确性门**：硬门（bitwise，图 vs 手动同路径）保证录制无失真；软门（有界漂移+平局判定，图 vs 旧路径）区分真 bug 与合法分叉。图加速的正确性验证两者都要。
 
-## 四、当前状态与下一步
+## 四、当前状态与下一步（261025 更新）
 
-- 官方 FP8：全通收官，6.0×。
-- 我方模型：常量类已修（2bpw eager −15.2%）；MoE 派发静态化为当前迭代主体，按问题 9 设计推进，kernel 零改动，先测试后主流程。
+- 官方 FP8：全通收官，6.0×（98.64 tok/s）。
+- 我方模型：静态化（问题 9）+ 空 expert 早退（问题 10）全落地，四模式 8 档
+  全出数（graph_decode 口径 plen=128 / steps=1024 / batch=1 / 单卡，
+  8023c96+，logs/1023.graph.seg.5.ours.log；单位 ms/步，parity 为 pass C
+  teacher-forced max_abs，nan = logits 含 NaN）：
+
+| ckpt | 模式 | eager | graph | replay | 加速 | tok/s | 闭环 tokens | parity |
+|---|---|---|---|---|---|---|---|---|
+| 4bpw | wxa8 | 73.8 | **18.5** | 18.4 | 3.99× | **54.01** | DIFF@19 | 14.23 |
+| 4bpw | wxfp8 | 74.6 | 18.7 | 18.4 | 3.99× | 53.47 | DIFF@12 | 16.62 |
+| 4bpw | wxa16 | 76.7 | 19.7 | 19.2 | 3.90× | 50.82 | MATCH | 13.47 |
+| 4bpw | wxfp4 | 72.1 | 20.1 | 19.6 | 3.58× | 49.68 | DIFF@2 | 14.98 |
+| 2bpw | wxa8 | 74.2 | 21.9 | 21.5 | 3.39× | 45.65 | DIFF@1 | nan |
+| 2bpw | wxfp8 | 74.2 | 21.9 | 21.5 | 3.38× | 45.58 | DIFF@1 | 0 |
+| 2bpw | wxfp4 | 76.6 | 22.0 | 21.4 | 3.48× | 45.43 | DIFF@1 | 0 |
+| 2bpw | wxa16 | 78.5 | 23.7 | 23.0 | 3.31× | 42.12 | DIFF@2 | nan |
+
+- **与官方 98.64 tok/s 的公平口径（修正）**：官方是双卡 device_map 分段
+  （[0:18] cuda:0 / [18:40] cuda:1 + head），但闭环贪心每步
+  `argmax().item()` 同步 ⇒ 两段串行、跨步无重叠——**第二张卡贡献显存
+  容量而非吞吐**（FP8 35GB 单卡 32GB 放不下，双卡是容量所迫；与吞吐
+  基准「串行切分、无算力红利」结论一致，98.64 不能按 ÷2 折算单卡）。
+  公平对比 = 官方 10.1ms/步 vs 我方 18.5ms/步（wxa8 4bpw），**差 1.83×，
+  未追平**；目标 10–12ms（83–100 tok/s，单卡追平乃至超过官方双卡总吞吐）。
+- **下一步（顺序）**：① nsys 逐段拆 18.5ms（graph 内 kernel 全署名，一次
+  看清 MoE 静态路径 / attention / lm_head / dispatch 链占比，避免拍脑袋
+  排序）；② fp4 池 decode 档 tile 重扫（BLOCK_N 128→32/64）与空块数削减
+  （decode 档 BLOCK_B 64/32→16 同方向）；③ dispatch 链融合（每层 ~25 个
+  小 kernel × 40 层 ≈ 图内 1000 节点）；④ 2bpw NaN 逐层溯源（问题 11
+  路线，修复前 2bpw 图路径只可测速）；⑤ 4bpw prefill 对齐（压漂移源头）。
 
 ## 关于混合精度静态图的优化特点：
 

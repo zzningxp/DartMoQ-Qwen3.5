@@ -1416,6 +1416,12 @@ def _turboquant_fused_matmul_merged_kernel_gf(
     slice_start = tl.load(ei + 2).to(tl.int32)
     slice_count = tl.load(ei + 3).to(tl.int32)
 
+    # 静态派发下 expert_info 覆盖池内全部 expert（decode 时绝大多数
+    # token_count=0）：空成员整块早退，权重流带与 dot 全免（对齐 pooled
+    # rotate kernel 的写法）。host 编排路径成员恒非空，此分支不触发
+    if token_count <= 0:
+        return
+
     rb = token_start + blk_b * BLOCK_B + tl.arange(0, BLOCK_B)
     mask_b = rb < token_start + token_count
 

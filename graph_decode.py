@@ -80,6 +80,13 @@ from bench_throughput import (  # noqa: E402
 )
 from data_utils import get_git_hash  # noqa: E402
 
+# nsys 剖析窗口开关（run.nsys.graph.sh 配套）：图重放与 host 路径共用同一批
+# merged kernel（名字相同），kern_sum 按名字聚合无法区分来源，须用
+# cudaProfilerApi 时间窗只录 pass B 计时循环；nsys 侧
+# --capture-range=cudaProfilerApi --capture-range-end=stop 在首个 stop 截止，
+# 故只采第一个 (plen, steps, rep) 档的窗口
+_PROF_WINDOW = os.environ.get("DARTMOQ_PROF_WINDOW", "0") == "1"
+
 
 def emb_device(model):
     return model.get_input_embeddings().weight.device
@@ -1232,6 +1239,10 @@ def main():
                 reset_cache(static_cache, dev)
                 pf = static_prefill(model, sample, plen, static_cache)
                 graph_tokens = [int(pf.argmax())]
+                # 剖析窗口开在计时循环外圈：reset/prefill（host 路径 kernel）
+                # 不入窗，窗内只有 feed/replay/argmax 一步的真实构成
+                if _PROF_WINDOW:
+                    torch.cuda.profiler.start()
                 t0 = time.time()
                 for i in range(s):
                     feed(plen + i, graph_tokens[-1])
@@ -1246,6 +1257,8 @@ def main():
                     replay_stats.append(ev0.elapsed_time(ev1))
                     graph_tokens.append(tok)
                 loop_stats.append((time.time() - t0) / s * 1000)
+                if _PROF_WINDOW:
+                    torch.cuda.profiler.stop()
                 if seq_ok and graph_tokens != ref_tokens[: s + 1]:
                     seq_ok = False
                     for i, (a, b) in enumerate(zip(graph_tokens, ref_tokens)):
@@ -1274,6 +1287,107 @@ def main():
               f"{r['loop_ms']:>10.1f}ms  {r['speedup']:>6.2f}x  "
               f"{r['replay_ms']:>10.1f}ms  {r['tok_per_s']:>11.2f}  {label}")
 
+    # ---- 6b) pass B2：闭环分叉诊断（仅 token_match=False 的档重跑一遍闭环；
+    #       独立于 pass B 计时循环，不污染 loop_ms）----
+    # 261025 四模式首轮出现的矛盾（2bpw parity=0 却 DIFF@1、4bpw parity 13~17
+    # 却有 MATCH）需要闭环路径上的逐步证据：
+    #   - 分叉步 logits diff + 两侧 top-2 gap → 区分平局翻转（benign）/
+    #     状态失配（drift 放大）/ logits 相同却 argmax 不同（门取数矛盾）
+    #   - prefill parity（vs eager 参考的 prefill logits）= 每次 run 的状态
+    #     指纹；诊断 run 复现不了 pass B 的分叉 ⇒ run 间非确定性（host 路径
+    #     index_add_ 原子序等）的直接证据
+    # logits 对拍仅对首档 prompt 有效（ref_logits 只留首档），其余档只看
+    # token 复现性。
+    gate_diag = []
+    for r in runs:
+        if r["token_match"]:
+            continue
+        plen, s = r["prompt_len"], r["steps"]
+        reset_cache(static_cache, dev)
+        pf = static_prefill(model, sample, plen, static_cache)
+        pf_parity = ((pf - ref_logits[0]).abs().max().item()
+                     if plen == p0 else -1.0)
+        tok0 = int(pf.argmax())
+        # prefill token 是否与 eager 参考一致：B2 的 prefill 与 setup 时的
+        # prefill 是两次独立执行，不一致 ⇒ prefill 本身非确定（host 路径
+        # 原子序等），闭环喂入不同 token 单独就能造成 DIFF@1
+        pf_tok_match = (None if plen != p0 else (tok0 == refs[p0][0][0]))
+        diag_tokens = [tok0]
+        cl_parity, div, matching = 0.0, None, True
+        for i in range(s):
+            feed(plen + i, diag_tokens[-1])
+            g.replay()
+            # detach：step() 的输出带 requires_grad（capture 在 no_grad 外），
+            # 后续 float()/topk() 会触发 UserWarning
+            gl = g_logits[0, -1].detach().float().cpu()
+            tok = int(gl.argmax().item())
+            diag_tokens.append(tok)
+            if plen != p0 or not matching:
+                continue
+            d = (gl - ref_logits[i + 1]).abs().max().item()
+            # NaN 用 max(0.0, nan) 会被吞掉（nan>x 为 False），显式保留
+            if d != d or d > cl_parity:
+                cl_parity = d
+            if tok != refs[p0][0][i + 1]:
+                matching = False
+                gt = gl.topk(2).values
+                et = ref_logits[i + 1].topk(2).values
+                div = {
+                    "step": i + 1,
+                    "logits_max_abs": d,
+                    "graph_logits_has_nan": bool(torch.isnan(gl).any().item()),
+                    "graph_top2_gap": float(gt[0] - gt[1]),
+                    "eager_top2_gap": float(et[0] - et[1]),
+                    "graph_tok": tok,
+                    "eager_tok": refs[p0][0][i + 1],
+                }
+        rerun_diff = next(
+            (i for i, (a, b) in enumerate(zip(diag_tokens, refs[plen][0]))
+             if a != b), -1)
+        if div is not None and div["graph_logits_has_nan"]:
+            # 261025 实测（2bpw wxfp4）：闭环 step1 logits 含 NaN（argmax 落 0），
+            # 非 tie-flip；同进程 teacher-forced pass C 却 bitwise 0 ⇒ NaN 只出
+            # 现在闭环喂入序列上，与参考流分叉后逐步定位需逐层 NaN 溯源
+            verdict = "NaN in closed-loop logits (state corruption, not a tie-flip)"
+        elif div is not None:
+            if div["logits_max_abs"] < 1e-6:
+                verdict = "CONTRADICTION: identical logits but argmax differs (gate bug)"
+            elif (div["logits_max_abs"] < 1e-2
+                  and div["graph_top2_gap"] < 1e-2
+                  and div["eager_top2_gap"] < 1e-2):
+                verdict = "tie-flip (likely benign)"
+            elif div["logits_max_abs"] > 1.0:
+                verdict = "state divergence (drift amplified)"
+            else:
+                verdict = "ambiguous (inspect numbers below)"
+        elif rerun_diff == -1:
+            verdict = ("MATCH on rerun: pass B DIFF not reproduced "
+                       "(run-to-run nondeterminism)")
+        else:
+            verdict = f"diverged again @step {rerun_diff} (non-p0 prompt, no logits evidence)"
+        gate_diag.append({
+            "prompt_len": plen, "steps": s,
+            "prefill_parity_max_abs": pf_parity,
+            "prefill_tok_match": pf_tok_match,
+            "closed_loop_parity_max_abs": cl_parity,
+            "rerun_first_diff_step": rerun_diff,
+            "divergence": div,
+            "verdict": verdict,
+        })
+        print(f"[graph] gate diag plen={plen} steps={s}: "
+              f"prefill_parity={pf_parity:.3e} "
+              f"prefill_tok_match={pf_tok_match} "
+              f"closed_loop_parity={cl_parity:.3e} "
+              f"rerun_diff@{rerun_diff} -> {verdict}", flush=True)
+        if div is not None:
+            print(f"[graph]   div step={div['step']} "
+                  f"logits_diff={div['logits_max_abs']:.3e} "
+                  f"graph_nan={div['graph_logits_has_nan']} "
+                  f"graph_top2_gap={div['graph_top2_gap']:.3e} "
+                  f"eager_top2_gap={div['eager_top2_gap']:.3e} "
+                  f"tok graph={div['graph_tok']} eager={div['eager_tok']}",
+                  flush=True)
+
     # ---- 7) pass C：teacher-forced logits 对拍（信息性；首档 prompt × 最长
     #      steps 档，覆盖该档全部前缀；capture 保真度与上下文长度无关）----
     reset_cache(static_cache, dev)
@@ -1282,8 +1396,11 @@ def main():
     for i in range(max_steps):
         feed(p0 + i, refs[p0][0][i])
         g.replay()
-        d = (g_logits[0, -1].float().cpu() - ref_logits[i + 1]).abs().max().item()
-        max_abs = max(max_abs, d)
+        d = (g_logits[0, -1].detach().float().cpu()
+             - ref_logits[i + 1]).abs().max().item()
+        # 同 B2：max(0.0, nan) 会吞 NaN，显式保留
+        if d != d or d > max_abs:
+            max_abs = d
     print(f"logits parity (teacher-forced, plen={p0}, {max_steps} steps): "
           f"max_abs={max_abs:.3e}")
 
@@ -1299,6 +1416,7 @@ def main():
         "eager_median_ms": {f"{p}:{s}": eager_med[(p, s)]
                             for p in plen_list for s in steps_list},
         "graph_runs": runs,
+        "gate_diag": gate_diag,
         "logits_max_abs": {"prompt_len": p0, "steps": max_steps, "max_abs": max_abs},
     }
     out = args.out or os.path.join(

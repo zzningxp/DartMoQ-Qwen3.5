@@ -10,6 +10,13 @@ neighboring row.
 以 "[model] ... | mode: ..." 行起始一条记录（bench 脚本专属标记，其他
 脚本日志无此格式），报告块内解析 prefill 各档 tok/s、decode 各档 tok/s、
 TTFT、一致性守卫结论与 MoE 每步总耗时。
+
+另支持 graph_decode.py 的 CUDA graph decode 日志（P9-5，官方 seg 与我方
+mask=native 两代格式共用）：以 "[graph] eager plen= ..." 行起始一条记录，
+解析 eager 中位数、graph 每步耗时 / replay-only / 加速比 / tok/s、
+token 流一致结论（MATCH / DIFF@n）与 teacher-forced logits 保真 max_abs。
+checkpoint 路径在锚点之前的 "Loading quantized checkpoint from:" 行，
+经 pending 机制回填（官方 external 模式无此行，模型名从 saved 文件名取）。
 """
 
 from __future__ import annotations
@@ -87,6 +94,36 @@ CHECKPOINT_BPW_RE = re.compile(r"(\d+(?:\.\d+)?)\s*bpw", re.IGNORECASE)
 # 行首空格，不能靠缩进判断块边界，直接匹配即可）
 THROUGHPUT_MOE_TOTAL_RE = re.compile(r"^\s*total\s+(?P<value>[-+0-9.eE]+)")
 
+# graph_decode.py 日志（CUDA graph decode，官方 seg 与我方 mask=native 两代
+# 格式共用）。运行锚点 = eager 中位数行（两种模式都打印）；同一 run 多 plen
+# 档会连打多行，见 parse_log 的合流处理
+GRAPH_EAGER_RE = re.compile(
+    r"^\[graph\] eager plen=\s*(?P<plen>\d+)\s+(?P<steps>\d+) steps: "
+    r"median\s*(?P<ms>[-+0-9.eE]+)ms/step")
+GRAPH_CKPT_LOAD_RE = re.compile(
+    r"^Loading quantized checkpoint from:\s+(?P<path>\S+)")
+GRAPH_MODE_RE = re.compile(
+    r"^\[graph\] DARTMOQ_STATIC_DISPATCH=1 "
+    r"\(MoE static dispatch enabled for (?P<mode>\S+)\)")
+# 汇总表数据行（两种表头共用，我方多一个 replay-only 列）：
+#   128  1024  74.0ms  49.0ms  1.51x  49.1ms  20.43  DIFF@12   （我方）
+#   128    64  60.8ms  10.1ms  6.00x  98.64  DIFF@14           （官方 seg）
+GRAPH_ROW_RE = re.compile(
+    r"^(?P<plen>\d+)\s+(?P<steps>\d+)\s+(?P<eager>[-+0-9.eE]+)ms\s+"
+    r"(?P<graph>[-+0-9.eE]+)ms\s+(?P<speedup>[-+0-9.eE]+)x\s+"
+    r"(?:(?P<replay>[-+0-9.eE]+)ms\s+)?(?P<tokps>[-+0-9.eE]+)\s+"
+    r"(?P<tokens>MATCH|DIFF@\d+)")
+GRAPH_PARITY_RE = re.compile(
+    r"^logits parity \(teacher-forced, plen=\d+, \d+ steps\): "
+    r"max_abs=(?P<value>[-+0-9.eE]+|nan)")
+GRAPH_SAVED_RE = re.compile(r"^\[(?:graph|seg)\] saved:\s+(?P<path>\S+)")
+# 结果文件名反解模型/模式/git hash：
+#   graph_decode_Qwen3.5-35B-A3B_wxfp4_8f64738+_261025_115857.json
+#   graph_decode_Qwen3.5-35B-A3B-FP8_external(fp8-bit)_seg_211729d+_261024_144409.json
+GRAPH_SAVED_NAME_RE = re.compile(
+    r"^graph_decode_(?P<rest>.+)_(?P<hash>[0-9a-f]{7,9}\+?)_"
+    r"(?P<date>\d{6})_(?P<time>\d{6})\.json$")
+
 # Old log format patterns (for backward compatibility)
 LOADING_RE = re.compile(r"Loading model:\s*\(ppl\)\s*(?P<path>\S+)")
 QUANTMODE_RE = re.compile(
@@ -150,6 +187,16 @@ class RunRecord:
     moe_total_ms: str = ""
     ckpt_path: str = ""
     checkpoint_path: str = ""
+    # graph_decode 字段（CUDA graph decode，档位键 = "plen:steps"）
+    is_graph: bool = False
+    graph_eager_ms: dict[str, str] = field(default_factory=dict, repr=False)
+    graph_ms: dict[str, str] = field(default_factory=dict, repr=False)
+    graph_replay_ms: dict[str, str] = field(default_factory=dict, repr=False)
+    graph_speedup: dict[str, str] = field(default_factory=dict, repr=False)
+    graph_tokps: dict[str, str] = field(default_factory=dict, repr=False)
+    graph_tokens: str = ""      # token 流结论 MATCH / DIFF@n
+    graph_parity: str = ""      # teacher-forced logits max_abs
+    graph_saved: str = ""       # 结果 JSON 文件名
     _fatal: bool = field(default=False, repr=False)
     # Temporary fields for accumulating time from old logs
     _layer_times: list[float] = field(default_factory=list, repr=False)
@@ -198,6 +245,10 @@ class RunRecord:
                 self.runtime_ppl = f"{t_quant + t_ppl:.2f}"
         if self._fatal:
             self.status = "failed"
+        elif self.is_graph:
+            # graph 记录：汇总表 tok/s 齐全即 ok；只到 eager 中位数
+            # （capture 前崩了）为 partial
+            self.status = "ok" if self.graph_tokps else "partial"
         elif self.decode_tokps:
             # Throughput 记录：decode 数字齐全即 ok
             self.status = "ok"
@@ -268,6 +319,11 @@ def parse_log(path: str) -> list[RunRecord]:
     using_new_format = False
     using_eval_format = False
     using_throughput_format = False
+    using_graph_format = False
+    # graph_decode 的 checkpoint 路径在锚点（eager 中位数）之前打印，
+    # 先存 pending，锚点触发时回填（只被 graph 锚点消费，混批日志中
+    # throughput/eval 记录不受影响）
+    pending_graph_ckpt = ""
 
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         for line_no, raw_line in enumerate(f, 1):
@@ -333,8 +389,48 @@ def parse_log(path: str) -> list[RunRecord]:
                 using_eval_format = False
                 continue
 
+            # graph 格式锚点（[graph] eager plen= 行，官方 seg / 我方
+            # mask=native 共用）。同一 run 多 plen 档连打多行 eager 中位数，
+            # 已开图记录且还没见到汇总表时不另起记录（档位键不同，直接并入）
+            graph_eager_match = GRAPH_EAGER_RE.search(line)
+            if graph_eager_match:
+                if not (current is not None and getattr(current, "is_graph", False)
+                        and not current.graph_tokps):
+                    if current is not None:
+                        current.finalize(line_no - 1)
+                        records.append(current)
+                    current = RunRecord(
+                        source=source,
+                        run_idx=len(records) + 1,
+                        start_line=line_no,
+                        start_time="",
+                        model_path="",
+                    )
+                    current.is_graph = True
+                    if pending_graph_ckpt:
+                        current.model_path = pending_graph_ckpt
+                        current.model_name = _last_path_component(pending_graph_ckpt)
+                        m = CHECKPOINT_BPW_RE.search(current.model_path)
+                        if m:
+                            current.bpw = m.group(1)
+                    using_graph_format = True
+                    using_new_format = False
+                    using_eval_format = False
+                    using_throughput_format = False
+                key = (f"{graph_eager_match.group('plen')}:"
+                       f"{graph_eager_match.group('steps')}")
+                current.graph_eager_ms[key] = graph_eager_match.group("ms")
+                continue
+
+            # graph checkpoint 路径行：任何格式下都只更新 pending（包括
+            # current 为 None 的文件头部），供后续 graph 锚点回填
+            graph_ckpt_match = GRAPH_CKPT_LOAD_RE.search(line)
+            if graph_ckpt_match:
+                pending_graph_ckpt = graph_ckpt_match.group("path")
+
             # If not using new format yet, check for old format patterns
-            if not using_new_format and not using_eval_format and not using_throughput_format:
+            if (not using_new_format and not using_eval_format
+                    and not using_throughput_format and not using_graph_format):
                 start_time_match = START_TIME_RE.search(line)
                 if start_time_match:
                     pending_start_time = start_time_match.group("value").strip()
@@ -417,6 +513,51 @@ def parse_log(path: str) -> list[RunRecord]:
                         m = CHECKPOINT_BPW_RE.search(current.ckpt_path)
                         if m:
                             current.bpw = m.group(1)
+                    continue
+                if FATAL_RE.search(line):
+                    current._fatal = True
+                    _append_error(current, line)
+                continue
+
+            # graph_decode 格式解析（锚点之后的报告块）
+            if using_graph_format:
+                graph_mode_match = GRAPH_MODE_RE.search(line)
+                if graph_mode_match:
+                    current.quantmode = graph_mode_match.group("mode")
+                    continue
+                graph_row_match = GRAPH_ROW_RE.search(line)
+                if graph_row_match:
+                    key = (f"{graph_row_match.group('plen')}:"
+                           f"{graph_row_match.group('steps')}")
+                    current.graph_eager_ms[key] = graph_row_match.group("eager")
+                    current.graph_ms[key] = graph_row_match.group("graph")
+                    current.graph_speedup[key] = graph_row_match.group("speedup")
+                    if graph_row_match.group("replay"):
+                        current.graph_replay_ms[key] = graph_row_match.group("replay")
+                    current.graph_tokps[key] = graph_row_match.group("tokps")
+                    if not current.graph_tokens:
+                        current.graph_tokens = graph_row_match.group("tokens")
+                    continue
+                graph_parity_match = GRAPH_PARITY_RE.search(line)
+                if graph_parity_match:
+                    current.graph_parity = graph_parity_match.group("value")
+                    continue
+                graph_saved_match = GRAPH_SAVED_RE.search(line)
+                if graph_saved_match:
+                    current.graph_saved = _last_path_component(
+                        graph_saved_match.group("path"))
+                    name_match = GRAPH_SAVED_NAME_RE.search(current.graph_saved)
+                    if name_match:
+                        if not current.git_hash:
+                            current.git_hash = name_match.group("hash")
+                        rest = name_match.group("rest")
+                        rest_parts = rest.split("_", 1)
+                        # 文件名 rest = "<模型>_<模式...>"：官方 external 模式
+                        # 无 STATIC_DISPATCH 行，模型名/模式从文件名补
+                        if not current.model_name and rest_parts[0]:
+                            current.model_name = rest_parts[0]
+                        if not current.quantmode and len(rest_parts) == 2:
+                            current.quantmode = rest_parts[1]
                     continue
                 if FATAL_RE.search(line):
                     current._fatal = True
@@ -661,7 +802,17 @@ def _field_value(record: RunRecord, field: str) -> str:
         return record.prefill_tokps.get(int(field[len("prefill_tokps_"):]), "")
     if field.startswith("decode_tokps_"):
         return record.decode_tokps.get(int(field[len("decode_tokps_"):]), "")
+    for metric in _GRAPH_METRIC_FIELDS:
+        if field.startswith(metric + "_"):
+            return getattr(record, metric).get(field[len(metric) + 1:], "")
     return str(getattr(record, field, "") or "")
+
+
+# graph_decode 的档位 dict 字段（键 "plen:steps"，含冒号不能走 int 解析）
+_GRAPH_METRIC_FIELDS = (
+    "graph_eager_ms", "graph_ms", "graph_replay_ms",
+    "graph_speedup", "graph_tokps",
+)
 
 
 def _select_fields(records: list[RunRecord]) -> list[str]:
@@ -692,15 +843,28 @@ def _select_fields(records: list[RunRecord]) -> list[str]:
         for f in ("ttft_s", "check", "moe_total_ms"):
             if any(getattr(r, f) for r in records):
                 fields.append(f)
+    # graph_decode 列（bpw 同吞吐：从 checkpoint 路径提取，graph 混批有意义）
+    if any(r.is_graph for r in records):
+        if any(r.bpw for r in records) and "bpw" not in fields:
+            fields.insert(fields.index("quantmode"), "bpw")
+        for metric in _GRAPH_METRIC_FIELDS:
+            keys = sorted({k for r in records for k in getattr(r, metric)})
+            fields += [f"{metric}_{k}" for k in keys]
+        for f in ("graph_tokens", "graph_parity"):
+            if any(getattr(r, f) for r in records):
+                fields.append(f)
     return fields
 
 
 def _plain_header(field: str) -> str:
-    """plain 输出的短表头；档位字段生成 pf<len>/dec<n> 形式。"""
+    """plain 输出的短表头；档位字段生成 pf<len>/dec<n>/g<缩写>_<键> 形式。"""
     if field.startswith("prefill_tokps_"):
         return "pf" + field.rsplit("_", 1)[1]
     if field.startswith("decode_tokps_"):
         return "dec" + field.rsplit("_", 1)[1]
+    for metric, short in _GRAPH_METRIC_PLAIN.items():
+        if field.startswith(metric + "_"):
+            return short + "_" + field[len(metric) + 1:]
     return PLAIN_HEADERS.get(field, field)
 
 
@@ -734,6 +898,17 @@ PLAIN_HEADERS = {
     "ttft_s": "ttft",
     "check": "check",
     "moe_total_ms": "moe_ms",
+    "graph_tokens": "toks",
+    "graph_parity": "parity",
+}
+
+# graph 档位列的 plain 短表头（g<缩写>_<plen:steps>，如 gtps_128:1024）
+_GRAPH_METRIC_PLAIN = {
+    "graph_eager_ms": "gegr",
+    "graph_ms": "gms",
+    "graph_replay_ms": "grep",
+    "graph_speedup": "gspd",
+    "graph_tokps": "gtps",
 }
 
 EXPORT_HEADERS = {
@@ -762,6 +937,8 @@ EXPORT_HEADERS = {
     "ttft_s": "ttft_s",
     "check": "check",
     "moe_total_ms": "moe_total_ms",
+    "graph_tokens": "graph_tokens",
+    "graph_parity": "graph_parity",
 }
 
 
