@@ -18,7 +18,10 @@
 #    not available"。⚠ 之前所有官方基线数字（1018.thrput.* 系列）都是 attention
 #    torch 慢路径口径，与装包后不可混表，需重跑。kernels hub 路径未启用
 #    （use_kernels=True 没开），仍走「原包优先」，与 finegrained-fp8 互不冲突。
-#    gptqmodel 7.3.6 的 cpp 扩展同样跳过，sm_120 走 tritonv2 后端（triton kernel）。
+#    gptqmodel 7.3.6：日志里"Skipping import of cpp extensions (torch>=2.11)"
+#    是 torchao 0.17 自己 .so 的门禁（经 mx_formats nvfp4 import 触发），与
+#    gptqmodel 无关；其 marlin/exllama JIT 扩展在 sm_120 + torch 2.9 可正常
+#    编译加载（1026 实测 extension.load('marlin') 通过，缓存已建）。
 #    ⚠ 绝不能装进 dart312-t38（triton 3.8 + ptxas 12.8 是 sm_120a mxfp4 配方）。
 #    conda activate dart312
 #    pip install "gptqmodel==7.3.6" "fbgemm-gpu==1.4.0" "torchao==0.17.0" \
@@ -52,6 +55,22 @@ fp8name="$HOME/models/Qwen3.5-35B-A3B-FP8/"
 export CUDA_VISIBLE_DEVICES=1
 # python bench_throughput.py --model-path $int4name \
 #         --prefill-lens 16,128,2048,4096 --decode-tokens 256,512,1024
+# 2026-10-27：Int4 kernel 后端实验（bench_throughput.py 支持
+# DARTMOQ_EXT_GPTQ_BACKEND 覆盖，默认 gptq_triton 不变）。marlin JIT 已预编译
+# 缓存（extension.load('marlin')，fp16/bf16 双 spec）；候选还有
+# gptq_exllama_v2（同为 JIT，首次运行会现场编译几分钟）：
+# DARTMOQ_EXT_GPTQ_BACKEND=gptq_marlin python bench_throughput.py \
+#         --model-path $int4name \
+#         --prefill-lens 16,128,2048,4096 --decode-tokens 256,512,1024
+# DARTMOQ_EXT_GPTQ_BACKEND=gptq_exllama_v2 python bench_throughput.py \
+#         --model-path $int4name \
+#         --prefill-lens 16,128,2048,4096 --decode-tokens 256,512,1024
+# 2026-10-27（下午）：decode 4.31 tok/s 根因 = defuser linear_loop 派发每专家
+# 一次 mask.any() DtoH 同步（40 层 × 256/步 ≈ 232ms，三 kernel 后端全部同值）。
+# bench 已默认换 unique_loop 派发（ext_gptq_moe_dispatch.py，每层一次同步，
+# 数值与 linear_loop bitwise 一致，CPU 对拍 test/test_gptq_moe_dispatch.py
+# 全绿）；DARTMOQ_EXT_GPTQ_DISPATCH=linear_loop 可回原生对照。1026 旧日志的
+# decode 4.31 是 linear_loop 口径，与本口径不可混表。
 
 # FP8（磁盘 35GB，attn/conv 等保持 bf16）：单卡 31.4GB 装不下，双卡 device_map=auto
 export CUDA_VISIBLE_DEVICES=0,1

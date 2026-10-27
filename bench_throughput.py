@@ -54,6 +54,10 @@ from qwen35_utils import DEV, get_qwen35_model
 MOE_TIMING_KEYS = ("total", "init", "shared", "router", "sort_scatter_prep",
                    "compute", "triton", "dequant", "gemm", "cleanup_reshape")
 
+# gptq 分支是否期望 unique_loop 派发生效（warmup 微前向后用探针校验，
+# 防 patch 静默失效——1027 首版实踩 0 命中白跑一轮）
+_GPTQ_UNIQUE_LOOP_EXPECTED = False
+
 
 # ---------------------------------------------------------------------------
 # 加载
@@ -100,20 +104,44 @@ def load_bench_model(args, device_map=None, max_memory=None):
             # GPTQConfig 丢掉了 dynamic 的 -: 排除规则（BF16 的 shared_expert_gate
             # N=1 被误包成量化层），且 Qwen3.5 融合 MoE 的 per-expert qweight 在
             # get_layers 里根本没有对应模块（1018.thrput.2/3 多轮实测）。
-            # 走 gptqmodel 原生加载（认识 dynamic 排除与融合 MoE），kernel 强制
-            # TritonV2：marlin/exllama 在 sm_120 不可用、MarlinLinear 还有
-            # pack_factor=8 整除约束，TritonV2 是唯一合法后端
+            # 走 gptqmodel 原生加载（认识 dynamic 排除与融合 MoE）。kernel 默认
+            # TritonV2；DARTMOQ_EXT_GPTQ_BACKEND 可显式覆盖为 gptq_marlin /
+            # gptq_exllama_v2（1026 复核：sm_120 上 gptqmodel 的 marlin JIT 扩展
+            # 可正常编译加载——此前"sm_120 不可用"是把 torchao 0.17 自己 .so 的
+            # torch>=2.11 门禁误读成了 gptqmodel 的；MarlinLinear pack_factor=8
+            # 整除约束对本模型 2048/512/1024 维度全部满足）
             from gptqmodel import GPTQModel
             from gptqmodel.utils.backend import BACKEND
             from transformers import AutoTokenizer
-            print("[ext] gptq checkpoint -> GPTQModel.load "
-                  "(backend=gptq_triton)", flush=True)
+            _gptq_backend = os.environ.get("DARTMOQ_EXT_GPTQ_BACKEND",
+                                           "gptq_triton")
+            _backend = BACKEND(_gptq_backend)
+            print(f"[ext] gptq checkpoint -> GPTQModel.load "
+                  f"(backend={_backend.value})", flush=True)
             model = GPTQModel.load(
-                model_path, backend=BACKEND.GPTQ_TRITON,
+                model_path, backend=_backend,
                 device_map="auto", trust_remote_code=True)
             tokenizer = AutoTokenizer.from_pretrained(
                 model_path, trust_remote_code=True)
             model.eval()
+            # MoE 专家派发（1027 定位）：defuser 的 linear_loop 每专家一次
+            # mask.any() DtoH 同步，40 层 × 256/步 ≈ 232ms → decode 4.31
+            # tok/s，与 kernel 后端无关（1026 三后端实测全 4.31）。默认换
+            # unique_loop（每层一次同步，数值与 linear_loop bitwise 一致）；
+            # DARTMOQ_EXT_GPTQ_DISPATCH=linear_loop 回原生行为对照。
+            # ⚠ 装饰器路径没有实例 forward（1027 首版按实例匹配 0 命中静默
+            # 失效），patch 走 ALL_EXPERTS_FUNCTIONS 注册表 + config 改写；
+            # warmup 微前向后有 unique_loop_active() 探针兜底告警。
+            from ext_gptq_moe_dispatch import (
+                patch_gptq_moe_dispatch, reset_unique_loop_probe)
+            _dispatch = os.environ.get("DARTMOQ_EXT_GPTQ_DISPATCH",
+                                       "unique_loop")
+            reset_unique_loop_probe()
+            _n_exp = patch_gptq_moe_dispatch(model, _dispatch)
+            global _GPTQ_UNIQUE_LOOP_EXPECTED
+            _GPTQ_UNIQUE_LOOP_EXPECTED = (_dispatch == "unique_loop")
+            print(f"[ext] gptq moe dispatch -> {_dispatch} "
+                  f"({_n_exp} experts modules)", flush=True)
             model_id = os.path.basename(model_path.rstrip("/"))
             return model, tokenizer, model_id, _detect_external_quant(model)
         archs = getattr(cfg, "architectures", None) or []
@@ -238,6 +266,17 @@ def warmup(model, prefill_lens, sample, dev):
     print("[warmup] micro forward (1x16) ...", flush=True)
     with torch.no_grad():
         model(input_ids=ids)
+        # unique_loop 派发探针：微前向必经 MoE，没置位说明 patch 没生效
+        # （类级/实例级两种装载形态之一失配），大声告警防静默白跑
+        if _GPTQ_UNIQUE_LOOP_EXPECTED:
+            from ext_gptq_moe_dispatch import unique_loop_active
+            if not unique_loop_active():
+                print("[ext][WARN] unique_loop experts forward NOT reached "
+                      "in micro forward -- dispatch patch ineffective, "
+                      "decode stays on linear_loop sync path", flush=True)
+            else:
+                print("[ext] unique_loop dispatch verified by micro forward",
+                      flush=True)
         print("[warmup] micro forward done; short decode loop (4 steps) ...",
               flush=True)
         decode_loop(model, sample[:32], 4, dev)
