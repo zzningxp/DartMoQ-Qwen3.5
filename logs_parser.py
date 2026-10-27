@@ -116,6 +116,13 @@ GRAPH_ROW_RE = re.compile(
 GRAPH_PARITY_RE = re.compile(
     r"^logits parity \(teacher-forced, plen=\d+, \d+ steps\): "
     r"max_abs=(?P<value>[-+0-9.eE]+|nan)")
+# prefill 计时行（261025 起 graph_decode 打印；static 每次调用都打、eager 每
+# plen 档一次。注意 eager 行出现在 [graph] eager 锚点**之前**（eager_reference
+# 先跑、中位数后打），归属上一条/不存在的记录都不对，须 pending 暂存、
+# 锚点建/并记录时回填，与 pending_graph_ckpt 同款手法）
+GRAPH_PREFILL_RE = re.compile(
+    r"^\[(?P<side>static|eager)\] prefill \w+Cache "
+    r"len=(?P<len>\d+):\s*(?P<ms>[-+0-9.eE]+) ms")
 GRAPH_SAVED_RE = re.compile(r"^\[(?:graph|seg)\] saved:\s+(?P<path>\S+)")
 # 结果文件名反解模型/模式/git hash：
 #   graph_decode_Qwen3.5-35B-A3B_wxfp4_8f64738+_261025_115857.json
@@ -196,6 +203,12 @@ class RunRecord:
     graph_tokps: dict[str, str] = field(default_factory=dict, repr=False)
     graph_tokens: str = ""      # token 流结论 MATCH / DIFF@n
     graph_parity: str = ""      # teacher-forced logits max_abs
+    graph_prefill: str = ""     # prefill ms（static 侧中位数：host 路径 + StaticCache、kernel 已热，有效口径）
+    graph_prefill_tps: str = "" # prefill 吞吐 tok/s（逐行 len/ms 折算后取中位数，混 plen 也成立）
+    graph_prefill_eager: str = ""  # eager 侧 ms 中位数（进程首次前向含 JIT 编译，仅诊断）
+    _pf_static_ms: list[float] = field(default_factory=list, repr=False)
+    _pf_static_tps: list[float] = field(default_factory=list, repr=False)
+    _pf_eager_ms: list[float] = field(default_factory=list, repr=False)
     graph_saved: str = ""       # 结果 JSON 文件名
     _fatal: bool = field(default=False, repr=False)
     # Temporary fields for accumulating time from old logs
@@ -213,6 +226,17 @@ class RunRecord:
 
     def finalize(self, end_line: int) -> None:
         self.end_line = end_line
+        # graph prefill 统计：static 侧多次调用取中位数（ms 与逐行 tps 各自
+        # 取中位数）；eager 侧每档一次，含 JIT 仅留导出列诊断
+        if self._pf_static_ms or self._pf_eager_ms:
+            def _med(xs):
+                s = sorted(xs)
+                return s[len(s) // 2] if s else float("nan")
+            if self._pf_static_ms:
+                self.graph_prefill = f"{_med(self._pf_static_ms):.1f}"
+                self.graph_prefill_tps = f"{_med(self._pf_static_tps):.0f}"
+            if self._pf_eager_ms:
+                self.graph_prefill_eager = f"{_med(self._pf_eager_ms):.1f}"
         # Only calculate and show quant time if we actually have ppl results
         # (meaning the quantization process completed successfully)
         if not self.runtime_quant and self._layer_times and (self.ppl_wikitext2 or self.ppl_c4):
@@ -324,6 +348,7 @@ def parse_log(path: str) -> list[RunRecord]:
     # 先存 pending，锚点触发时回填（只被 graph 锚点消费，混批日志中
     # throughput/eval 记录不受影响）
     pending_graph_ckpt = ""
+    pending_graph_pf_eager: list[float] = []
 
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         for line_no, raw_line in enumerate(f, 1):
@@ -420,6 +445,10 @@ def parse_log(path: str) -> list[RunRecord]:
                 key = (f"{graph_eager_match.group('plen')}:"
                        f"{graph_eager_match.group('steps')}")
                 current.graph_eager_ms[key] = graph_eager_match.group("ms")
+                # 回填锚点前暂存的 eager prefill 计时（建新记录与并入多档
+                # 两种路径都走这里）
+                current._pf_eager_ms.extend(pending_graph_pf_eager)
+                pending_graph_pf_eager.clear()
                 continue
 
             # graph checkpoint 路径行：任何格式下都只更新 pending（包括
@@ -427,6 +456,20 @@ def parse_log(path: str) -> list[RunRecord]:
             graph_ckpt_match = GRAPH_CKPT_LOAD_RE.search(line)
             if graph_ckpt_match:
                 pending_graph_ckpt = graph_ckpt_match.group("path")
+
+            # graph prefill 计时行：eager 侧暂存 pending（出现在锚点前）；
+            # static 侧必然在 graph 记录打开后打印，直接累积（ms + 逐行 tps）
+            graph_pf_match = GRAPH_PREFILL_RE.search(line)
+            if graph_pf_match:
+                if graph_pf_match.group("side") == "eager":
+                    pending_graph_pf_eager.append(
+                        float(graph_pf_match.group("ms")))
+                elif current is not None and getattr(current, "is_graph", False):
+                    ms = float(graph_pf_match.group("ms"))
+                    plen = int(graph_pf_match.group("len"))
+                    current._pf_static_ms.append(ms)
+                    current._pf_static_tps.append(plen / ms * 1000.0)
+                continue
 
             # If not using new format yet, check for old format patterns
             if (not using_new_format and not using_eval_format
@@ -788,7 +831,7 @@ def _csv_escape(value: str) -> str:
 
 
 def write_csv(records: list[RunRecord], out) -> None:
-    fields = _select_fields(records)
+    fields = _select_fields(records, include_pf_eager=True)
     headers = [_export_header(f) for f in fields]
     out.write(",".join([_csv_escape(h) for h in headers]) + "\n")
     for record in records:
@@ -815,8 +858,10 @@ _GRAPH_METRIC_FIELDS = (
 )
 
 
-def _select_fields(records: list[RunRecord]) -> list[str]:
-    """自适应选择展示列：按批次内容决定列集合。"""
+def _select_fields(records: list[RunRecord],
+                   include_pf_eager: bool = False) -> list[str]:
+    """自适应选择展示列：按批次内容决定列集合。include_pf_eager 仅供导出
+    （csv/json/md）附带 eager 侧 prefill 诊断列（含 JIT 冷启动，plain 不放）。"""
     fields = list(COMMON_FIELDS)
     # checkpoint 目录名列：混合批次（gptq/turboquant 等）必须能区分每行来源；
     # ckpt 名内已含模型名（qwen3.5-35B-...），任一记录有 ckpt 即用 ckpt 替换
@@ -850,9 +895,12 @@ def _select_fields(records: list[RunRecord]) -> list[str]:
         for metric in _GRAPH_METRIC_FIELDS:
             keys = sorted({k for r in records for k in getattr(r, metric)})
             fields += [f"{metric}_{k}" for k in keys]
-        for f in ("graph_tokens", "graph_parity"):
+        for f in ("graph_tokens", "graph_parity", "graph_prefill",
+                  "graph_prefill_tps"):
             if any(getattr(r, f) for r in records):
                 fields.append(f)
+        if include_pf_eager and any(r.graph_prefill_eager for r in records):
+            fields.append("graph_prefill_eager")
     return fields
 
 
@@ -900,6 +948,8 @@ PLAIN_HEADERS = {
     "moe_total_ms": "moe_ms",
     "graph_tokens": "toks",
     "graph_parity": "parity",
+    "graph_prefill": "pfms",
+    "graph_prefill_tps": "pftps",
 }
 
 # graph 档位列的 plain 短表头（g<缩写>_<plen:steps>，如 gtps_128:1024）
@@ -939,6 +989,9 @@ EXPORT_HEADERS = {
     "moe_total_ms": "moe_total_ms",
     "graph_tokens": "graph_tokens",
     "graph_parity": "graph_parity",
+    "graph_prefill": "graph_prefill_ms",
+    "graph_prefill_tps": "graph_prefill_tps",
+    "graph_prefill_eager": "graph_prefill_eager_ms",
 }
 
 
@@ -986,7 +1039,7 @@ def write_plain(records: list[RunRecord], out) -> None:
 
 
 def write_markdown(records: list[RunRecord], out) -> None:
-    fields = _select_fields(records)
+    fields = _select_fields(records, include_pf_eager=True)
     print("<table>", file=out)
     print("  <thead>", file=out)
     print("    <tr>", file=out)
@@ -1037,7 +1090,7 @@ def main(argv: list[str] | None = None) -> int:
         output_path = f"{log_path}.{args.format}"
         with open(output_path, "w", newline="", encoding="utf-8") as out:
             if args.format == "json":
-                fields = _select_fields(records)
+                fields = _select_fields(records, include_pf_eager=True)
                 json.dump([_format_export_row(record, fields)
                            for record in records], out, indent=2,
                           ensure_ascii=False)

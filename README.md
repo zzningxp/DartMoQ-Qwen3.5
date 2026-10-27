@@ -274,24 +274,25 @@ fla 前口径——同批次四模式（git 3349151，P5-2 合并路径全模式
 ### CUDA Graph Decode（整步静态图重放，graph_decode.py，2026-10-25）
 
 batch=1、plen=128、steps=1024、RTX 5090 单卡整步 capture（mask=native）；
-git 8023c96+，logs/1023.graph.seg.5.ours.log。eager 为同进程 DynamicCache
+git e36df65+，logs/1023.graph.seg.6.ours.log（2bpw NaN 修复后复跑）。
+eager 为同进程 DynamicCache
 参考，replay 为事件计时上限参考；单位 ms/步，parity 为 pass C
-teacher-forced max_abs（nan = logits 含 NaN）：
+teacher-forced max_abs：
 
 | ckpt | 模式 | eager | graph | replay | 加速 | tok/s | 闭环 tokens | parity |
 |---|---|---|---|---|---|---|---|---|
-| 4bpw | wxa8 | 73.8 | **18.5** | 18.4 | 3.99× | **54.01** | DIFF@19 | 14.23 |
-| 4bpw | wxfp8 | 74.6 | 18.7 | 18.4 | 3.99× | 53.47 | DIFF@12 | 16.62 |
-| 4bpw | wxa16 | 76.7 | 19.7 | 19.2 | 3.90× | 50.82 | MATCH | 13.47 |
-| 4bpw | wxfp4 | 72.1 | 20.1 | 19.6 | 3.58× | 49.68 | DIFF@2 | 14.98 |
-| 2bpw | wxa8 | 74.2 | 21.9 | 21.5 | 3.39× | 45.65 | DIFF@1 | nan |
-| 2bpw | wxfp8 | 74.2 | 21.9 | 21.5 | 3.38× | 45.58 | DIFF@1 | 0 |
-| 2bpw | wxfp4 | 76.6 | 22.0 | 21.4 | 3.48× | 45.43 | DIFF@1 | 0 |
-| 2bpw | wxa16 | 78.5 | 23.7 | 23.0 | 3.31× | 42.12 | DIFF@2 | nan |
+| 4bpw | wxa8 | 74.2 | **18.6** | 18.6 | 3.98× | **53.66** | MATCH | 14.21 |
+| 4bpw | wxfp8 | 73.3 | 19.1 | 18.6 | 3.83× | 52.24 | DIFF@28 | 14.46 |
+| 4bpw | wxa16 | 76.6 | 19.6 | 19.3 | 3.90× | 50.89 | DIFF@12 | 13.14 |
+| 4bpw | wxfp4 | 73.7 | 20.0 | 19.8 | 3.68× | 49.90 | DIFF@12 | 14.84 |
+| 2bpw | wxa8 | 74.0 | 22.4 | 22.0 | 3.31× | 44.68 | DIFF@107 | 9.555 |
+| 2bpw | wxfp8 | 75.6 | 22.7 | 22.0 | 3.33× | 44.10 | DIFF@38 | 12.02 |
+| 2bpw | wxfp4 | 76.0 | 22.8 | 22.1 | 3.34× | 43.93 | DIFF@13 | 14.02 |
+| 2bpw | wxa16 | 78.4 | 23.5 | 23.4 | 3.34× | 42.54 | MATCH | 14.56 |
 
 - **静态派发 + 空 expert 早退是吞吐主杠杆**：早退前 49–63ms/步（空 expert
   块仅掩 token 行、权重流带与 dot 照跑，每步废 2–4 TFLOP），四个 merged
-  kernel 读 expert_info 后 `token_count<=0` 整块退出 → 18.5–23.7ms
+  kernel 读 expert_info 后 `token_count<=0` 整块退出 → 18.6–23.5ms
   （再 2.4–2.7×，vs eager 合计 3.3–4.0×）
 - **官方 98.64 tok/s 口径修正**：双卡 device_map 分段 + 闭环贪心每步
   `argmax().item()` 同步 ⇒ 两段串行、跨步无重叠——**非 TP**（每层完整落
@@ -299,11 +300,11 @@ teacher-forced max_abs（nan = logits 含 NaN）：
   **也非带重叠的 PP**（batch=1 闭环贪心无流水线可重叠），是 accelerate
   连续层块 naive 切分：第二张卡贡献显存容量而非吞吐（FP8 35GB 单卡放不下，
   双卡系容量所迫），且每步多付一次跨卡拷贝，单卡等效 < 10.1ms。公平对比
-  = 官方 10.1ms/步 vs 我方 18.5ms/步（wxa8 4bpw），差距 ≥ 1.83×；目标
+  = 官方 10.1ms/步 vs 我方 18.6ms/步（wxa8 4bpw），差距 ≥ 1.83×；目标
   10–12ms
 - **模式排名翻转**：早退前由空块废 flop 决定（fp4 BLOCK_B=32 废最少 → 最快），
   早退后由活跃 expert kernel 效率决定——量化三模式 BLOCK_N 32/32/128 与
-  18.5/18.7/20.1ms 单调对应（decode 活跃 8 expert 的 gate_up/down 块数
+  18.6/19.1/20.0ms 单调对应（decode 活跃 8 expert 的 gate_up/down 块数
   256/512 vs 64/128，5090 有 170 SM，fp4 大 tile 填充不足；B=1 下权重字节
   减半非主导）。2bpw 三量化模式持平（bit≤2 池共享 int8 码本 kernel 族）；
   fp4 池 decode tile 重扫（128→32/64）为下一明确杠杆
@@ -317,8 +318,11 @@ teacher-forced max_abs（nan = logits 含 NaN）：
   多池拆分必有），`torch.empty` 残留非有限时 scatter 尾 0 × inf/NaN = NaN
   污染 token 0（4bpw 单池无 padding 故从不触发；残留取决于分配历史 → 实例
   依赖）——修复 = `_static_scatter_tail`（四模式共用）masked_fill_ 显式清零
-  padding 行；toy 注入 A/B 四模式全绿（旧行为复现 NaN、修复后 bitwise 一致），
-  待全模型复跑闭环确认
+  padding 行；toy 注入 A/B 四模式全绿（旧行为复现 NaN、修复后 bitwise 一致）。
+  全模型复跑（e36df65+，logs/1023.graph.seg.6.ours.log）8 档全部有限确认：
+  2bpw 四模式 NaN 全消、首次正常出文本（DIFF@13/38/107、wxa16 MATCH），
+  parity 9.6–14.6 落入与 4bpw（13.1–14.8）同族漂移带，分叉步近平局
+  （top-2 gap ≤0.25）；速度与修复前持平（fill 节点零成本）
 - **对 ppl/eval 无影响**：eval 走 host 编排路径 + DynamicCache
   （DARTMOQ_STATIC_DISPATCH 仅 graph_decode 设置），与静态图路径不相交，
   早退分支 host 路径不触发——已测 ppl 数字全部有效
@@ -330,8 +334,8 @@ teacher-forced max_abs（nan = logits 含 NaN）：
   （L2 引擎化）我方 MoE kernel 进 vLLM 类引擎 → **~5–7ms（140–200
   tok/s）**；带宽地板 ~1.5–1.6ms（bs=1 top-8 每步只读活跃 ~2.5–2.8GB——
   官方与 vLLM 双卡均离各自地板 5×+，batch=1 decode 瓶颈在 kernel 数量/
-  延迟非带宽；2bpw 权重字节更少反而慢 3.4ms 即开销主导佐证）。并线保真：
-  2bpw NaN 逐层溯源、4bpw prefill 对齐；第一步 = nsys 拆解
+  延迟非带宽；2bpw 权重字节更少反而慢 3.4–3.8ms 即开销主导佐证）。并线保真：
+  4bpw prefill 对齐；第一步 = nsys 拆解
   （run.nsys.graph.sh 已就绪，cudaProfilerApi 时间窗隔离同名 kernel）。
   分档依据与逐项清单详见
   [roadmaps/graph-decode-retrospective-261024.md](roadmaps/graph-decode-retrospective-261024.md)
@@ -631,11 +635,12 @@ python bench_throughput.py --quant-dir models/<ckpt>/ --mode wxa8 \
 
 - **CUDA Graph Decode（2026-10-25 我方模型四模式落地）**：整步静态图 +
   MoE 静态派发（device 端定形算子替换 host 编排）+ 空 expert 早退；
-  4bpw 18.5–20.1ms/步（45–54 tok/s 单卡，vs eager 3.3–4.0×）、2bpw
-  21.9–23.7ms。官方 98.64 tok/s 为双卡串行切分口径（第二卡贡献显存非
-  吞吐），公平对比 10.1 vs 18.5ms（1.83×）。保真门：4bpw 状态漂移
-  （prefill 起源、待对齐）、2bpw 闭环 step1 NaN（根因 = padding 行
-  torch.empty 残留 0×inf/NaN，已修复待全模型复跑）；对 ppl/eval 无影响
+  4bpw 18.6–20.0ms/步（50–54 tok/s 单卡，vs eager 3.3–4.0×）、2bpw
+  22.4–23.5ms（43–45 tok/s）。官方 98.64 tok/s 为双卡串行切分口径（第二卡贡献显存非
+  吞吐），公平对比 10.1 vs 18.6ms（1.83×）。保真门：4bpw 状态漂移
+  （prefill 起源、待对齐）、2bpw 闭环 NaN 已修复并全模型验证（根因 = padding
+  行 torch.empty 残留 0×inf/NaN，`_static_scatter_tail` 清零；e36df65+
+  8 档全有限，parity 落入与 4bpw 同族漂移带）；对 ppl/eval 无影响
   （eval 走 host 路径）。
   优化路线（自 54 tok/s，261025 估算）：近期编排级 ~14–16ms → 中期
   kernel 级 ~8–10ms（100–125 tok/s，单卡超官方双卡）→ 长期 L2 引擎化

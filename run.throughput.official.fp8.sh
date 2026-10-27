@@ -67,7 +67,7 @@ export CUDA_VISIBLE_DEVICES=0,1
 # 2026-10-24：FP8Experts eager 路径有 nonzero()+host 专家循环 capture 必死，
 # 显式 --experts-impl grouped_mm（histc 静态路径，官方 cuda-graph 安全设计）。
 python graph_decode.py --model-path $fp8name \
-        --strategy segment --prompt-len 128 --steps 64 \
+        --strategy segment --prompt-len 128 --steps 1024 \
         --experts-impl grouped_mm
 
 # python graph_decode.py --model-path $fp8name \
